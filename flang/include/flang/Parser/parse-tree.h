@@ -31,6 +31,7 @@
 #include "llvm/Frontend/OpenACC/ACC.h.inc"
 #include "llvm/Frontend/OpenMP/OMP.h"
 #include "llvm/Frontend/OpenMP/OMPConstants.h"
+#include "llvm/Frontend/FnGPU/FnGPU.h"
 #include <cinttypes>
 #include <list>
 #include <optional>
