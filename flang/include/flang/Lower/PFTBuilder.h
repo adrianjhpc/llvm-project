@@ -142,7 +142,8 @@ using Directives =
                parser::OpenACCRoutineConstruct,
                parser::OpenACCDeclarativeConstruct, parser::OpenMPConstruct,
                parser::OpenMPDeclarativeConstruct,
-               parser::CUFKernelDoConstruct>;
+               parser::CUFKernelDoConstruct,
+               parser::FnGPUConstruct>;
 
 using DeclConstructs = std::tuple<parser::OpenMPDeclarativeConstruct,
                                   parser::OpenACCDeclarativeConstruct>;

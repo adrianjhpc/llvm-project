@@ -1200,7 +1200,9 @@ private:
             eval.isUnstructured = true;
           },
           [&](const parser::WhereConstruct &) { setConstructExit(eval); },
-
+          [&](const parser::FnGPUConstruct &) { 
+            eval.constructExit = &eval.evaluationList->back();
+          },
           // Default - Common analysis for IO statements; otherwise nop.
           [&](const auto &stmt) {
             using A = std::decay_t<decltype(stmt)>;
@@ -1361,8 +1363,15 @@ public:
   }
 
   llvm::StringRef evaluationName(const lower::pft::Evaluation &eval) {
-    return eval.visit([](const auto &parseTreeNode) {
-      return parser::ParseTreeDumper::GetNodeName(parseTreeNode);
+    return eval.visit([](const auto &parseTreeNode) -> llvm::StringRef {
+      using NodeTy = std::decay_t<decltype(parseTreeNode)>;
+      
+      // Intercept our custom AST node so the dumper doesn't crash
+      if constexpr (std::is_same_v<NodeTy, Fortran::parser::FnGPUConstruct>) {
+        return "FnGPUConstruct";
+      } else {
+        return parser::ParseTreeDumper::GetNodeName(parseTreeNode);
+      }
     });
   }
 

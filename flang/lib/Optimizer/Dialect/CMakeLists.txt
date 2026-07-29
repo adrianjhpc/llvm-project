@@ -46,3 +46,24 @@ add_flang_library(FIRDialect
   MLIRLLVMToLLVMIRTranslation
   MLIRTargetLLVMIRExport
 )
+
+# --- FNGPU Dialect Library Target ---
+add_flang_library(FIRFNGPUDialect
+  FNGPU/FNGPUDialect.cpp
+  FNGPU/FNGPUOutlineKernels.cpp
+  FNGPU/FNGPULowerToTriton.cpp
+
+  DEPENDS
+  FnGPUDialectIncGen
+  FNGPUPassesIncGen
+
+  LINK_LIBS
+  FIRDialect 
+
+  MLIR_DEPS
+  MLIRIR
+
+  MLIR_LIBS
+  MLIRFuncDialect
+  MLIRArithDialect 
+)

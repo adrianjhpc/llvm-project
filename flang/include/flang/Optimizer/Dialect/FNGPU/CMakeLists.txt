@@ -1,0 +1,6 @@
+set(LLVM_TARGET_DEFINITIONS FNGPUOps.td)
+mlir_tablegen(FNGPUOps.h.inc -gen-op-decls)
+mlir_tablegen(FNGPUOps.cpp.inc -gen-op-defs)
+mlir_tablegen(FNGPUDialect.h.inc -gen-dialect-decls)
+mlir_tablegen(FNGPUDialect.cpp.inc -gen-dialect-defs)
+add_public_tablegen_target(FnGPUDialectIncGen)

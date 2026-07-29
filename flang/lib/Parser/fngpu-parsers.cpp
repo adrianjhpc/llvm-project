@@ -1,39 +1,49 @@
-#include "parse-tree-fngpu.h"
-#include "flang/Parser/parser-combinators.h"
-#include "flang/Parser/token-parsers.h"
+#include "flang/Parser/parse-tree.h"
+#include "basic-parsers.h"
+#include "expr-parsers.h"
+#include "stmt-parser.h"
+#include "token-parsers.h"
+#include "type-parsers.h"
+#include "type-parser-implementation.h"
 
 namespace Fortran::parser {
 
-// 1. Parse the enums: "HOST" or "DEVICE"
-constexpr auto fngpuPackTarget =
-    "HOST" >> pure(FnGPUPackTarget::Host) ||
-    "DEVICE" >> pure(FnGPUPackTarget::Device);
+constexpr auto startFngpuLine = skipStuffBeforeStatement >> ("!$FNGPU "_sptok || "!DIR$ FNGPU "_sptok);
+constexpr auto endFngpuLine = space >> endOfLine;
 
-// 2. Parse a single pack item: Name : Target
+template <typename PA> inline constexpr auto nonemptyList(PA p) {
+  return nonemptySeparated(p, ","_tok);
+}
+
+TYPE_PARSER(
+    "HOST"_tok >> pure(FnGPUPackTarget::Host) ||
+    "DEVICE"_tok >> pure(FnGPUPackTarget::Device)
+)
+
 TYPE_PARSER(construct<FnGPUPackClause::Item>(
-    name / ":", fngpuPackTarget))
+    name, ":"_tok >> Parser<FnGPUPackTarget>{}
+))
 
-// 3. Parse the whole PACK clause: PACK ( item1, item2, ... )
 TYPE_PARSER(construct<FnGPUPackClause>(
-    "PACK" >> parenthesized(nonemptyList(Parser<FnGPUPackClause::Item>{}))))
+    "PACK"_tok >> parenthesized(nonemptyList(Parser<FnGPUPackClause::Item>{}))
+))
 
-// 4. Parse the TILE clause: TILE ( int, int, ... )
 TYPE_PARSER(construct<FnGPUTileClause>(
-    "TILE" >> parenthesized(nonemptyList(scalarIntConstantExpr))))
+    "TILE"_tok >> parenthesized(nonemptyList(scalarIntConstantExpr))
+))
 
-// 5. Parse any clause variant
-TYPE_PARSER(construct<FnGPUClause>(Parser<FnGPUTileClause>{}) ||
-            construct<FnGPUClause>(Parser<FnGPUPackClause>{}))
+TYPE_PARSER(
+    construct<FnGPUClause>(Parser<FnGPUTileClause>{}) ||
+    construct<FnGPUClause>(Parser<FnGPUPackClause>{})
+)
 
-// 6. Parse the directive body: PARALLEL [clause...]
-// Note: The prescanner handles the "!$FNGPU" sentinel, so this parser
-// only sees the tokens that come after it.
 TYPE_PARSER(construct<FnGPUParallelDirective>(
-    "PARALLEL" >> many(Parser<FnGPUClause>{})))
+    "PARALLEL"_tok >> many(Parser<FnGPUClause>{})
+))
 
-// 7. Tie it together: The Directive + the Fortran Loop
 TYPE_PARSER(construct<FnGPUConstruct>(
-    statement(Parser<FnGPUParallelDirective>{}),
-    indirect(Parser<ExecutableConstruct>{})))
+    sourced(startFngpuLine >> Parser<FnGPUParallelDirective>{} / endOfLine),
+    Parser<DoConstruct>{}
+))
 
 } // namespace Fortran::parser

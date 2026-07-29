@@ -39,6 +39,7 @@ add_flang_library(flangFrontend
   FortranSupport
   FIRDialect
   FIRDialectSupport
+  FIRFNGPUDialect
   FIRSupport
   FIRBuilder
   FIRCodeGen
@@ -47,6 +48,7 @@ add_flang_library(flangFrontend
   HLFIRDialect
   HLFIRTransforms
   flangPasses
+  FIRFNGPUDialect
   FIROpenACCSupport
   FIROpenMPSupport
   FlangOpenMPTransforms

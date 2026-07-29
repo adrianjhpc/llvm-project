@@ -1,6 +1,7 @@
 add_subdirectory(CUF)
 add_subdirectory(FIRCG)
 add_subdirectory(MIF)
+add_subdirectory(FNGPU)
 
 # This replicates part of the add_mlir_dialect cmake function from MLIR that
 # cannot be used her because it expects to be run inside MLIR directory which
@@ -65,3 +66,7 @@ add_custom_command(
 add_custom_target(${dialect_doc_filename}DocGen DEPENDS ${GEN_DOC_FILE})
 set_target_properties(${dialect_doc_filename}DocGen PROPERTIES FOLDER "Flang/Tablegenning/Docs")
 add_dependencies(flang-doc ${dialect_doc_filename}DocGen)
+
+set(LLVM_TARGET_DEFINITIONS FNGPU/FNGPUPasses.td)
+mlir_tablegen(FNGPU/FNGPUPasses.h.inc -gen-pass-decls)
+add_public_tablegen_target(FNGPUPassesIncGen)

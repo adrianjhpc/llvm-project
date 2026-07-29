@@ -2080,6 +2080,39 @@ void OmpVisitor::ProcessMapperSpecifier(const parser::OmpMapperSpecifier &spec,
   PopScope();
 }
 
+// Resolve names in FNGPU constructs
+class FnGPUVisitor : public virtual DeclarationVisitor {
+public:
+  bool Pre(const parser::FnGPUConstruct &x) {
+    // Track source for diagnostics; descend into the construct.
+    const auto &dir{std::get<parser::FnGPUParallelDirective>(x.t)};
+    messageHandler().set_currStmtSource(dir.source);
+    currScope().AddSourceRange(dir.source);
+    return true;
+  }
+  void Post(const parser::FnGPUConstruct &) {
+    messageHandler().set_currStmtSource(std::nullopt);
+  }
+
+  // The PACK clause holds bare parser::Name nodes. ResolveNamesVisitor does
+  // not visit standalone Names, so we must resolve them explicitly here
+  // (same idea as OmpVisitor::Post(OmpObjectList) for common blocks).
+  void Post(const parser::FnGPUPackClause::Item &item) {
+    auto &name{std::get<parser::Name>(item.t)};
+    if (name.symbol) {
+      return; // already resolved
+    }
+    if (Symbol * symbol{FindSymbol(name)}) {
+      Resolve(name, *symbol); // sets name.symbol -> satisfies the invariant
+    } else {
+      Say(name.source,
+          "'%s' in FNGPU PACK clause is not a declared variable"_err_en_US,
+          name.source);
+    }
+  }
+};
+
+
 parser::CharBlock MakeNameFromOperator(
     const parser::DefinedOperator::IntrinsicOperator &op,
     SemanticsContext &context) {
@@ -2286,10 +2319,13 @@ class ResolveNamesVisitor : public virtual ScopeHandler,
                             public SubprogramVisitor,
                             public ConstructVisitor,
                             public OmpVisitor,
-                            public AccVisitor {
+                            public AccVisitor,
+                            public FnGPUVisitor {
 public:
   using AccVisitor::Post;
   using AccVisitor::Pre;
+  using FnGPUVisitor::Post;
+  using FnGPUVisitor::Pre;
   using ArraySpecVisitor::Post;
   using ConstructVisitor::Post;
   using ConstructVisitor::Pre;

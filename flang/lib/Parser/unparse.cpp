@@ -2815,6 +2815,17 @@ public:
     EndOpenMP();
   }
 
+ // Adding in FnGPU unparse functionality
+
+  void Unparse(const FnGPUConstruct &x) { /* Walk the tuple members */ }
+  void Unparse(const FnGPUParallelDirective &x);
+  void Unparse(const FnGPUClause &x);      // WalkUnion
+  void Unparse(const FnGPUTileClause &x);
+  void Unparse(const FnGPUPackClause &x);
+  void Unparse(const FnGPUPackClause::Item &x);
+  // and the FnGPUPackTarget enum
+
+
   void Unparse(const BasedPointer &x) {
     Put('('), Walk(std::get<0>(x.t)), Put(","), Walk(std::get<1>(x.t));
     Walk("(", std::get<std::optional<ArraySpec>>(x.t), ")"), Put(')');

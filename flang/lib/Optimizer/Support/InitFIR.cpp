@@ -10,6 +10,7 @@
 #include "mlir/Target/LLVMIR/Dialect/Builtin/BuiltinToLLVMIRTranslation.h"
 #include "mlir/Target/LLVMIR/Dialect/LLVMIR/LLVMToLLVMIRTranslation.h"
 #include "mlir/Target/LLVMIR/Dialect/OpenMP/OpenMPToLLVMIRTranslation.h"
+#include "flang/Optimizer/Dialect/FNGPU/FNGPUDialect.h"
 
 void fir::support::registerLLVMTranslation(mlir::MLIRContext &context) {
   mlir::DialectRegistry registry;

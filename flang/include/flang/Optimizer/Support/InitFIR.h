@@ -16,6 +16,7 @@
 #include "flang/Optimizer/Dialect/CUF/CUFDialect.h"
 #include "flang/Optimizer/Dialect/CUF/CUFToLLVMIRTranslation.h"
 #include "flang/Optimizer/Dialect/FIRDialect.h"
+#include "flang/Optimizer/Dialect/FNGPU/FNGPUDialect.h"
 #include "flang/Optimizer/Dialect/MIF/MIFDialect.h"
 #include "flang/Optimizer/HLFIR/HLFIRDialect.h"
 #include "flang/Optimizer/OpenACC/Support/RegisterOpenACCExtensions.h"
@@ -50,7 +51,7 @@ namespace fir::support {
       mlir::vector::VectorDialect, mlir::math::MathDialect,                    \
       mlir::complex::ComplexDialect, mlir::DLTIDialect, cuf::CUFDialect,       \
       mlir::NVVM::NVVMDialect, mlir::gpu::GPUDialect,                          \
-      mlir::index::IndexDialect, mif::MIFDialect
+      mlir::index::IndexDialect, mif::MIFDialect, fir::fngpu::FNGPUDialect
 
 #define FLANG_CODEGEN_DIALECT_LIST FIRCodeGenDialect, mlir::LLVM::LLVMDialect
 

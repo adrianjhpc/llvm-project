@@ -29,7 +29,12 @@ Prescanner::Prescanner(Messages &messages, CookedSource &cooked,
     : messages_{messages}, cooked_{cooked}, preprocessor_{preprocessor},
       allSources_{preprocessor_.allSources()}, features_{lfc},
       backslashFreeFormContinuation_{preprocessor.AnyDefinitions()},
-      encoding_{allSources_.encoding()} {}
+      encoding_{allSources_.encoding()} {
+  AddCompilerDirectiveSentinel("$fngpu");
+  // Register our custom GPU directive
+  AddCompilerDirectiveSentinel("");
+
+}
 
 Prescanner::Prescanner(const Prescanner &that, Preprocessor &prepro,
     bool isNestedInIncludeDirective)
@@ -1634,7 +1639,7 @@ Prescanner::IsFixedFormCompilerDirectiveLine(const char *start) const {
   // TODO: Handle keyword macros that expand to directives in fixed form.
   // The comment character can't be 'c' or 'C'.  Need to figure out whether
   // fixed form continuation should apply to the expansions.
-  char sentinel[5], *sp{sentinel};
+  char sentinel[16], *sp{sentinel};
   int column{2};
   for (; column < 6; ++column) {
     if (*p == '\n' || IsSpaceOrTab(p) || IsDecimalDigit(*p)) {
@@ -1790,7 +1795,7 @@ const char *Prescanner::IsCompilerDirectiveSentinel(CharBlock token) const {
 
 std::optional<std::pair<const char *, const char *>>
 Prescanner::IsCompilerDirectiveSentinel(const char *p) const {
-  char sentinel[8];
+  char sentinel[16];
   for (std::size_t j{0}; j + 1 < sizeof sentinel; ++p, ++j) {
     if (int n{IsSpaceOrTab(p)};
         n || !(IsLetter(*p) || *p == '$' || *p == '@')) {

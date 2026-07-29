@@ -13,12 +13,14 @@ target_link_libraries(tco PRIVATE
   FIRCodeGenDialect
   FIRDialect
   FIRDialectSupport
+  FIRFNGPUDialect
   FIRSupport
   FIRTransforms
   FIRBuilder
   HLFIRDialect
   HLFIRTransforms
   flangPasses
+  FIRFNGPUDialect
   FIROpenACCSupport
   FIROpenMPSupport
   FlangOpenMPTransforms

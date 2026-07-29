@@ -97,6 +97,8 @@ const SourceFile *Parsing::Prescan(const std::string &path, Options options) {
     prescanner.AddCompilerDirectiveSentinel("$cuf");
     prescanner.AddCompilerDirectiveSentinel("@cuf");
   }
+  prescanner.AddCompilerDirectiveSentinel("$fngpu");
+  prescanner.AddCompilerDirectiveSentinel("@fngpu");
   for (const auto &sentinel : options.compilerDirectiveSentinels) {
     prescanner.AddCompilerDirectiveSentinel(sentinel);
   }
@@ -132,9 +134,12 @@ void Parsing::EmitPreprocessedSource(
   bool inContinuation{false};
   bool lineWasBlankBefore{true};
   const AllSources &allSources{allCooked().allSources()};
-  // All directives that flang supports are known to have a length of 4 chars,
-  // except for OpenMP conditional compilation lines (!$).
-  constexpr int directiveNameLength{4};
+  // The sentinel ends at the first non-sentinel character (usually the
+  // space separating it from the directive body).  A defensive upper
+  // bound guards against pathological input; the longest sentinel is
+  // "$fngpu" (6), so 8 leaves headroom.
+  constexpr std::size_t maxSentinelLength{8};
+  bool sentinelComplete{false};
   // We need to know the current directive in order to provide correct
   // continuation for the directive
   std::string directive;
@@ -147,6 +152,7 @@ void Parsing::EmitPreprocessedSource(
       ompConditionalLine = false;
       inContinuation = false;
       lineWasBlankBefore = true;
+      sentinelComplete = false;
       ++sourceLine;
       directive.clear();
     } else {
@@ -165,6 +171,9 @@ void Parsing::EmitPreprocessedSource(
         return ch;
       }};
 
+      const auto isSentinelChar{
+          [](char c) { return IsLetter(c) || c == '$' || c == '@'; }};
+
       bool inDirectiveSentinel{false};
       if (ch == '!' && lineWasBlankBefore) {
         // Other comment markers (C, *, D) in original fixed form source
@@ -172,13 +181,19 @@ void Parsing::EmitPreprocessedSource(
         // which signifies a comment (directive) in both source forms.
         inDirective = true;
         inDirectiveSentinel = true;
-      } else if (inDirective && !ompConditionalLine &&
-          directive.size() < directiveNameLength) {
-        if (IsLetter(ch) || ch == '$' || ch == '@') {
+        sentinelComplete = false;
+      } else if (inDirective && !ompConditionalLine && !sentinelComplete) {
+        if (isSentinelChar(ch) && directive.size() < maxSentinelLength) {
           directive += getOriginalChar(ch);
           inDirectiveSentinel = true;
         } else if (directive == "$"s) {
+          // "!$" with no following sentinel letters: OpenMP conditional
+          // compilation line, not a named directive.
           ompConditionalLine = true;
+        } else {
+          // First non-sentinel character terminates the sentinel, so we
+          // don't swallow the directive body into `directive`.
+          sentinelComplete = true;
         }
       }
 

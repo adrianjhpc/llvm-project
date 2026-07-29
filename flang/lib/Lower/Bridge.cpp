@@ -52,6 +52,7 @@
 #include "flang/Optimizer/Dialect/FIRAttr.h"
 #include "flang/Optimizer/Dialect/FIROps.h"
 #include "flang/Optimizer/Dialect/Support/FIRContext.h"
+#include "flang/Optimizer/Dialect/FNGPU/FNGPUDialect.h"
 #include "flang/Optimizer/HLFIR/HLFIROps.h"
 #include "flang/Optimizer/Support/DataLayout.h"
 #include "flang/Optimizer/Support/FatalError.h"
@@ -2106,6 +2107,8 @@ private:
     return builder->createFunction(toLocation(), name, ty);
   }
 
+   
+
   /// Lowering of CALL statement
   void genFIR(const Fortran::parser::CallStmt &stmt) {
     Fortran::lower::StatementContext stmtCtx;
@@ -3640,6 +3643,57 @@ private:
             [&](const auto &) {}},
         dir.u);
   }
+
+  void genFIR(const Fortran::parser::FnGPUConstruct &fngpu) {
+    setCurrentPositionAt(fngpu);
+    Fortran::lower::pft::Evaluation &eval = getEval();
+    mlir::Location loc = toLocation();
+
+    const auto &directive{std::get<Fortran::parser::FnGPUParallelDirective>(fngpu.t)};
+    const auto &clauses{std::get<std::list<Fortran::parser::FnGPUClause>>(directive.t)};
+
+    llvm::SmallVector<int64_t> tileSizes;
+    llvm::SmallVector<mlir::Value> packVars;
+    llvm::SmallVector<int32_t> packTargets;
+
+    for (const Fortran::parser::FnGPUClause &clause : clauses) {
+      Fortran::common::visit(Fortran::common::visitors{
+        [&](const Fortran::parser::FnGPUTileClause &tileClause) {
+          for (const auto &expr : tileClause.v)
+            if (std::optional<int64_t> val = Fortran::semantics::GetIntValue(expr))
+              tileSizes.push_back(*val);
+        },
+        [&](const Fortran::parser::FnGPUPackClause &packClause) {
+          for (const auto &item : packClause.v) {
+            const auto &name{std::get<Fortran::parser::Name>(item.t)};
+            const auto tgt{std::get<Fortran::parser::FnGPUPackTarget>(item.t)};
+            if (name.symbol) {
+              packVars.push_back(getSymbolAddress(*name.symbol));
+              packTargets.push_back(
+                  tgt == Fortran::parser::FnGPUPackTarget::Device ? 1 : 0);
+            }
+          }
+        },
+        [&](const auto &) {}
+      }, clause.u);
+    }
+
+    auto launchOp = fir::fngpu::LaunchOp::create(*builder, loc, tileSizes, packVars, packTargets); 
+
+
+    // 4. New block inside the region
+    builder->createBlock(&launchOp.getRegion());
+
+    // 5. Lower the nested DO loop
+    for (Fortran::lower::pft::Evaluation &e : eval.getNestedEvaluations()) {
+      genFIR(e);
+    }
+
+    // 6. Terminate and move out
+    fir::FirEndOp::create(*builder, loc);
+    builder->setInsertionPointAfter(launchOp);
+  }
+
 
   void genFIR(const Fortran::parser::OpenACCConstruct &acc) {
     setCurrentPositionAt(acc);

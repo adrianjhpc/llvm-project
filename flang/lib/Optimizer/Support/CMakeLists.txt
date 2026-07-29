@@ -8,6 +8,7 @@ add_flang_library(FIRSupport
   FIROpsIncGen
   HLFIROpsIncGen
   MIFOpsIncGen
+  FnGPUDialectIncGen
 
   LINK_LIBS
   FIRDialect
