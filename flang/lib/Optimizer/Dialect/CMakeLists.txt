@@ -52,6 +52,7 @@ add_flang_library(FIRFNGPUDialect
   FNGPU/FNGPUDialect.cpp
   FNGPU/FNGPUOutlineKernels.cpp
   FNGPU/FNGPULowerToTriton.cpp
+  FNGPU/FNGPULowerToRuntime.cpp
 
   DEPENDS
   FnGPUDialectIncGen

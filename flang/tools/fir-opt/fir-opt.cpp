@@ -42,6 +42,7 @@ int main(int argc, char **argv) {
   fir::registerFlangPipelinePasses();
   fir::fngpu::registerFNGPUOutlineKernelsPass();
   fir::fngpu::registerFNGPULowerToTritonPass();
+  fir::fngpu::registerFNGPULowerToRuntimePass();
 #ifdef FLANG_INCLUDE_TESTS
   fir::test::registerTestFIRAliasAnalysisPass();
   fir::test::registerTestFIROpenACCInterfacesPass();

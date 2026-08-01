@@ -27,5 +27,20 @@ def FNGPULowerToTriton : Pass<"fngpu-lower-to-triton", "mlir::ModuleOp"> {
   ];
 }
 
+def FNGPULowerToRuntime : Pass<"fngpu-lower-to-runtime", "mlir::ModuleOp"> {
+  let summary = "Lower fngpu.launch operations to generated runtime wrapper calls";
+  let description = [{
+    Replaces recognized `fngpu.launch` operations with calls to generated
+    Fortran-callable C runtime wrappers such as `fngpu_launch_kernel_0`.
+  }];
+  let constructor = "fir::fngpu::createFNGPULowerToRuntimePass()";
+  let dependentDialects = [
+    "fir::fngpu::FNGPUDialect",
+    "fir::FIROpsDialect",
+    "mlir::func::FuncDialect",
+    "mlir::arith::ArithDialect"
+  ];
+}
+
 
 #endif // FORTRAN_OPTIMIZER_DIALECT_FNGPU_PASSES

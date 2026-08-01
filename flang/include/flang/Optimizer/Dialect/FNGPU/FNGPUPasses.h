@@ -11,6 +11,7 @@ namespace fir::fngpu {
 
 std::unique_ptr<mlir::Pass> createFNGPUOutlineKernelsPass();
 std::unique_ptr<mlir::Pass> createFNGPULowerToTritonPass();
+std::unique_ptr<mlir::Pass> createFNGPULowerToRuntimePass();
 
 #define GEN_PASS_REGISTRATION
 #include "flang/Optimizer/Dialect/FNGPU/FNGPUPasses.h.inc"
