@@ -1,11 +1,19 @@
-// RUN: fir-opt %s | fir-opt | FileCheck %s
-// CHECK: fngpu.launch tile_sizes = [64] pack(%{{.*}}, %{{.*}} : {{.*}}) {{.*}}array<i32: 0, 1>
-func.func @t(%a: !fir.ref<!fir.array<?xf32>>, %c: !fir.ref<!fir.array<?xf32>>) {
-  fngpu.launch tile_sizes = [64]
-      pack(%a, %c : !fir.ref<!fir.array<?xf32>>, !fir.ref<!fir.array<?xf32>>)
-      {pack_targets = array<i32: 0, 1>} {
-    fir.end
+// RUN: fir-opt %s | FileCheck %s
+
+module {
+  func.func @test_fngpu_launch(
+      %a: !fir.ref<!fir.array<?xf32>>,
+      %b: !fir.ref<!fir.array<?xf32>>) {
+    fngpu.launch tile_sizes = [64] pack(%a, %b : !fir.ref<!fir.array<?xf32>>, !fir.ref<!fir.array<?xf32>>) {
+      "fir.end"() : () -> ()
+    } attributes {pack_targets = array<i32: 0, 1>}
+
+    return
   }
-  return
 }
+
+// CHECK: fngpu.launch tile_sizes = [64]
+// CHECK-SAME: pack(%{{.*}}, %{{.*}} : !fir.ref<!fir.array<?xf32>>, !fir.ref<!fir.array<?xf32>>)
+// CHECK: attributes
+// CHECK-SAME: pack_targets = array<i32: 0, 1>
 

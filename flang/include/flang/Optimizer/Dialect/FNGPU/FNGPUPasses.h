@@ -9,7 +9,9 @@ namespace fir::fngpu {
 #define GEN_PASS_DECL
 #include "flang/Optimizer/Dialect/FNGPU/FNGPUPasses.h.inc"
 
+std::unique_ptr<mlir::Pass> createFNGPUAssignKernelIdsPass();
 std::unique_ptr<mlir::Pass> createFNGPUOutlineKernelsPass();
+std::unique_ptr<mlir::Pass> createFNGPUEmitFortranAliasesPass();
 std::unique_ptr<mlir::Pass> createFNGPULowerToTritonPass();
 std::unique_ptr<mlir::Pass> createFNGPULowerToRuntimePass();
 
@@ -18,3 +20,4 @@ std::unique_ptr<mlir::Pass> createFNGPULowerToRuntimePass();
 } // namespace fir::fngpu
 
 #endif // FORTRAN_OPTIMIZER_DIALECT_FNGPU_FNGPUPASSES_H
+

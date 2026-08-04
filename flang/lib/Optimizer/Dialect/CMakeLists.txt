@@ -50,6 +50,9 @@ add_flang_library(FIRDialect
 # --- FNGPU Dialect Library Target ---
 add_flang_library(FIRFNGPUDialect
   FNGPU/FNGPUDialect.cpp
+  FNGPU/FNGPUAssignKernelIds.cpp
+  FNGPU/FNGPUEmitFortranAliases.cpp
+  FNGPU/FNGPUKernelAnalysis.cpp
   FNGPU/FNGPUOutlineKernels.cpp
   FNGPU/FNGPULowerToTriton.cpp
   FNGPU/FNGPULowerToRuntime.cpp
@@ -63,7 +66,7 @@ add_flang_library(FIRFNGPUDialect
 
   MLIR_DEPS
   MLIRIR
-
+  MLIRPass
   MLIR_LIBS
   MLIRFuncDialect
   MLIRArithDialect 

@@ -1,13 +1,18 @@
 #include "flang/Optimizer/Dialect/FNGPU/FNGPUPasses.h"
 #include "flang/Optimizer/Dialect/FNGPU/FNGPUDialect.h"
+#include "flang/Optimizer/Dialect/FNGPU/FNGPUKernelAnalysis.h"
+
 #include "flang/Optimizer/Dialect/FIRDialect.h"
 #include "flang/Optimizer/Dialect/FIROps.h"
+
 #include "mlir/Dialect/Arith/IR/Arith.h"
-#include "mlir/Transforms/RegionUtils.h"
-#include "llvm/Support/raw_ostream.h"
-#include "llvm/Support/FileSystem.h"
+
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/Support/FileSystem.h"
+#include "llvm/Support/raw_ostream.h"
+
 #include <optional>
+#include <string>
 
 namespace fir::fngpu {
 #define GEN_PASS_DEF_FNGPULOWERTOTRITON
@@ -18,292 +23,346 @@ using namespace mlir;
 
 namespace {
 
-  struct ElementwiseKernel {
-    int rank = 1;
+  static constexpr int32_t kTritonNumWarps = 1;
+  static constexpr int32_t kTritonThreadsPerWarp = 32;
+  static constexpr int32_t kTritonNumCTAs = 1;
+  static constexpr int32_t kTritonNumStages = 3;
 
-    fir::DoLoopOp loop1D;
-    fir::DoLoopOp outerLoop;
-    fir::DoLoopOp innerLoop;
+  static constexpr int32_t kCudaThreadsPerCTA =
+    kTritonNumWarps * kTritonThreadsPerWarp;
 
-    Value innerIndMemref; // i
-    Value outerIndMemref; // j
+  // Triton/NVVM-generated PTX currently appends two hidden pointer parameters
+  // after the explicit kernel parameters for the FNGPU kernels we emit.
+  //
+  // Example 1-D binary PTX:
+  //
+  //   param_0 = a
+  //   param_1 = b
+  //   param_2 = c
+  //   param_3 = n
+  //   param_4 = hidden ptr
+  //   param_5 = hidden ptr
+  //
+  // The runtime appends two null CUdeviceptr values for these hidden args.
+  static constexpr int32_t kTritonHiddenPtrArgs = 2;
+  
+  static constexpr llvm::StringLiteral kKernelIdAttrName = "fngpu.kernel_id";
+  static constexpr llvm::StringLiteral kKernelNameAttrName = "fngpu.kernel_name";
 
-    llvm::SmallVector<Value> readArrays;
-    Value writeArray;
+  static int32_t getKernelId(fir::fngpu::LaunchOp launchOp,
+			     int32_t fallbackId) {
+    if (auto attr = launchOp->getAttrOfType<IntegerAttr>(kKernelIdAttrName))
+      return static_cast<int32_t>(attr.getInt());
 
-    Operation *computeOp = nullptr;
-  };
-
-
-  // Trace an array_coor index back to a load of the induction memref.
-  static bool indexIsInductionLoad(Value v, Value indMemref) {
-    while (true) {
-      if (auto cvt = v.getDefiningOp<fir::ConvertOp>()) { v = cvt.getValue(); continue; }
-      if (auto ld  = v.getDefiningOp<fir::LoadOp>())     return ld.getMemref() == indMemref;
-      return false;
-    }
+    return fallbackId;
   }
 
-  static bool indexIsLoadOf(Value v, Value memref) {
-    while (true) {
-      if (auto cvt = v.getDefiningOp<fir::ConvertOp>()) {
-	v = cvt.getValue();
-	continue;
-      }
+  static std::string getKernelName(fir::fngpu::LaunchOp launchOp,
+				   int32_t fallbackId) {
+    if (auto attr = launchOp->getAttrOfType<StringAttr>(kKernelNameAttrName))
+      return attr.getValue().str();
 
-      if (auto ld = v.getDefiningOp<fir::LoadOp>())
-	return ld.getMemref() == memref;
-
-      return false;
-    }
+    return "fngpu_kernel_" + std::to_string(fallbackId);
   }
 
-  static Value findInductionMemref(fir::DoLoopOp loop) {
-    if (loop.getRegionIterArgs().empty())
-      return {};
-
-    Value iterArg = loop.getRegionIterArgs()[0];
-
-    for (Operation &op : loop.getBody()->getOperations()) {
-      if (auto st = dyn_cast<fir::StoreOp>(op)) {
-	if (st.getValue() == iterArg)
-	  return st.getMemref();
-      }
-    }
-
-    return {};
-  }
-
-  static std::optional<ElementwiseKernel> recognize1D(fir::fngpu::LaunchOp launchOp) {
-    Region &region = launchOp.getRegion();
-    if (region.empty())
-      return std::nullopt;
-
-    Block &block = region.front();
-
-    fir::DoLoopOp loop;
-    for (Operation &op : block) {
-      if (auto dl = dyn_cast<fir::DoLoopOp>(op)) {
-	if (loop)
-	  return std::nullopt;
-	loop = dl;
-      }
-    }
-
-    if (!loop)
-      return std::nullopt;
-
-    ElementwiseKernel k;
-    k.rank = 1;
-    k.loop1D = loop;
-
-    Value indMemref = findInductionMemref(loop);
-    if (!indMemref)
-      return std::nullopt;
-
-    k.innerIndMemref = indMemref;
-
-    Value writeStoredValue;
-
-    for (Operation &op : loop.getBody()->getOperations()) {
-      auto ac = dyn_cast<fir::ArrayCoorOp>(op);
-      if (!ac)
-	continue;
-
-      auto indices = ac.getIndices();
-      if (indices.size() != 1)
-	return std::nullopt;
-
-      if (!indexIsLoadOf(indices[0], indMemref))
-	return std::nullopt;
-
-      Value base = ac.getMemref();
-
-      for (Operation *user : ac.getResult().getUsers()) {
-	if (isa<fir::LoadOp>(user)) {
-	  k.readArrays.push_back(base);
-	} else if (auto st = dyn_cast<fir::StoreOp>(user)) {
-	  if (k.writeArray)
-	    return std::nullopt;
-
-	  k.writeArray = base;
-	  writeStoredValue = st.getValue();
-	} else {
-	  return std::nullopt;
-	}
-      }
-    }
-
-    if (!k.writeArray)
-      return std::nullopt;
-
-    if (k.readArrays.size() != 2)
-      return std::nullopt;
-
-    k.computeOp = writeStoredValue.getDefiningOp();
-
-    if (!k.computeOp ||
-	!isa<arith::AddFOp, arith::SubFOp, arith::MulFOp, arith::DivFOp>(k.computeOp))
-									 
-      return std::nullopt;
-
-    return k;
-  }
-
-
-  static std::optional<ElementwiseKernel> recognize2D(fir::fngpu::LaunchOp launchOp) {
-    Region &region = launchOp.getRegion();
-    if (region.empty())
-      return std::nullopt;
-
-    Block &launchBlock = region.front();
-
-    // Launch region should contain exactly one outer loop.
-    fir::DoLoopOp outer;
-    for (Operation &op : launchBlock) {
-      if (auto loop = dyn_cast<fir::DoLoopOp>(op)) {
-	if (outer)
-	  return std::nullopt;
-	outer = loop;
-      }
-    }
-
-    if (!outer)
-      return std::nullopt;
-
-    // Outer loop body should contain exactly one inner loop.
-    fir::DoLoopOp inner;
-    for (Operation &op : outer.getBody()->getOperations()) {
-      if (auto loop = dyn_cast<fir::DoLoopOp>(op)) {
-	if (inner)
-	  return std::nullopt;
-	inner = loop;
-      }
-    }
-
-    if (!inner)
-      return std::nullopt;
-
-    ElementwiseKernel k;
-    k.rank = 2;
-    k.outerLoop = outer; // j
-    k.innerLoop = inner; // i
-
-    k.outerIndMemref = findInductionMemref(outer); // j alloca/declaration
-    k.innerIndMemref = findInductionMemref(inner); // i alloca/declaration
-
-    if (!k.outerIndMemref || !k.innerIndMemref)
-      return std::nullopt;
-
-    Value writeStoredValue;
-
-    for (Operation &op : inner.getBody()->getOperations()) {
-      auto ac = dyn_cast<fir::ArrayCoorOp>(op);
-      if (!ac)
-	continue;
-
-      auto indices = ac.getIndices();
-      if (indices.size() != 2)
-	return std::nullopt;
-
-      // FIR has array_coor %array %i, %j for a(i,j)
-      if (!indexIsLoadOf(indices[0], k.innerIndMemref))
-	return std::nullopt;
-
-      if (!indexIsLoadOf(indices[1], k.outerIndMemref))
-	return std::nullopt;
-
-      Value base = ac.getMemref();
-
-      for (Operation *user : ac.getResult().getUsers()) {
-	if (isa<fir::LoadOp>(user)) {
-	  k.readArrays.push_back(base);
-	} else if (auto st = dyn_cast<fir::StoreOp>(user)) {
-	  if (k.writeArray)
-	    return std::nullopt;
-
-	  k.writeArray = base;
-	  writeStoredValue = st.getValue();
-	} else {
-	  return std::nullopt;
-	}
-      }
-    }
-
-    if (!k.writeArray)
-      return std::nullopt;
-
-    if (k.readArrays.size() != 2)
-      return std::nullopt;
-
-    k.computeOp = writeStoredValue.getDefiningOp();
-
-    if (!k.computeOp ||
-	!isa<arith::AddFOp, arith::SubFOp, arith::MulFOp, arith::DivFOp>(
-									 k.computeOp))
-      return std::nullopt;
-
-    return k;
-  }
-
-  static std::optional<ElementwiseKernel> recognize(fir::fngpu::LaunchOp launchOp) {
-    if (auto k2 = recognize2D(launchOp))
-      return k2;
-
-    return recognize1D(launchOp);
-  }
-
-  // ---- Emit tt textual IR ---------------------------------------------------
   static StringRef ttArith(Operation *op) {
-    if (isa<arith::AddFOp>(op)) return "arith.addf";
-    if (isa<arith::SubFOp>(op)) return "arith.subf";
-    if (isa<arith::MulFOp>(op)) return "arith.mulf";
+    if (isa<arith::AddFOp>(op))
+      return "arith.addf";
+    if (isa<arith::SubFOp>(op))
+      return "arith.subf";
+    if (isa<arith::MulFOp>(op))
+      return "arith.mulf";
+
     return "arith.divf";
   }
 
-  static void emitTriton1D(const ElementwiseKernel &k, int64_t block, int id,
+  static void emitTriton1D(const fir::fngpu::ElementwiseKernel &k,
+			   int64_t block,
+			   StringRef kernelName,
 			   llvm::raw_ostream &os) {
-    // Kernel params: read0, read1, write, n
-    os << "tt.func @fngpu_kernel_" << id
+    os << "tt.func @" << kernelName
        << "(%a: !tt.ptr<f32>, %b: !tt.ptr<f32>, %c: !tt.ptr<f32>, %n: i32) "
        << "attributes {noinline = false} {\n";
+
     os << "  %pid  = tt.get_program_id x : i32\n";
     os << "  %blk  = arith.constant " << block << " : i32\n";
     os << "  %base = arith.muli %pid, %blk : i32\n";
+
     os << "  %rng  = tt.make_range {start = 0 : i32, end = " << block
        << " : i32} : tensor<" << block << "xi32>\n";
+
     os << "  %bS   = tt.splat %base : i32 -> tensor<" << block << "xi32>\n";
     os << "  %offs = arith.addi %bS, %rng : tensor<" << block << "xi32>\n";
+
     os << "  %nS   = tt.splat %n : i32 -> tensor<" << block << "xi32>\n";
     os << "  %mask = arith.cmpi slt, %offs, %nS : tensor<" << block << "xi32>\n";
+
     auto loadArr = [&](StringRef ptr, StringRef dst) {
-      os << "  " << dst << "p = tt.splat " << ptr << " : !tt.ptr<f32> -> tensor<"
-	 << block << "x!tt.ptr<f32>>\n";
+      os << "  " << dst << "p = tt.splat " << ptr
+	 << " : !tt.ptr<f32> -> tensor<" << block << "x!tt.ptr<f32>>\n";
+
       os << "  " << dst << "o = tt.addptr " << dst << "p, %offs : tensor<"
 	 << block << "x!tt.ptr<f32>>, tensor<" << block << "xi32>\n";
+
       os << "  " << dst << " = tt.load " << dst << "o, %mask : tensor<"
 	 << block << "x!tt.ptr<f32>>\n";
     };
+
     loadArr("%a", "%av");
     loadArr("%b", "%bv");
+
     os << "  %r = " << ttArith(k.computeOp) << " %av, %bv : tensor<"
        << block << "xf32>\n";
+
     os << "  %cp = tt.splat %c : !tt.ptr<f32> -> tensor<"
        << block << "x!tt.ptr<f32>>\n";
+
     os << "  %co = tt.addptr %cp, %offs : tensor<"
        << block << "x!tt.ptr<f32>>, tensor<" << block << "xi32>\n";
-    os << "  tt.store %co, %r, %mask : tensor<" << block << "x!tt.ptr<f32>>\n";
-    os << "  tt.return\n}\n\n";
+
+    os << "  tt.store %co, %r, %mask : tensor<" << block
+       << "x!tt.ptr<f32>>\n";
+
+    os << "  tt.return\n";
+    os << "}\n\n";
   }
 
-  static void emitTriton2D(const ElementwiseKernel &k,
+  static void emitTritonSaxpy1D(const fir::fngpu::ElementwiseKernel &k,
+				int64_t block,
+				StringRef kernelName,
+				llvm::raw_ostream &os) {
+    os << "tt.func @" << kernelName
+       << "(%a: !tt.ptr<f32>, %b: !tt.ptr<f32>, %c: !tt.ptr<f32>, "
+       << "%alpha: f32, %n: i32) attributes {noinline = false} {\n";
+
+    os << "  %pid  = tt.get_program_id x : i32\n";
+    os << "  %blk  = arith.constant " << block << " : i32\n";
+    os << "  %base = arith.muli %pid, %blk : i32\n";
+
+    os << "  %rng  = tt.make_range {start = 0 : i32, end = " << block
+       << " : i32} : tensor<" << block << "xi32>\n";
+
+    os << "  %bS   = tt.splat %base : i32 -> tensor<" << block << "xi32>\n";
+    os << "  %offs = arith.addi %bS, %rng : tensor<" << block << "xi32>\n";
+
+    os << "  %nS   = tt.splat %n : i32 -> tensor<" << block << "xi32>\n";
+    os << "  %mask = arith.cmpi slt, %offs, %nS : tensor<" << block << "xi32>\n";
+
+    auto loadArr = [&](StringRef ptr, StringRef dst) {
+      os << "  " << dst << "p = tt.splat " << ptr
+	 << " : !tt.ptr<f32> -> tensor<" << block << "x!tt.ptr<f32>>\n";
+
+      os << "  " << dst << "o = tt.addptr " << dst << "p, %offs : tensor<"
+	 << block << "x!tt.ptr<f32>>, tensor<" << block << "xi32>\n";
+
+      os << "  " << dst << " = tt.load " << dst << "o, %mask : tensor<"
+	 << block << "x!tt.ptr<f32>>\n";
+    };
+
+    loadArr("%a", "%av");
+    loadArr("%b", "%bv");
+
+    os << "  %alpha_s = tt.splat %alpha : f32 -> tensor<" << block << "xf32>\n";
+
+    os << "  %tmp = arith.mulf %alpha_s, %av : tensor<" << block << "xf32>\n";
+    os << "  %r = arith.addf %tmp, %bv : tensor<" << block << "xf32>\n";
+
+    os << "  %cp = tt.splat %c : !tt.ptr<f32> -> tensor<"
+       << block << "x!tt.ptr<f32>>\n";
+
+    os << "  %co = tt.addptr %cp, %offs : tensor<"
+       << block << "x!tt.ptr<f32>>, tensor<" << block << "xi32>\n";
+
+    os << "  tt.store %co, %r, %mask : tensor<" << block
+       << "x!tt.ptr<f32>>\n";
+
+    os << "  tt.return\n";
+    os << "}\n\n";
+  }
+
+  static int findValueIndex(ArrayRef<Value> values, Value value) {
+    for (auto it : llvm::enumerate(values)) {
+      if (it.value() == value)
+	return static_cast<int>(it.index());
+    }
+
+    return -1;
+  }
+
+  struct ExprTritonEmitterState {
+    int64_t block = 0;
+    unsigned nextTmp = 0;
+
+    llvm::SmallVector<bool> scalarSplatEmitted;
+    llvm::SmallVector<std::string> scalarSplatNames;
+  };
+
+  static StringRef ttArithForExprKind(fir::fngpu::ElementwiseExprKind kind) {
+    switch (kind) {
+    case fir::fngpu::ElementwiseExprKind::AddF:
+      return "arith.addf";
+    case fir::fngpu::ElementwiseExprKind::SubF:
+      return "arith.subf";
+    case fir::fngpu::ElementwiseExprKind::MulF:
+      return "arith.mulf";
+    case fir::fngpu::ElementwiseExprKind::DivF:
+      return "arith.divf";
+    default:
+      llvm_unreachable("not a binary arithmetic expression kind");
+    }
+  }
+
+  static std::string emitExpr1D(const fir::fngpu::ElementwiseKernel &k,
+				const fir::fngpu::ElementwiseExpr &expr,
+				ExprTritonEmitterState &state,
+				llvm::raw_ostream &os) {
+    int64_t block = state.block;
+
+    switch (expr.kind) {
+    case fir::fngpu::ElementwiseExprKind::ArrayLoad: {
+      int index = findValueIndex(k.readArrays, expr.source);
+      assert(index >= 0 && "array load source not found in read array list");
+
+      if (index == 0)
+	return "%read0v";
+      if (index == 1)
+	return "%read1v";
+
+      llvm_unreachable("only two read arrays are currently supported");
+    }
+
+    case fir::fngpu::ElementwiseExprKind::ScalarLoad: {
+      int index = findValueIndex(k.scalarRefs, expr.source);
+      assert(index >= 0 && "scalar source not found in scalar list");
+
+      if (static_cast<unsigned>(index) >= state.scalarSplatEmitted.size()) {
+	state.scalarSplatEmitted.resize(index + 1, false);
+	state.scalarSplatNames.resize(index + 1);
+      }
+
+      if (!state.scalarSplatEmitted[index]) {
+	std::string scalarName = "%scalar" + std::to_string(index);
+	std::string splatName = "%scalar" + std::to_string(index) + "_s";
+
+	os << "  " << splatName << " = tt.splat " << scalarName
+	   << " : f32 -> tensor<" << block << "xf32>\n";
+
+	state.scalarSplatEmitted[index] = true;
+	state.scalarSplatNames[index] = splatName;
+      }
+
+      return state.scalarSplatNames[index];
+    }
+
+    case fir::fngpu::ElementwiseExprKind::ConstantF32: {
+      unsigned id = state.nextTmp++;
+      std::string cst = "%cst" + std::to_string(id);
+      std::string splat = "%cst" + std::to_string(id) + "_s";
+
+      os << "  " << cst << " = arith.constant "
+	 << static_cast<float>(expr.f32Value) << " : f32\n";
+
+      os << "  " << splat << " = tt.splat " << cst
+	 << " : f32 -> tensor<" << block << "xf32>\n";
+
+      return splat;
+    }
+
+    case fir::fngpu::ElementwiseExprKind::AddF:
+    case fir::fngpu::ElementwiseExprKind::SubF:
+    case fir::fngpu::ElementwiseExprKind::MulF:
+    case fir::fngpu::ElementwiseExprKind::DivF: {
+      assert(expr.operands.size() == 2 && "binary expression expected");
+
+      std::string lhs = emitExpr1D(k, *expr.operands[0], state, os);
+      std::string rhs = emitExpr1D(k, *expr.operands[1], state, os);
+
+      std::string result = "%expr" + std::to_string(state.nextTmp++);
+
+      os << "  " << result << " = " << ttArithForExprKind(expr.kind)
+	 << " " << lhs << ", " << rhs
+	 << " : tensor<" << block << "xf32>\n";
+
+      return result;
+    }
+    }
+
+    llvm_unreachable("unknown expression kind");
+  }
+
+  static void emitTritonExpr1D(const fir::fngpu::ElementwiseKernel &k,
+			       int64_t block,
+			       StringRef kernelName,
+			       llvm::raw_ostream &os) {
+    assert(k.expression && "Expr1D kernel has no expression tree");
+
+    os << "tt.func @" << kernelName
+       << "(%a: !tt.ptr<f32>, %b: !tt.ptr<f32>, %c: !tt.ptr<f32>";
+
+    for (unsigned i = 0; i < k.scalarRefs.size(); ++i)
+      os << ", %scalar" << i << ": f32";
+
+    os << ", %n: i32) attributes {noinline = false} {\n";
+
+    os << "  %pid  = tt.get_program_id x : i32\n";
+    os << "  %blk  = arith.constant " << block << " : i32\n";
+    os << "  %base = arith.muli %pid, %blk : i32\n";
+
+    os << "  %rng  = tt.make_range {start = 0 : i32, end = " << block
+       << " : i32} : tensor<" << block << "xi32>\n";
+
+    os << "  %bS   = tt.splat %base : i32 -> tensor<" << block << "xi32>\n";
+    os << "  %offs = arith.addi %bS, %rng : tensor<" << block << "xi32>\n";
+
+    os << "  %nS   = tt.splat %n : i32 -> tensor<" << block << "xi32>\n";
+    os << "  %mask = arith.cmpi slt, %offs, %nS : tensor<" << block << "xi32>\n";
+
+    auto loadArr = [&](StringRef ptr, StringRef dst) {
+      os << "  " << dst << "p = tt.splat " << ptr
+	 << " : !tt.ptr<f32> -> tensor<" << block << "x!tt.ptr<f32>>\n";
+
+      os << "  " << dst << "o = tt.addptr " << dst << "p, %offs : tensor<"
+	 << block << "x!tt.ptr<f32>>, tensor<" << block << "xi32>\n";
+
+      os << "  " << dst << " = tt.load " << dst << "o, %mask : tensor<"
+	 << block << "x!tt.ptr<f32>>\n";
+    };
+
+    // For now the generic expression ABI still supports up to two read arrays.
+    if (!k.readArrays.empty())
+      loadArr("%a", "%read0v");
+
+    if (k.readArrays.size() >= 2)
+      loadArr("%b", "%read1v");
+
+    ExprTritonEmitterState state;
+    state.block = block;
+    state.scalarSplatEmitted.resize(k.scalarRefs.size(), false);
+    state.scalarSplatNames.resize(k.scalarRefs.size());
+
+    std::string result = emitExpr1D(k, *k.expression, state, os);
+
+    os << "  %cp = tt.splat %c : !tt.ptr<f32> -> tensor<"
+       << block << "x!tt.ptr<f32>>\n";
+
+    os << "  %co = tt.addptr %cp, %offs : tensor<"
+       << block << "x!tt.ptr<f32>>, tensor<" << block << "xi32>\n";
+
+    os << "  tt.store %co, " << result << ", %mask : tensor<" << block
+       << "x!tt.ptr<f32>>\n";
+
+    os << "  tt.return\n";
+    os << "}\n\n";
+  }
+  
+  static void emitTriton2D(const fir::fngpu::ElementwiseKernel &k,
 			   int64_t blockX,
 			   int64_t blockY,
-			   int id,
+			   StringRef kernelName,
 			   llvm::raw_ostream &os) {
     int64_t block = blockX * blockY;
 
-    os << "tt.func @fngpu_kernel_" << id
+    os << "tt.func @" << kernelName
        << "(%a: !tt.ptr<f32>, %b: !tt.ptr<f32>, %c: !tt.ptr<f32>, "
        << "%n: i32, %m: i32) attributes {noinline = false} {\n";
 
@@ -323,27 +382,38 @@ namespace {
     os << "  %local_i = arith.remui %r, %bx_s : tensor<" << block << "xi32>\n";
     os << "  %local_j = arith.divui %r, %bx_s : tensor<" << block << "xi32>\n";
 
-    os << "  %base_x_s = tt.splat %base_x : i32 -> tensor<" << block << "xi32>\n";
-    os << "  %base_y_s = tt.splat %base_y : i32 -> tensor<" << block << "xi32>\n";
+    os << "  %base_x_s = tt.splat %base_x : i32 -> tensor<" << block
+       << "xi32>\n";
+    os << "  %base_y_s = tt.splat %base_y : i32 -> tensor<" << block
+       << "xi32>\n";
 
-    os << "  %ix = arith.addi %base_x_s, %local_i : tensor<" << block << "xi32>\n";
-    os << "  %jy = arith.addi %base_y_s, %local_j : tensor<" << block << "xi32>\n";
+    os << "  %ix = arith.addi %base_x_s, %local_i : tensor<" << block
+       << "xi32>\n";
+    os << "  %jy = arith.addi %base_y_s, %local_j : tensor<" << block
+       << "xi32>\n";
 
     os << "  %n_s = tt.splat %n : i32 -> tensor<" << block << "xi32>\n";
     os << "  %m_s = tt.splat %m : i32 -> tensor<" << block << "xi32>\n";
 
-    os << "  %mask_x = arith.cmpi slt, %ix, %n_s : tensor<" << block << "xi32>\n";
-    os << "  %mask_y = arith.cmpi slt, %jy, %m_s : tensor<" << block << "xi32>\n";
-    os << "  %mask = arith.andi %mask_x, %mask_y : tensor<" << block << "xi1>\n";
+    os << "  %mask_x = arith.cmpi slt, %ix, %n_s : tensor<" << block
+       << "xi32>\n";
+    os << "  %mask_y = arith.cmpi slt, %jy, %m_s : tensor<" << block
+       << "xi32>\n";
+    os << "  %mask = arith.andi %mask_x, %mask_y : tensor<" << block
+       << "xi1>\n";
 
-    // Fortran column-major:
-    // offset = ix + jy * n
+    // Fortran column-major logical offset for zero-based generated coordinates:
+    //
+    //   offset = ix + jy * n
+    //
+    // This currently assumes supported loops are normal 1-based Fortran loops
+    // and the generated GPU coordinates are zero-based offsets.
     os << "  %jy_n = arith.muli %jy, %n_s : tensor<" << block << "xi32>\n";
     os << "  %offs = arith.addi %ix, %jy_n : tensor<" << block << "xi32>\n";
 
     auto loadArr = [&](StringRef ptr, StringRef dst) {
-      os << "  " << dst << "p = tt.splat " << ptr << " : !tt.ptr<f32> -> tensor<"
-	 << block << "x!tt.ptr<f32>>\n";
+      os << "  " << dst << "p = tt.splat " << ptr
+	 << " : !tt.ptr<f32> -> tensor<" << block << "x!tt.ptr<f32>>\n";
 
       os << "  " << dst << "o = tt.addptr " << dst << "p, %offs : tensor<"
 	 << block << "x!tt.ptr<f32>>, tensor<" << block << "xi32>\n";
@@ -364,47 +434,105 @@ namespace {
     os << "  %co = tt.addptr %cp, %offs : tensor<"
        << block << "x!tt.ptr<f32>>, tensor<" << block << "xi32>\n";
 
-    os << "  tt.store %co, %rval, %mask : tensor<"
-       << block << "x!tt.ptr<f32>>\n";
+    os << "  tt.store %co, %rval, %mask : tensor<" << block
+       << "x!tt.ptr<f32>>\n";
 
     os << "  tt.return\n";
     os << "}\n\n";
   }
 
-
-  static std::optional<unsigned>
-  kernelParamSlotForValue(const ElementwiseKernel &k, Value v) {
+  static std::optional<unsigned> kernelParamSlotForValue(const fir::fngpu::ElementwiseKernel &k, Value v) {
     for (unsigned i = 0; i < k.readArrays.size(); ++i) {
       if (k.readArrays[i] == v)
-	return i; // read0, read1, ...
+	return i;
     }
 
     if (k.writeArray == v)
-      return k.readArrays.size(); // write slot, currently 2
+      return k.readArrays.size(); // usually slot 2
+
+    unsigned scalarBaseSlot = k.readArrays.size() + 1; // read0, read1, write
+    for (unsigned i = 0; i < k.scalarRefs.size(); ++i) {
+      if (k.scalarRefs[i] == v)
+	return scalarBaseSlot + i;
+    }
 
     return std::nullopt;
-  }
+  }  
+
+
 
   static void emitJsonDescriptor(fir::fngpu::LaunchOp launchOp,
-				 const ElementwiseKernel &k,
-				 int64_t block,
-				 int id,
+				 const fir::fngpu::ElementwiseKernel &k,
+				 int64_t blockX,
+				 int64_t blockY,
+				 int64_t blockZ,
+				 int32_t kernelId,
+				 StringRef kernelName,
 				 llvm::raw_ostream &os,
 				 bool &firstKernel) {
     if (!firstKernel)
       os << ",\n";
     firstKernel = false;
 
+    StringRef kindName = "binary";
+    if (k.kind == fir::fngpu::ElementwiseKernelKind::Saxpy1D)
+      kindName = "saxpy1d";
+    else if (k.kind == fir::fngpu::ElementwiseKernelKind::Expr1D)
+      kindName = "expr1d";
+
     os << "    {\n";
-    os << "      \"name\": \"fngpu_kernel_" << id << "\",\n";
-    os << "      \"block\": " << block << ",\n";
-    os << "      \"grid\": \"cdiv(n, " << block << ")\",\n";
+    os << "      \"id\": " << kernelId << ",\n";
+    os << "      \"name\": \"" << kernelName << "\",\n";
+    os << "      \"kind\": \"" << kindName << "\",\n";
+    os << "      \"rank\": " << k.rank << ",\n";
+    os << "      \"tile\": [" << blockX << ", " << blockY << ", " << blockZ
+       << "],\n";
+    os << "      \"num_warps\": " << kTritonNumWarps << ",\n";
+    os << "      \"threads_per_warp\": " << kTritonThreadsPerWarp << ",\n";
+    os << "      \"num_ctas\": " << kTritonNumCTAs << ",\n";
+    os << "      \"num_stages\": " << kTritonNumStages << ",\n";
+    os << "      \"cuda_threads_per_cta\": " << kCudaThreadsPerCTA << ",\n";
+    os << "      \"triton_hidden_ptr_args\": " << kTritonHiddenPtrArgs << ",\n";
+
+    if (k.rank == 2) {
+      os << "      \"grid\": [\"cdiv(extent_x, tile_x)\", "
+	 << "\"cdiv(extent_y, tile_y)\", \"1\"],\n";
+    } else {
+      os << "      \"grid\": [\"cdiv(extent_x, tile_x)\", \"1\", \"1\"],\n";
+    }
 
     os << "      \"params\": [\n";
-    os << "        {\"slot\": 0, \"role\": \"read\",  \"name\": \"read0\", \"type\": \"ptr<f32>\"},\n";
-    os << "        {\"slot\": 1, \"role\": \"read\",  \"name\": \"read1\", \"type\": \"ptr<f32>\"},\n";
-    os << "        {\"slot\": 2, \"role\": \"write\", \"name\": \"write\", \"type\": \"ptr<f32>\"},\n";
-    os << "        {\"slot\": 3, \"role\": \"size\",  \"name\": \"n\",     \"type\": \"i32\"}\n";
+    os << "        {\"slot\": 0, \"role\": \"read\",     \"name\": \"read0\",    "
+      "\"type\": \"ptr<f32>\"},\n";
+    os << "        {\"slot\": 1, \"role\": \"read\",     \"name\": \"read1\",    "
+      "\"type\": \"ptr<f32>\"},\n";
+    os << "        {\"slot\": 2, \"role\": \"write\",    \"name\": \"write\",    "
+      "\"type\": \"ptr<f32>\"}";
+
+    unsigned nextSlot = 3;
+
+
+    for (unsigned i = 0; i < k.scalarRefs.size(); ++i) {
+      os << ",\n";
+      os << "        {\"slot\": " << nextSlot++
+	 << ", \"role\": \"scalar\",   \"name\": \"scalar" << i
+	 << "\",  \"type\": \"f32\"}";
+    }
+    
+    os << ",\n";
+    os << "        {\"slot\": " << nextSlot++
+       << ", \"role\": \"extent_x\", \"name\": \"extent_x\", "
+       << "\"type\": \"i32\"}";
+
+    if (k.rank == 2) {
+      os << ",\n";
+      os << "        {\"slot\": " << nextSlot++
+	 << ", \"role\": \"extent_y\", \"name\": \"extent_y\", "
+	 << "\"type\": \"i32\"}\n";
+    } else {
+      os << "\n";
+    }
+
     os << "      ],\n";
 
     os << "      \"pack\": [";
@@ -447,22 +575,26 @@ namespace {
   }
 
   struct FNGPULowerToTritonPass
-    : public fir::fngpu::impl::FNGPULowerToTritonBase<FNGPULowerToTritonPass> {
+    : public fir::fngpu::impl::FNGPULowerToTritonBase<
+    FNGPULowerToTritonPass> {
     void runOnOperation() override {
       ModuleOp module = getOperation();
 
+      std::string ttirPath = this->ttirOutput;
+      std::string jsonPath = this->jsonOutput;
+
       std::error_code ttirEc;
-      llvm::raw_fd_ostream ttirOs("fngpu_kernels.ttir", ttirEc);
+      llvm::raw_fd_ostream ttirOs(ttirPath, ttirEc);
       if (ttirEc) {
-	module.emitError("cannot open fngpu_kernels.ttir");
+	module.emitError("cannot open FNGPU TTIR output file: ") << ttirPath;
 	signalPassFailure();
 	return;
       }
 
       std::error_code jsonEc;
-      llvm::raw_fd_ostream jsonOs("fngpu_kernels.json", jsonEc);
+      llvm::raw_fd_ostream jsonOs(jsonPath, jsonEc);
       if (jsonEc) {
-	module.emitError("cannot open fngpu_kernels.json");
+	module.emitError("cannot open FNGPU JSON output file: ") << jsonPath;
 	signalPassFailure();
 	return;
       }
@@ -471,48 +603,67 @@ namespace {
       jsonOs << "  \"kernels\": [\n";
 
       bool firstKernel = true;
-      int id = 0;
+      int32_t fallbackId = 0;
 
-  
       ttirOs << "module attributes {"
-	     << "\"ttg.num-warps\" = 1 : i32, "
-	     << "\"ttg.num-ctas\" = 1 : i32, "
-	     << "\"ttg.num-stages\" = 3 : i32, "
-	     << "\"ttg.threads-per-warp\" = 32 : i32"
+	     << "\"ttg.num-warps\" = " << kTritonNumWarps << " : i32, "
+	     << "\"ttg.num-ctas\" = " << kTritonNumCTAs << " : i32, "
+	     << "\"ttg.num-stages\" = " << kTritonNumStages << " : i32, "
+	     << "\"ttg.threads-per-warp\" = " << kTritonThreadsPerWarp << " : i32"
 	     << "} {\n";
 
       module.walk([&](fir::fngpu::LaunchOp launchOp) {
-	auto k = recognize(launchOp);
-	if (!k) {
-	  launchOp.emitWarning("fngpu.launch not an elementwise pattern; skipped");
+	auto result = fir::fngpu::recognizeElementwiseKernel(launchOp);
+
+	if (result.failed()) {
+	  launchOp.emitWarning("FNGPU Triton emission skipped launch: ")
+            << result.getFailure().reason;
+	  ++fallbackId;
 	  return;
 	}
 
+	const fir::fngpu::ElementwiseKernel &k = result.getKernel();
+
+	int32_t kernelId = getKernelId(launchOp, fallbackId);
+	std::string kernelName = getKernelName(launchOp, kernelId);
+
 	llvm::ArrayRef<int64_t> tiles = launchOp.getTileSizes();
 
-	int64_t jsonBlock = 1024;
+	int64_t blockX = 1024;
+	int64_t blockY = 1;
+	int64_t blockZ = 1;
 
-	if (k->rank == 2) {
-	  int64_t bx = tiles.size() >= 1 ? tiles[0] : 16;
-	  int64_t by = tiles.size() >= 2 ? tiles[1] : 16;
+	if (k.rank == 2) {
+	  blockX = tiles.size() >= 1 ? tiles[0] : 16;
+	  blockY = tiles.size() >= 2 ? tiles[1] : 16;
+	  blockZ = 1;
 
-	  emitTriton2D(*k, bx, by, id, ttirOs);
-
-	  // For the old JSON scalar field, use total tile size for now.
-	  // Later we should change JSON to store block: [bx, by].
-	  jsonBlock = bx * by;
+	  emitTriton2D(k, blockX, blockY, kernelName, ttirOs);
 	} else {
-	  int64_t block = tiles.empty() ? 1024 : tiles[0];
+	  blockX = tiles.empty() ? 1024 : tiles[0];
+	  blockY = 1;
+	  blockZ = 1;
 
-	  emitTriton1D(*k, block, id, ttirOs);
-
-	  jsonBlock = block;
+	  if (k.kind == fir::fngpu::ElementwiseKernelKind::Expr1D)
+	    emitTritonExpr1D(k, blockX, kernelName, ttirOs);
+	  else if (k.kind == fir::fngpu::ElementwiseKernelKind::Saxpy1D)
+	    emitTritonSaxpy1D(k, blockX, kernelName, ttirOs);
+	  else
+	    emitTriton1D(k, blockX, kernelName, ttirOs);
+	  
 	}
+ 
+	emitJsonDescriptor(launchOp,
+			   k,
+			   blockX,
+			   blockY,
+			   blockZ,
+			   kernelId,
+			   kernelName,
+			   jsonOs,
+			   firstKernel);
 
-	emitJsonDescriptor(launchOp, *k, jsonBlock, id, jsonOs, firstKernel);
-
-	++id;
-
+	++fallbackId;
       });
 
       ttirOs << "}\n";

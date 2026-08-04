@@ -41,8 +41,10 @@ int main(int argc, char **argv) {
   fir::support::registerMLIRPassesForFortranTools();
   fir::registerFlangPipelinePasses();
   fir::fngpu::registerFNGPUOutlineKernelsPass();
+  fir::fngpu::registerFNGPUEmitFortranAliasesPass();
   fir::fngpu::registerFNGPULowerToTritonPass();
   fir::fngpu::registerFNGPULowerToRuntimePass();
+  fir::fngpu::registerFNGPUAssignKernelIdsPass();
 #ifdef FLANG_INCLUDE_TESTS
   fir::test::registerTestFIRAliasAnalysisPass();
   fir::test::registerTestFIROpenACCInterfacesPass();

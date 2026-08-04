@@ -15,6 +15,7 @@ set(LIBS
   FIRDialectSupport
   FIROpenACCAnalysis
   FIROpenACCSupport
+  FIRFNGPUDialect
   FIRSupport
   FIRTransforms
   HLFIRDialect
@@ -52,7 +53,8 @@ DEPENDS
   FIRDialect
   FIRSupport
   HLFIRDialect
-  MIFDialect)
+  MIFDialect
+  FIRFNGPUDialect)
 
 if(NOT FLANG_STANDALONE_BUILD)
   add_dependencies(FlangOptimizerTests
