@@ -441,23 +441,45 @@ namespace {
     os << "}\n\n";
   }
 
-  static std::optional<unsigned> kernelParamSlotForValue(const fir::fngpu::ElementwiseKernel &k, Value v) {
-    for (unsigned i = 0; i < k.readArrays.size(); ++i) {
-      if (k.readArrays[i] == v)
-	return i;
-    }
+  static llvm::SmallVector<unsigned>
+kernelParamSlotsForValue(const fir::fngpu::ElementwiseKernel &k, Value v) {
+  llvm::SmallVector<unsigned> slots;
 
-    if (k.writeArray == v)
-      return k.readArrays.size(); // usually slot 2
+  // Read arrays occupy slots:
+  //
+  //   read0 -> 0
+  //   read1 -> 1
+  //   read2 -> 2, if later supported
+  for (unsigned i = 0; i < k.readArrays.size(); ++i) {
+    if (k.readArrays[i] == v)
+      slots.push_back(i);
+  }
 
-    unsigned scalarBaseSlot = k.readArrays.size() + 1; // read0, read1, write
-    for (unsigned i = 0; i < k.scalarRefs.size(); ++i) {
-      if (k.scalarRefs[i] == v)
-	return scalarBaseSlot + i;
-    }
+  // Write array occupies the slot immediately after read arrays.
+  //
+  // For current kernels:
+  //
+  //   read0 = slot 0
+  //   read1 = slot 1
+  //   write = slot 2
+  //
+  // If the same SSA value is both read and written, e.g.
+  //
+  //   c(i) = c(i) + b(i)
+  //
+  // then this intentionally adds both the read slot and the write slot.
+  if (k.writeArray == v)
+    slots.push_back(k.readArrays.size());
 
-    return std::nullopt;
-  }  
+  // Scalars are after read arrays and write array.
+  unsigned scalarBaseSlot = k.readArrays.size() + 1;
+  for (unsigned i = 0; i < k.scalarRefs.size(); ++i) {
+    if (k.scalarRefs[i] == v)
+      slots.push_back(scalarBaseSlot + i);
+  }
+
+  return slots;
+}
 
 
 
@@ -541,34 +563,38 @@ namespace {
     llvm::ArrayRef<int32_t> targets = launchOp.getPackTargets();
 
     bool firstPack = true;
-    for (auto it : llvm::enumerate(packVars)) {
-      unsigned packIndex = it.index();
-      Value packValue = it.value();
+for (auto it : llvm::enumerate(packVars)) {
+  unsigned packIndex = it.index();
+  Value packValue = it.value();
 
-      std::optional<unsigned> slot = kernelParamSlotForValue(k, packValue);
-      if (!slot) {
-	launchOp.emitWarning(
-			     "PACK variable was not used by recognized Triton kernel body");
-	continue;
-      }
+  llvm::SmallVector<unsigned> slots = kernelParamSlotsForValue(k, packValue);
+  if (slots.empty()) {
+    launchOp.emitWarning()
+    << "PACK variable #" << packIndex
+    << " was not used by recognized Triton kernel body";
+    continue;
+  }
 
-      if (packIndex >= targets.size()) {
-	launchOp.emitWarning("PACK target list shorter than PACK var list");
-	continue;
-      }
+  if (packIndex >= targets.size()) {
+    launchOp.emitWarning("PACK target list shorter than PACK var list");
+    continue;
+  }
 
-      int32_t target = targets[packIndex];
+  int32_t target = targets[packIndex];
 
-      if (!firstPack)
-	os << ", ";
-      firstPack = false;
+  for (unsigned slot : slots) {
+    if (!firstPack)
+      os << ", ";
+    firstPack = false;
 
-      os << "{\"kernel_arg_slot\": " << *slot
-	 << ", \"target\": " << target
-	 << ", \"target_name\": \""
-	 << (target == 0 ? "host" : "device")
-	 << "\"}";
-    }
+    os << "{\"kernel_arg_slot\": " << slot
+       << ", \"target\": " << target
+       << ", \"target_name\": \""
+       << (target == 0 ? "host" : "device")
+       << "\"}";
+  }
+}
+
 
     os << "]\n";
     os << "    }";

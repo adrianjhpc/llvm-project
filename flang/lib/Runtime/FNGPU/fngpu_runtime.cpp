@@ -9,6 +9,7 @@
 #include <sstream>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 namespace {
 
@@ -156,6 +157,117 @@ namespace {
     return true;
   }
 
+  static bool jsonFindArrayText(const std::string &text,
+                              const char *key,
+                              std::string &out) {
+  std::size_t keyPos = jsonFindKey(text, key);
+  if (keyPos == std::string::npos)
+    return false;
+
+  std::size_t open = text.find('[', keyPos);
+  if (open == std::string::npos)
+    return false;
+
+  bool inString = false;
+  bool escaped = false;
+  int depth = 0;
+
+  for (std::size_t i = open; i < text.size(); ++i) {
+    char c = text[i];
+
+    if (escaped) {
+      escaped = false;
+      continue;
+    }
+
+    if (c == '\\' && inString) {
+      escaped = true;
+      continue;
+    }
+
+    if (c == '"') {
+      inString = !inString;
+      continue;
+    }
+
+    if (inString)
+      continue;
+
+    if (c == '[') {
+      ++depth;
+      continue;
+    }
+
+    if (c == ']') {
+      --depth;
+      if (depth == 0) {
+        out = text.substr(open + 1, i - open - 1);
+        return true;
+      }
+    }
+  }
+
+  return false;
+}
+
+  static constexpr int32_t FNGPU_PACK_TARGET_HOST = 0;
+static constexpr int32_t FNGPU_PACK_TARGET_DEVICE = 1;
+
+struct FNGPUPackEntry {
+  int32_t kernelArgSlot = -1;
+  int32_t target = FNGPU_PACK_TARGET_HOST;
+};
+
+
+static std::vector<FNGPUPackEntry>
+jsonParsePackEntries(const std::string &kernelObjectText) {
+  std::vector<FNGPUPackEntry> entries;
+
+  std::string packArray;
+  if (!jsonFindArrayText(kernelObjectText, "pack", packArray))
+    return entries;
+
+  std::size_t pos = 0;
+
+  while (true) {
+    std::size_t slotKey = packArray.find("\"kernel_arg_slot\"", pos);
+    if (slotKey == std::string::npos)
+      break;
+
+    std::size_t objectEnd = packArray.find('}', slotKey);
+    if (objectEnd == std::string::npos)
+      objectEnd = packArray.size();
+
+    std::string objectText = packArray.substr(slotKey, objectEnd - slotKey);
+
+    FNGPUPackEntry entry;
+
+    if (!jsonFindInt(objectText, "kernel_arg_slot", entry.kernelArgSlot)) {
+      pos = objectEnd;
+      continue;
+    }
+
+    if (!jsonFindInt(objectText, "target", entry.target))
+      entry.target = FNGPU_PACK_TARGET_HOST;
+
+    if (entry.target != FNGPU_PACK_TARGET_HOST &&
+        entry.target != FNGPU_PACK_TARGET_DEVICE) {
+      std::fprintf(stderr,
+                   "FNGPU warning: invalid pack target %d for slot %d; "
+                   "defaulting to host\n",
+                   entry.target,
+                   entry.kernelArgSlot);
+      entry.target = FNGPU_PACK_TARGET_HOST;
+    }
+
+    entries.push_back(entry);
+    pos = objectEnd + 1;
+  }
+
+  return entries;
+}
+
+
   static std::size_t findKernelObjectEnd(const std::string &json,
 					 std::size_t objectStart) {
     std::size_t nextKernelId = json.find("\n      \"id\"", objectStart + 1);
@@ -219,43 +331,59 @@ namespace {
     CUdeviceptr hidden0 = 0;
     CUdeviceptr hidden1 = 0;
   };
-
+  
   struct FNGPUKernelDesc {
-    int32_t id = -1;
-    std::string name;
-    std::string kind = "binary";
+  int32_t id = -1;
+  std::string name;
+  std::string kind = "binary";
 
-    int32_t rank = 1;
+  int32_t rank = 1;
 
-    int32_t tileX = 1024;
-    int32_t tileY = 1;
-    int32_t tileZ = 1;
+  int32_t tileX = 1024;
+  int32_t tileY = 1;
+  int32_t tileZ = 1;
 
-    int32_t numWarps = 1;
-    int32_t threadsPerWarp = 32;
-    int32_t numCTAs = 1;
-    int32_t numStages = 3;
+  int32_t numWarps = 1;
+  int32_t threadsPerWarp = 32;
+  int32_t numCTAs = 1;
+  int32_t numStages = 3;
 
-    int32_t cudaThreadsPerCTA = 32;
+  int32_t cudaThreadsPerCTA = 32;
 
-    // Number of hidden pointer parameters appended by the Triton/NVVM generated
-    // PTX after the explicit kernel arguments.
-    //
-    // Current generated kernels use two hidden pointer args.
-    int32_t tritonHiddenPtrArgs = 2;
-  };
+  // Number of hidden pointer parameters appended by Triton/NVVM PTX.
+  int32_t tritonHiddenPtrArgs = 2;
 
-  struct FNGPUKernelRegistry {
-    bool initialized = false;
+  // PACK metadata from JSON.
+  std::vector<FNGPUPackEntry> pack;
+};
 
-    CUcontext context = nullptr;
-    CUmodule module = nullptr;
 
-    std::unordered_map<int32_t, FNGPUKernelDesc> kernels;
-    std::unordered_map<int32_t, CUfunction> functionCache;
-  };
+struct FNGPUDeviceAllocation {
+  CUdeviceptr ptr = 0;
+  std::size_t bytes = 0;
+};
+
+struct FNGPUKernelRegistry {
+  bool initialized = false;
+
+  CUcontext context = nullptr;
+  CUmodule module = nullptr;
+
+  std::unordered_map<int32_t, FNGPUKernelDesc> kernels;
+  std::unordered_map<int32_t, CUfunction> functionCache;
+
+  // Device cache keyed by host pointer.
+  std::unordered_map<void *, FNGPUDeviceAllocation> deviceCache;
+};
 
   static FNGPUKernelRegistry fngpuRegistry;
+
+struct FNGPUDeviceArg {
+  CUdeviceptr ptr = 0;
+  bool cached = false;
+  int32_t target = FNGPU_PACK_TARGET_HOST;
+  int32_t slot = -1;
+};
 
   static bool fngpuDebugEnabled() {
     const char *value = std::getenv("FNGPU_DEBUG");
@@ -329,6 +457,8 @@ namespace {
       
       jsonFindInt(objectText, "triton_hidden_ptr_args",
 		  desc.tritonHiddenPtrArgs);
+
+      desc.pack = jsonParsePackEntries(objectText);
 
       if (desc.numWarps <= 0)
 	desc.numWarps = 1;
@@ -413,7 +543,14 @@ namespace {
 		     desc.threadsPerWarp,
 		     desc.cudaThreadsPerCTA,
 		     desc.tritonHiddenPtrArgs);
-      }
+      for (const FNGPUPackEntry &entry : desc.pack) {
+    std::fprintf(stderr,
+                 "FNGPU:   pack slot %d -> %s\n",
+                 entry.kernelArgSlot,
+                 entry.target == FNGPU_PACK_TARGET_DEVICE ? "device"
+                                                          : "host");
+  }
+  }
     }
 
     fngpuRegistry.initialized = true;
@@ -470,6 +607,208 @@ namespace {
 		 count);
     std::abort();
   }
+
+static int32_t fngpuPackTargetForSlot(const FNGPUKernelDesc *desc,
+                                      int32_t slot) {
+  if (!desc)
+    return FNGPU_PACK_TARGET_HOST;
+
+  for (const FNGPUPackEntry &entry : desc->pack) {
+    if (entry.kernelArgSlot == slot)
+      return entry.target;
+  }
+
+  return FNGPU_PACK_TARGET_HOST;
+}
+
+static const char *fngpuPackTargetName(int32_t target) {
+  return target == FNGPU_PACK_TARGET_DEVICE ? "device" : "host";
+}
+
+
+static FNGPUDeviceArg fngpuMakeTemporaryDeviceBuffer(void *hostPtr,
+                                                     std::size_t bytes,
+                                                     bool copyHostToDevice,
+                                                     int32_t slot,
+                                                     const char *role) {
+  FNGPUDeviceArg arg;
+  arg.cached = false;
+  arg.target = FNGPU_PACK_TARGET_HOST;
+  arg.slot = slot;
+
+  FNGPU_CUDA_CHECK(cuMemAlloc(&arg.ptr, bytes));
+
+  if (copyHostToDevice)
+    FNGPU_CUDA_CHECK(cuMemcpyHtoD(arg.ptr, hostPtr, bytes));
+
+  if (fngpuDebugEnabled()) {
+    std::fprintf(stderr,
+                 "FNGPU: temporary device buffer for %s slot %d: "
+                 "host=%p device=0x%llx bytes=%zu copy_in=%s\n",
+                 role,
+                 slot,
+                 hostPtr,
+                 static_cast<unsigned long long>(arg.ptr),
+                 bytes,
+                 copyHostToDevice ? "yes" : "no");
+  }
+
+  return arg;
+}
+
+static FNGPUDeviceArg fngpuGetCachedDeviceBuffer(void *hostPtr,
+                                                 std::size_t bytes,
+                                                 bool copyHostToDeviceOnMiss,
+                                                 int32_t slot,
+                                                 const char *role) {
+  FNGPUDeviceArg arg;
+  arg.cached = true;
+  arg.target = FNGPU_PACK_TARGET_DEVICE;
+  arg.slot = slot;
+
+  auto it = fngpuRegistry.deviceCache.find(hostPtr);
+
+  bool needAllocate = false;
+  bool cacheMiss = false;
+
+  if (it == fngpuRegistry.deviceCache.end()) {
+    needAllocate = true;
+    cacheMiss = true;
+  } else if (it->second.bytes != bytes) {
+    if (fngpuDebugEnabled()) {
+      std::fprintf(stderr,
+                   "FNGPU: cache size mismatch for %s slot %d host=%p; "
+                   "old bytes=%zu new bytes=%zu, reallocating\n",
+                   role,
+                   slot,
+                   hostPtr,
+                   it->second.bytes,
+                   bytes);
+    }
+
+    FNGPU_CUDA_CHECK(cuMemFree(it->second.ptr));
+    fngpuRegistry.deviceCache.erase(it);
+    needAllocate = true;
+    cacheMiss = true;
+  }
+
+  if (needAllocate) {
+    FNGPUDeviceAllocation allocation;
+    allocation.bytes = bytes;
+    FNGPU_CUDA_CHECK(cuMemAlloc(&allocation.ptr, bytes));
+
+    if (copyHostToDeviceOnMiss)
+      FNGPU_CUDA_CHECK(cuMemcpyHtoD(allocation.ptr, hostPtr, bytes));
+
+    auto inserted = fngpuRegistry.deviceCache.emplace(hostPtr, allocation);
+    arg.ptr = inserted.first->second.ptr;
+
+    if (fngpuDebugEnabled()) {
+      std::fprintf(stderr,
+                   "FNGPU: cache miss for %s slot %d target=device: "
+                   "host=%p device=0x%llx bytes=%zu copy_in=%s\n",
+                   role,
+                   slot,
+                   hostPtr,
+                   static_cast<unsigned long long>(arg.ptr),
+                   bytes,
+                   copyHostToDeviceOnMiss ? "yes" : "no");
+    }
+  } else {
+    arg.ptr = it->second.ptr;
+
+    if (fngpuDebugEnabled()) {
+      std::fprintf(stderr,
+                   "FNGPU: cache hit for %s slot %d target=device: "
+                   "host=%p device=0x%llx bytes=%zu\n",
+                   role,
+                   slot,
+                   hostPtr,
+                   static_cast<unsigned long long>(arg.ptr),
+                   bytes);
+    }
+  }
+
+  return arg;
+}
+
+static FNGPUDeviceArg fngpuPrepareReadArray(float *hostPtr,
+                                            std::size_t bytes,
+                                            int32_t target,
+                                            int32_t slot) {
+  if (target == FNGPU_PACK_TARGET_DEVICE) {
+    // Device target means cache/reuse device allocation. Copy in only on miss.
+    return fngpuGetCachedDeviceBuffer(static_cast<void *>(hostPtr),
+                                      bytes,
+                                      /*copyHostToDeviceOnMiss=*/true,
+                                      slot,
+                                      "read");
+  }
+
+  return fngpuMakeTemporaryDeviceBuffer(static_cast<void *>(hostPtr),
+                                        bytes,
+                                        /*copyHostToDevice=*/true,
+                                        slot,
+                                        "read");
+}
+
+static FNGPUDeviceArg fngpuPrepareWriteArray(float *hostPtr,
+                                             std::size_t bytes,
+                                             int32_t target,
+                                             int32_t slot) {
+  if (target == FNGPU_PACK_TARGET_DEVICE) {
+    // Device target means keep the output allocation cached. No copy-in needed.
+    return fngpuGetCachedDeviceBuffer(static_cast<void *>(hostPtr),
+                                      bytes,
+                                      /*copyHostToDeviceOnMiss=*/false,
+                                      slot,
+                                      "write");
+  }
+
+  return fngpuMakeTemporaryDeviceBuffer(static_cast<void *>(hostPtr),
+                                        bytes,
+                                        /*copyHostToDevice=*/false,
+                                        slot,
+                                        "write");
+}
+
+static void fngpuCopyBackWriteArray(float *hostPtr,
+                                    const FNGPUDeviceArg &arg,
+                                    std::size_t bytes) {
+  // Conservative semantics: always copy writes back to host after launch.
+  // Even target=device remains host-visible for now.
+  FNGPU_CUDA_CHECK(cuMemcpyDtoH(hostPtr, arg.ptr, bytes));
+
+  if (fngpuDebugEnabled()) {
+    std::fprintf(stderr,
+                 "FNGPU: copied write slot %d device=0x%llx -> host=%p "
+                 "bytes=%zu target=%s\n",
+                 arg.slot,
+                 static_cast<unsigned long long>(arg.ptr),
+                 static_cast<void *>(hostPtr),
+                 bytes,
+                 fngpuPackTargetName(arg.target));
+  }
+}
+
+static void fngpuReleaseDeviceArg(const FNGPUDeviceArg &arg) {
+  if (!arg.ptr)
+    return;
+
+  if (arg.cached)
+    return;
+
+  FNGPU_CUDA_CHECK(cuMemFree(arg.ptr));
+
+  if (fngpuDebugEnabled()) {
+    std::fprintf(stderr,
+                 "FNGPU: freed temporary device buffer for slot %d "
+                 "device=0x%llx\n",
+                 arg.slot,
+                 static_cast<unsigned long long>(arg.ptr));
+  }
+}
+
 
   // -------------------------------------------------------------------------- //
   // CUDA module/function management
@@ -1280,25 +1619,60 @@ extern "C" void __fngpu_launch_f32_v1(
 
   std::size_t numBytes = elemCount * sizeof(float);
 
-  CUdeviceptr dRead0 = 0;
-  CUdeviceptr dRead1 = 0;
-  CUdeviceptr dRead2 = 0;
-  CUdeviceptr dWrite = 0;
+const FNGPUKernelDesc *desc = fngpuLookupKernelDesc(kernelId);
 
-  FNGPU_CUDA_CHECK(cuMemAlloc(&dRead0, numBytes));
-  FNGPU_CUDA_CHECK(cuMemcpyHtoD(dRead0, read0, numBytes));
+// Current JSON parameter order is:
+//   slot 0 = read0
+//   slot 1 = read1
+//   slot 2 = read2 if present, otherwise write for current kernels
+//   slot numReadArrays = write
+//
+// For current FNGPU kernels numReadArrays is normally 2, so write slot is 2.
+int32_t read0Slot = 0;
+int32_t read1Slot = 1;
+int32_t read2Slot = 2;
+int32_t writeSlot = numReadArrays;
 
-  if (numReadArrays >= 2) {
-    FNGPU_CUDA_CHECK(cuMemAlloc(&dRead1, numBytes));
-    FNGPU_CUDA_CHECK(cuMemcpyHtoD(dRead1, read1, numBytes));
-  }
+int32_t read0Target = fngpuPackTargetForSlot(desc, read0Slot);
+int32_t read1Target = fngpuPackTargetForSlot(desc, read1Slot);
+int32_t read2Target = fngpuPackTargetForSlot(desc, read2Slot);
+int32_t writeTarget = fngpuPackTargetForSlot(desc, writeSlot);
 
-  if (numReadArrays >= 3) {
-    FNGPU_CUDA_CHECK(cuMemAlloc(&dRead2, numBytes));
-    FNGPU_CUDA_CHECK(cuMemcpyHtoD(dRead2, read2, numBytes));
-  }
+if (fngpuDebugEnabled()) {
+  std::fprintf(stderr,
+               "FNGPU: pack targets for kernel id %d: "
+               "read0(slot %d)=%s read1(slot %d)=%s "
+               "read2(slot %d)=%s write(slot %d)=%s\n",
+               kernelId,
+               read0Slot,
+               fngpuPackTargetName(read0Target),
+               read1Slot,
+               fngpuPackTargetName(read1Target),
+               read2Slot,
+               fngpuPackTargetName(read2Target),
+               writeSlot,
+               fngpuPackTargetName(writeTarget));
+}
 
-  FNGPU_CUDA_CHECK(cuMemAlloc(&dWrite, numBytes));
+FNGPUDeviceArg read0Dev =
+    fngpuPrepareReadArray(read0, numBytes, read0Target, read0Slot);
+
+FNGPUDeviceArg read1Dev;
+if (numReadArrays >= 2)
+  read1Dev = fngpuPrepareReadArray(read1, numBytes, read1Target, read1Slot);
+
+FNGPUDeviceArg read2Dev;
+if (numReadArrays >= 3)
+  read2Dev = fngpuPrepareReadArray(read2, numBytes, read2Target, read2Slot);
+
+FNGPUDeviceArg writeDev =
+    fngpuPrepareWriteArray(write, numBytes, writeTarget, writeSlot);
+
+CUdeviceptr dRead0 = read0Dev.ptr;
+CUdeviceptr dRead1 = read1Dev.ptr;
+CUdeviceptr dRead2 = read2Dev.ptr;
+CUdeviceptr dWrite = writeDev.ptr;
+
 
   fngpuValidateSupportedHiddenPtrArgCount(kernelId);
   FNGPUHiddenTritonArgs hidden;
@@ -1381,18 +1755,19 @@ if (argCount > 16) {
 
 
 
-  FNGPU_CUDA_CHECK(cuCtxSynchronize());
+FNGPU_CUDA_CHECK(cuCtxSynchronize());
 
-  FNGPU_CUDA_CHECK(cuMemcpyDtoH(write, dWrite, numBytes));
+fngpuCopyBackWriteArray(write, writeDev, numBytes);
 
-  FNGPU_CUDA_CHECK(cuMemFree(dRead0));
+fngpuReleaseDeviceArg(read0Dev);
 
-  if (dRead1)
-    FNGPU_CUDA_CHECK(cuMemFree(dRead1));
+if (numReadArrays >= 2)
+  fngpuReleaseDeviceArg(read1Dev);
 
-  if (dRead2)
-    FNGPU_CUDA_CHECK(cuMemFree(dRead2));
+if (numReadArrays >= 3)
+  fngpuReleaseDeviceArg(read2Dev);
 
-  FNGPU_CUDA_CHECK(cuMemFree(dWrite));
+fngpuReleaseDeviceArg(writeDev);
+
 }
 
