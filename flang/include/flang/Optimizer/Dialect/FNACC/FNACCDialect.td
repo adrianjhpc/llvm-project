@@ -1,16 +1,16 @@
-#ifndef FORTRAN_OPTIMIZER_DIALECT_FNGPU_DIALECT
-#define FORTRAN_OPTIMIZER_DIALECT_FNGPU_DIALECT
+#ifndef FORTRAN_OPTIMIZER_DIALECT_FNACC_DIALECT
+#define FORTRAN_OPTIMIZER_DIALECT_FNACC_DIALECT
 
 include "mlir/IR/OpBase.td"
 
-def FNGPU_Dialect : Dialect {
-  let name = "fngpu";
-  let cppNamespace = "::fir::fngpu";
+def FNACC_Dialect : Dialect {
+  let name = "fnacc";
+  let cppNamespace = "::fir::fnacc";
   let summary = "The Flang GPU directive dialect";
   let description = [{
-    This dialect represents `$FNGPU` pragmas in Flang before they are
+    This dialect represents `$FNACC` pragmas in Flang before they are
     lowered to Triton or GPU execution models.
   }];
 }
 
-#endif // FORTRAN_OPTIMIZER_DIALECT_FNGPU_DIALECT
+#endif // FORTRAN_OPTIMIZER_DIALECT_FNACC_DIALECT

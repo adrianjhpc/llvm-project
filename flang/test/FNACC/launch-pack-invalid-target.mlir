@@ -3,7 +3,7 @@
 module {
   func.func @bad_pack_target(
       %a: !fir.ref<!fir.array<?xf32>>) {
-    fngpu.launch tile_sizes = [128] pack(%a : !fir.ref<!fir.array<?xf32>>) {
+    fnacc.launch tile_sizes = [128] pack(%a : !fir.ref<!fir.array<?xf32>>) {
       "fir.end"() : () -> ()
     } attributes {pack_targets = array<i32: 7>}
 

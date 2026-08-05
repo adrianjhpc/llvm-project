@@ -1,6 +1,6 @@
 // RUN: fir-opt \
-// RUN:   --fngpu-assign-kernel-ids \
-// RUN:   --fngpu-lower-to-triton="ttir-output=%t.ttir json-output=%t.json" \
+// RUN:   --fnacc-assign-kernel-ids \
+// RUN:   --fnacc-lower-to-triton="ttir-output=%t.ttir json-output=%t.json" \
 // RUN:   %s -o /dev/null
 // RUN: FileCheck %s --check-prefix=TTIR --input-file=%t.ttir
 // RUN: FileCheck %s --check-prefix=JSON --input-file=%t.json
@@ -20,7 +20,7 @@ module {
     %nidx = fir.convert %n : (i32) -> index
     %shape = fir.shape %nidx : (index) -> !fir.shape<1>
 
-    fngpu.launch tile_sizes = [128] {
+    fnacc.launch tile_sizes = [128] {
       fir.do_loop %iv = %c1_i32 to %n step %c1_i32 : i32 {
         fir.store %iv to %i : !fir.ref<i32>
 
@@ -56,10 +56,10 @@ module {
 
 // CHECK: %[[NREAD:.*]] = arith.constant 2 : i32
 // CHECK: %[[NSCALAR:.*]] = arith.constant 2 : i32
-// CHECK: call @__fngpu_launch_f32_v1
+// CHECK: call @__fnacc_launch_f32_v1
 // CHECK-SAME: %[[NREAD]], %[[NSCALAR]]
 
-// TTIR: tt.func @fngpu_kernel_0
+// TTIR: tt.func @fnacc_kernel_0
 // TTIR-SAME: %a: !tt.ptr<f32>
 // TTIR-SAME: %b: !tt.ptr<f32>
 // TTIR-SAME: %c: !tt.ptr<f32>

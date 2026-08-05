@@ -1,6 +1,6 @@
 // RUN: fir-opt \
-// RUN:   --fngpu-assign-kernel-ids \
-// RUN:   --fngpu-lower-to-triton="ttir-output=%t.ttir json-output=%t.json" \
+// RUN:   --fnacc-assign-kernel-ids \
+// RUN:   --fnacc-lower-to-triton="ttir-output=%t.ttir json-output=%t.json" \
 // RUN:   %s -o /dev/null
 // RUN: FileCheck %s --check-prefix=JSON --input-file=%t.json
 // RUN: python3 -m json.tool %t.json > /dev/null
@@ -24,7 +24,7 @@ module {
     //
     //   slot 0 or 1, depending read order, for the read use of c
     //   slot 2 for the write use of c
-    fngpu.launch tile_sizes = [128] pack(%c : !fir.ref<!fir.array<?xf32>>) {
+    fnacc.launch tile_sizes = [128] pack(%c : !fir.ref<!fir.array<?xf32>>) {
       fir.do_loop %iv = %c1_i32 to %n step %c1_i32 : i32 {
         fir.store %iv to %i : !fir.ref<i32>
 

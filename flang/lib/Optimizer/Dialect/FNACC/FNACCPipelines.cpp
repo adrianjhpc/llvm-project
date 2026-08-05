@@ -1,22 +1,22 @@
-#include "flang/Optimizer/Dialect/FNGPU/FNGPUPasses.h"
+#include "flang/Optimizer/Dialect/FNACC/FNACCPasses.h"
 
 #include "mlir/Pass/PassManager.h"
 #include "mlir/Pass/PassRegistry.h"
 
-namespace fir::fngpu {
+namespace fir::fnacc {
 namespace {
 
-struct FNGPUPipelineOptions
-    : public mlir::PassPipelineOptions<FNGPUPipelineOptions> {
+struct FNACCPipelineOptions
+    : public mlir::PassPipelineOptions<FNACCPipelineOptions> {
   Option<std::string> ttirOutput{
       *this, "ttir-output",
-      llvm::cl::desc("Path to write generated FNGPU Triton TTIR"),
-      llvm::cl::init("fngpu_kernels.ttir")};
+      llvm::cl::desc("Path to write generated FNACC Triton TTIR"),
+      llvm::cl::init("fnacc_kernels.ttir")};
 
   Option<std::string> jsonOutput{
       *this, "json-output",
-      llvm::cl::desc("Path to write generated FNGPU kernel descriptor JSON"),
-      llvm::cl::init("fngpu_kernels.json")};
+      llvm::cl::desc("Path to write generated FNACC kernel descriptor JSON"),
+      llvm::cl::init("fnacc_kernels.json")};
 
   Option<bool> emitFortranAliases{
       *this, "emit-fortran-aliases",
@@ -25,28 +25,28 @@ struct FNGPUPipelineOptions
       llvm::cl::init(false)};
 };
 
-void buildFNGPUPipeline(mlir::OpPassManager &pm,
-                        const FNGPUPipelineOptions &options) {
-  pm.addPass(createFNGPUAssignKernelIdsPass());
+void buildFNACCPipeline(mlir::OpPassManager &pm,
+                        const FNACCPipelineOptions &options) {
+  pm.addPass(createFNACCAssignKernelIdsPass());
 
   pm.addPass(
-      createFNGPULowerToTritonPass(options.ttirOutput, options.jsonOutput));
+      createFNACCLowerToTritonPass(options.ttirOutput, options.jsonOutput));
 
-  pm.addPass(createFNGPULowerToRuntimePass());
+  pm.addPass(createFNACCLowerToRuntimePass());
 
   if (options.emitFortranAliases)
-    pm.addPass(createFNGPUEmitFortranAliasesPass());
+    pm.addPass(createFNACCEmitFortranAliasesPass());
 }
 
 } // namespace
 
-void registerFNGPUPipelines() {
-  mlir::PassPipelineRegistration<FNGPUPipelineOptions>(
-      "fngpu-pipeline",
-      "Run the experimental FNGPU lowering pipeline: assign kernel ids, emit "
-      "Triton TTIR/JSON metadata, and lower host FNGPU operations to runtime "
+void registerFNACCPipelines() {
+  mlir::PassPipelineRegistration<FNACCPipelineOptions>(
+      "fnacc-pipeline",
+      "Run the experimental FNACC lowering pipeline: assign kernel ids, emit "
+      "Triton TTIR/JSON metadata, and lower host FNACC operations to runtime "
       "calls",
-      buildFNGPUPipeline);
+      buildFNACCPipeline);
 }
 
-} // namespace fir::fngpu
+} // namespace fir::fnacc

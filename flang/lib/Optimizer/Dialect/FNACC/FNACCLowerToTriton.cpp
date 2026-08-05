@@ -1,6 +1,6 @@
-#include "flang/Optimizer/Dialect/FNGPU/FNGPUDialect.h"
-#include "flang/Optimizer/Dialect/FNGPU/FNGPUKernelAnalysis.h"
-#include "flang/Optimizer/Dialect/FNGPU/FNGPUPasses.h"
+#include "flang/Optimizer/Dialect/FNACC/FNACCDialect.h"
+#include "flang/Optimizer/Dialect/FNACC/FNACCKernelAnalysis.h"
+#include "flang/Optimizer/Dialect/FNACC/FNACCPasses.h"
 
 #include "flang/Optimizer/Dialect/FIRDialect.h"
 #include "flang/Optimizer/Dialect/FIROps.h"
@@ -14,10 +14,10 @@
 #include <optional>
 #include <string>
 
-namespace fir::fngpu {
-#define GEN_PASS_DEF_FNGPULOWERTOTRITON
-#include "flang/Optimizer/Dialect/FNGPU/FNGPUPasses.h.inc"
-} // namespace fir::fngpu
+namespace fir::fnacc {
+#define GEN_PASS_DEF_FNACCLOWERTOTRITON
+#include "flang/Optimizer/Dialect/FNACC/FNACCPasses.h.inc"
+} // namespace fir::fnacc
 
 using namespace mlir;
 
@@ -32,7 +32,7 @@ static constexpr int32_t kCudaThreadsPerCTA =
     kTritonNumWarps * kTritonThreadsPerWarp;
 
 // Triton/NVVM-generated PTX currently appends two hidden pointer parameters
-// after the explicit kernel parameters for the FNGPU kernels we emit.
+// after the explicit kernel parameters for the FNACC kernels we emit.
 //
 // Example 1-D binary PTX:
 //
@@ -46,22 +46,22 @@ static constexpr int32_t kCudaThreadsPerCTA =
 // The runtime appends two null CUdeviceptr values for these hidden args.
 static constexpr int32_t kTritonHiddenPtrArgs = 2;
 
-static constexpr llvm::StringLiteral kKernelIdAttrName = "fngpu.kernel_id";
-static constexpr llvm::StringLiteral kKernelNameAttrName = "fngpu.kernel_name";
+static constexpr llvm::StringLiteral kKernelIdAttrName = "fnacc.kernel_id";
+static constexpr llvm::StringLiteral kKernelNameAttrName = "fnacc.kernel_name";
 
-static int32_t getKernelId(fir::fngpu::LaunchOp launchOp, int32_t fallbackId) {
+static int32_t getKernelId(fir::fnacc::LaunchOp launchOp, int32_t fallbackId) {
   if (auto attr = launchOp->getAttrOfType<IntegerAttr>(kKernelIdAttrName))
     return static_cast<int32_t>(attr.getInt());
 
   return fallbackId;
 }
 
-static std::string getKernelName(fir::fngpu::LaunchOp launchOp,
+static std::string getKernelName(fir::fnacc::LaunchOp launchOp,
                                  int32_t fallbackId) {
   if (auto attr = launchOp->getAttrOfType<StringAttr>(kKernelNameAttrName))
     return attr.getValue().str();
 
-  return "fngpu_kernel_" + std::to_string(fallbackId);
+  return "fnacc_kernel_" + std::to_string(fallbackId);
 }
 
 static StringRef ttArith(Operation *op) {
@@ -75,7 +75,7 @@ static StringRef ttArith(Operation *op) {
   return "arith.divf";
 }
 
-static void emitTriton1D(const fir::fngpu::ElementwiseKernel &k, int64_t block,
+static void emitTriton1D(const fir::fnacc::ElementwiseKernel &k, int64_t block,
                          StringRef kernelName, llvm::raw_ostream &os) {
   os << "tt.func @" << kernelName
      << "(%a: !tt.ptr<f32>, %b: !tt.ptr<f32>, %c: !tt.ptr<f32>, %n: i32) "
@@ -123,7 +123,7 @@ static void emitTriton1D(const fir::fngpu::ElementwiseKernel &k, int64_t block,
   os << "}\n\n";
 }
 
-static void emitTritonSaxpy1D(const fir::fngpu::ElementwiseKernel &k,
+static void emitTritonSaxpy1D(const fir::fnacc::ElementwiseKernel &k,
                               int64_t block, StringRef kernelName,
                               llvm::raw_ostream &os) {
   os << "tt.func @" << kernelName
@@ -191,29 +191,29 @@ struct ExprTritonEmitterState {
   llvm::SmallVector<std::string> scalarSplatNames;
 };
 
-static StringRef ttArithForExprKind(fir::fngpu::ElementwiseExprKind kind) {
+static StringRef ttArithForExprKind(fir::fnacc::ElementwiseExprKind kind) {
   switch (kind) {
-  case fir::fngpu::ElementwiseExprKind::AddF:
+  case fir::fnacc::ElementwiseExprKind::AddF:
     return "arith.addf";
-  case fir::fngpu::ElementwiseExprKind::SubF:
+  case fir::fnacc::ElementwiseExprKind::SubF:
     return "arith.subf";
-  case fir::fngpu::ElementwiseExprKind::MulF:
+  case fir::fnacc::ElementwiseExprKind::MulF:
     return "arith.mulf";
-  case fir::fngpu::ElementwiseExprKind::DivF:
+  case fir::fnacc::ElementwiseExprKind::DivF:
     return "arith.divf";
   default:
     llvm_unreachable("not a binary arithmetic expression kind");
   }
 }
 
-static std::string emitExpr1D(const fir::fngpu::ElementwiseKernel &k,
-                              const fir::fngpu::ElementwiseExpr &expr,
+static std::string emitExpr1D(const fir::fnacc::ElementwiseKernel &k,
+                              const fir::fnacc::ElementwiseExpr &expr,
                               ExprTritonEmitterState &state,
                               llvm::raw_ostream &os) {
   int64_t block = state.block;
 
   switch (expr.kind) {
-  case fir::fngpu::ElementwiseExprKind::ArrayLoad: {
+  case fir::fnacc::ElementwiseExprKind::ArrayLoad: {
     int index = findValueIndex(k.readArrays, expr.source);
     assert(index >= 0 && "array load source not found in read array list");
 
@@ -225,7 +225,7 @@ static std::string emitExpr1D(const fir::fngpu::ElementwiseKernel &k,
     llvm_unreachable("only two read arrays are currently supported");
   }
 
-  case fir::fngpu::ElementwiseExprKind::ScalarLoad: {
+  case fir::fnacc::ElementwiseExprKind::ScalarLoad: {
     int index = findValueIndex(k.scalarRefs, expr.source);
     assert(index >= 0 && "scalar source not found in scalar list");
 
@@ -248,7 +248,7 @@ static std::string emitExpr1D(const fir::fngpu::ElementwiseKernel &k,
     return state.scalarSplatNames[index];
   }
 
-  case fir::fngpu::ElementwiseExprKind::ConstantF32: {
+  case fir::fnacc::ElementwiseExprKind::ConstantF32: {
     unsigned id = state.nextTmp++;
     std::string cst = "%cst" + std::to_string(id);
     std::string splat = "%cst" + std::to_string(id) + "_s";
@@ -262,10 +262,10 @@ static std::string emitExpr1D(const fir::fngpu::ElementwiseKernel &k,
     return splat;
   }
 
-  case fir::fngpu::ElementwiseExprKind::AddF:
-  case fir::fngpu::ElementwiseExprKind::SubF:
-  case fir::fngpu::ElementwiseExprKind::MulF:
-  case fir::fngpu::ElementwiseExprKind::DivF: {
+  case fir::fnacc::ElementwiseExprKind::AddF:
+  case fir::fnacc::ElementwiseExprKind::SubF:
+  case fir::fnacc::ElementwiseExprKind::MulF:
+  case fir::fnacc::ElementwiseExprKind::DivF: {
     assert(expr.operands.size() == 2 && "binary expression expected");
 
     std::string lhs = emitExpr1D(k, *expr.operands[0], state, os);
@@ -283,7 +283,7 @@ static std::string emitExpr1D(const fir::fngpu::ElementwiseKernel &k,
   llvm_unreachable("unknown expression kind");
 }
 
-static void emitTritonExpr1D(const fir::fngpu::ElementwiseKernel &k,
+static void emitTritonExpr1D(const fir::fnacc::ElementwiseKernel &k,
                              int64_t block, StringRef kernelName,
                              llvm::raw_ostream &os) {
   assert(k.expression && "Expr1D kernel has no expression tree");
@@ -347,7 +347,7 @@ static void emitTritonExpr1D(const fir::fngpu::ElementwiseKernel &k,
   os << "}\n\n";
 }
 
-static void emitTriton2D(const fir::fngpu::ElementwiseKernel &k, int64_t blockX,
+static void emitTriton2D(const fir::fnacc::ElementwiseKernel &k, int64_t blockX,
                          int64_t blockY, StringRef kernelName,
                          llvm::raw_ostream &os) {
   int64_t block = blockX * blockY;
@@ -426,7 +426,7 @@ static void emitTriton2D(const fir::fngpu::ElementwiseKernel &k, int64_t blockX,
 }
 
 static llvm::SmallVector<unsigned>
-kernelParamSlotsForValue(const fir::fngpu::ElementwiseKernel &k, Value v) {
+kernelParamSlotsForValue(const fir::fnacc::ElementwiseKernel &k, Value v) {
   llvm::SmallVector<unsigned> slots;
 
   // Read arrays occupy slots:
@@ -465,8 +465,8 @@ kernelParamSlotsForValue(const fir::fngpu::ElementwiseKernel &k, Value v) {
   return slots;
 }
 
-static void emitJsonDescriptor(fir::fngpu::LaunchOp launchOp,
-                               const fir::fngpu::ElementwiseKernel &k,
+static void emitJsonDescriptor(fir::fnacc::LaunchOp launchOp,
+                               const fir::fnacc::ElementwiseKernel &k,
                                int64_t blockX, int64_t blockY, int64_t blockZ,
                                int32_t kernelId, StringRef kernelName,
                                llvm::raw_ostream &os, bool &firstKernel) {
@@ -475,9 +475,9 @@ static void emitJsonDescriptor(fir::fngpu::LaunchOp launchOp,
   firstKernel = false;
 
   StringRef kindName = "binary";
-  if (k.kind == fir::fngpu::ElementwiseKernelKind::Saxpy1D)
+  if (k.kind == fir::fnacc::ElementwiseKernelKind::Saxpy1D)
     kindName = "saxpy1d";
-  else if (k.kind == fir::fngpu::ElementwiseKernelKind::Expr1D)
+  else if (k.kind == fir::fnacc::ElementwiseKernelKind::Expr1D)
     kindName = "expr1d";
 
   os << "    {\n";
@@ -574,11 +574,11 @@ static void emitJsonDescriptor(fir::fngpu::LaunchOp launchOp,
   os << "    }";
 }
 
-struct FNGPULowerToTritonPass
-    : public fir::fngpu::impl::FNGPULowerToTritonBase<FNGPULowerToTritonPass> {
-  FNGPULowerToTritonPass() = default;
+struct FNACCLowerToTritonPass
+    : public fir::fnacc::impl::FNACCLowerToTritonBase<FNACCLowerToTritonPass> {
+  FNACCLowerToTritonPass() = default;
 
-  FNGPULowerToTritonPass(llvm::StringRef ttirOutput,
+  FNACCLowerToTritonPass(llvm::StringRef ttirOutput,
                          llvm::StringRef jsonOutput) {
     this->ttirOutput = ttirOutput.str();
     this->jsonOutput = jsonOutput.str();
@@ -593,7 +593,7 @@ struct FNGPULowerToTritonPass
     std::error_code ttirEc;
     llvm::raw_fd_ostream ttirOs(ttirPath, ttirEc);
     if (ttirEc) {
-      module.emitError("cannot open FNGPU TTIR output file: ") << ttirPath;
+      module.emitError("cannot open FNACC TTIR output file: ") << ttirPath;
       signalPassFailure();
       return;
     }
@@ -601,7 +601,7 @@ struct FNGPULowerToTritonPass
     std::error_code jsonEc;
     llvm::raw_fd_ostream jsonOs(jsonPath, jsonEc);
     if (jsonEc) {
-      module.emitError("cannot open FNGPU JSON output file: ") << jsonPath;
+      module.emitError("cannot open FNACC JSON output file: ") << jsonPath;
       signalPassFailure();
       return;
     }
@@ -619,17 +619,17 @@ struct FNGPULowerToTritonPass
            << "\"ttg.threads-per-warp\" = " << kTritonThreadsPerWarp << " : i32"
            << "} {\n";
 
-    module.walk([&](fir::fngpu::LaunchOp launchOp) {
-      auto result = fir::fngpu::recognizeElementwiseKernel(launchOp);
+    module.walk([&](fir::fnacc::LaunchOp launchOp) {
+      auto result = fir::fnacc::recognizeElementwiseKernel(launchOp);
 
       if (result.failed()) {
-        launchOp.emitWarning("FNGPU Triton emission skipped launch: ")
+        launchOp.emitWarning("FNACC Triton emission skipped launch: ")
             << result.getFailure().reason;
         ++fallbackId;
         return;
       }
 
-      const fir::fngpu::ElementwiseKernel &k = result.getKernel();
+      const fir::fnacc::ElementwiseKernel &k = result.getKernel();
 
       int32_t kernelId = getKernelId(launchOp, fallbackId);
       std::string kernelName = getKernelName(launchOp, kernelId);
@@ -651,9 +651,9 @@ struct FNGPULowerToTritonPass
         blockY = 1;
         blockZ = 1;
 
-        if (k.kind == fir::fngpu::ElementwiseKernelKind::Expr1D)
+        if (k.kind == fir::fnacc::ElementwiseKernelKind::Expr1D)
           emitTritonExpr1D(k, blockX, kernelName, ttirOs);
-        else if (k.kind == fir::fngpu::ElementwiseKernelKind::Saxpy1D)
+        else if (k.kind == fir::fnacc::ElementwiseKernelKind::Saxpy1D)
           emitTritonSaxpy1D(k, blockX, kernelName, ttirOs);
         else
           emitTriton1D(k, blockX, kernelName, ttirOs);
@@ -675,12 +675,12 @@ struct FNGPULowerToTritonPass
 
 } // namespace
 
-std::unique_ptr<mlir::Pass> fir::fngpu::createFNGPULowerToTritonPass() {
-  return std::make_unique<FNGPULowerToTritonPass>();
+std::unique_ptr<mlir::Pass> fir::fnacc::createFNACCLowerToTritonPass() {
+  return std::make_unique<FNACCLowerToTritonPass>();
 }
 
 std::unique_ptr<mlir::Pass>
-fir::fngpu::createFNGPULowerToTritonPass(llvm::StringRef ttirOutput,
+fir::fnacc::createFNACCLowerToTritonPass(llvm::StringRef ttirOutput,
                                          llvm::StringRef jsonOutput) {
-  return std::make_unique<FNGPULowerToTritonPass>(ttirOutput, jsonOutput);
+  return std::make_unique<FNACCLowerToTritonPass>(ttirOutput, jsonOutput);
 }

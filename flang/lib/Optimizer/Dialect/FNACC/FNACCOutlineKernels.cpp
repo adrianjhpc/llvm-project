@@ -1,21 +1,21 @@
-#include "flang/Optimizer/Dialect/FNGPU/FNGPUDialect.h"
-#include "flang/Optimizer/Dialect/FNGPU/FNGPUPasses.h"
+#include "flang/Optimizer/Dialect/FNACC/FNACCDialect.h"
+#include "flang/Optimizer/Dialect/FNACC/FNACCPasses.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/IRMapping.h"
 #include "mlir/Transforms/RegionUtils.h"
 
-namespace fir::fngpu {
-#define GEN_PASS_DEF_FNGPUOUTLINEKERNELS
-#include "flang/Optimizer/Dialect/FNGPU/FNGPUPasses.h.inc"
-} // namespace fir::fngpu
+namespace fir::fnacc {
+#define GEN_PASS_DEF_FNACCOUTLINEKERNELS
+#include "flang/Optimizer/Dialect/FNACC/FNACCPasses.h.inc"
+} // namespace fir::fnacc
 
 using namespace mlir;
 
 namespace {
-struct FNGPUOutlineKernelsPass
-    : public fir::fngpu::impl::FNGPUOutlineKernelsBase<
-          FNGPUOutlineKernelsPass> {
+struct FNACCOutlineKernelsPass
+    : public fir::fnacc::impl::FNACCOutlineKernelsBase<
+          FNACCOutlineKernelsPass> {
 
   void runOnOperation() override {
     ModuleOp module = getOperation();
@@ -24,14 +24,14 @@ struct FNGPUOutlineKernelsPass
 
     int kernelId = 0;
 
-    // Walk the IR looking for fngpu.launch operations
-    module.walk([&](fir::fngpu::LaunchOp launchOp) {
+    // Walk the IR looking for fnacc.launch operations
+    module.walk([&](fir::fnacc::LaunchOp launchOp) {
       outlineKernel(launchOp, builder, symbolTable, kernelId++);
     });
   }
 
 private:
-  void outlineKernel(fir::fngpu::LaunchOp launchOp, OpBuilder &builder,
+  void outlineKernel(fir::fnacc::LaunchOp launchOp, OpBuilder &builder,
                      SymbolTable &symbolTable, int kernelId) {
     Location loc = launchOp.getLoc();
 
@@ -51,7 +51,7 @@ private:
         launchOp->getParentOfType<ModuleOp>().getBody());
 
     FunctionType funcType = builder.getFunctionType(argTypes, TypeRange{});
-    std::string kernelName = "fngpu_kernel_" + std::to_string(kernelId);
+    std::string kernelName = "fnacc_kernel_" + std::to_string(kernelId);
 
     // Create function using StringRef to avoid deprecation warning
     auto kernelFunc =
@@ -84,6 +84,6 @@ private:
 };
 } // namespace
 
-std::unique_ptr<mlir::Pass> fir::fngpu::createFNGPUOutlineKernelsPass() {
-  return std::make_unique<FNGPUOutlineKernelsPass>();
+std::unique_ptr<mlir::Pass> fir::fnacc::createFNACCOutlineKernelsPass() {
+  return std::make_unique<FNACCOutlineKernelsPass>();
 }

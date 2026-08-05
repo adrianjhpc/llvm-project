@@ -1,13 +1,13 @@
-#include "flang/Optimizer/Dialect/FNGPU/FNGPUPasses.h"
+#include "flang/Optimizer/Dialect/FNACC/FNACCPasses.h"
 
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/SymbolTable.h"
 
-namespace fir::fngpu {
-#define GEN_PASS_DEF_FNGPUEMITFORTRANALIASES
-#include "flang/Optimizer/Dialect/FNGPU/FNGPUPasses.h.inc"
-} // namespace fir::fngpu
+namespace fir::fnacc {
+#define GEN_PASS_DEF_FNACCEMITFORTRANALIASES
+#include "flang/Optimizer/Dialect/FNACC/FNACCPasses.h.inc"
+} // namespace fir::fnacc
 
 using namespace mlir;
 
@@ -27,9 +27,9 @@ namespace {
     return (bare + "_").str();
   }
 
-  struct FNGPUEmitFortranAliasesPass
-    : public fir::fngpu::impl::FNGPUEmitFortranAliasesBase<
-    FNGPUEmitFortranAliasesPass> {
+  struct FNACCEmitFortranAliasesPass
+    : public fir::fnacc::impl::FNACCEmitFortranAliasesBase<
+    FNACCEmitFortranAliasesPass> {
     void runOnOperation() override {
       ModuleOp module = getOperation();
       MLIRContext *ctx = module.getContext();
@@ -84,7 +84,7 @@ namespace {
 
 } // namespace
 
-std::unique_ptr<mlir::Pass> fir::fngpu::createFNGPUEmitFortranAliasesPass() {
-  return std::make_unique<FNGPUEmitFortranAliasesPass>();
+std::unique_ptr<mlir::Pass> fir::fnacc::createFNACCEmitFortranAliasesPass() {
+  return std::make_unique<FNACCEmitFortranAliasesPass>();
 }
 

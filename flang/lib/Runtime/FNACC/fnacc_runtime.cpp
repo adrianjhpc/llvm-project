@@ -17,14 +17,14 @@ namespace {
 // Tiny dependency-free JSON helpers
 // -------------------------------------------------------------------------- //
 //
-// These intentionally parse only the JSON shape emitted by the FNGPU compiler.
+// These intentionally parse only the JSON shape emitted by the FNACC compiler.
 // This is not a general-purpose JSON parser.
 //
 // Expected generated object form:
 //
 // {
 //   "id": 5,
-//   "name": "fngpu_kernel_5",
+//   "name": "fnacc_kernel_5",
 //   "kind": "saxpy1d",
 //   "rank": 1,
 //   "tile": [128, 1, 1],
@@ -204,17 +204,17 @@ static bool jsonFindArrayText(
   return false;
 }
 
-static constexpr int32_t FNGPU_PACK_TARGET_HOST = 0;
-static constexpr int32_t FNGPU_PACK_TARGET_DEVICE = 1;
+static constexpr int32_t FNACC_PACK_TARGET_HOST = 0;
+static constexpr int32_t FNACC_PACK_TARGET_DEVICE = 1;
 
-struct FNGPUPackEntry {
+struct FNACCPackEntry {
   int32_t kernelArgSlot = -1;
-  int32_t target = FNGPU_PACK_TARGET_HOST;
+  int32_t target = FNACC_PACK_TARGET_HOST;
 };
 
-static std::vector<FNGPUPackEntry> jsonParsePackEntries(
+static std::vector<FNACCPackEntry> jsonParsePackEntries(
     const std::string &kernelObjectText) {
-  std::vector<FNGPUPackEntry> entries;
+  std::vector<FNACCPackEntry> entries;
 
   std::string packArray;
   if (!jsonFindArrayText(kernelObjectText, "pack", packArray))
@@ -233,7 +233,7 @@ static std::vector<FNGPUPackEntry> jsonParsePackEntries(
 
     std::string objectText = packArray.substr(slotKey, objectEnd - slotKey);
 
-    FNGPUPackEntry entry;
+    FNACCPackEntry entry;
 
     if (!jsonFindInt(objectText, "kernel_arg_slot", entry.kernelArgSlot)) {
       pos = objectEnd;
@@ -241,15 +241,15 @@ static std::vector<FNGPUPackEntry> jsonParsePackEntries(
     }
 
     if (!jsonFindInt(objectText, "target", entry.target))
-      entry.target = FNGPU_PACK_TARGET_HOST;
+      entry.target = FNACC_PACK_TARGET_HOST;
 
-    if (entry.target != FNGPU_PACK_TARGET_HOST &&
-        entry.target != FNGPU_PACK_TARGET_DEVICE) {
+    if (entry.target != FNACC_PACK_TARGET_HOST &&
+        entry.target != FNACC_PACK_TARGET_DEVICE) {
       std::fprintf(stderr,
-          "FNGPU warning: invalid pack target %d for slot %d; "
+          "FNACC warning: invalid pack target %d for slot %d; "
           "defaulting to host\n",
           entry.target, entry.kernelArgSlot);
-      entry.target = FNGPU_PACK_TARGET_HOST;
+      entry.target = FNACC_PACK_TARGET_HOST;
     }
 
     entries.push_back(entry);
@@ -272,12 +272,12 @@ static std::size_t findKernelObjectEnd(
   return json.size();
 }
 
-[[noreturn]] static void fngpuFatal(const char *message) {
-  std::fprintf(stderr, "FNGPU error: %s\n", message);
+[[noreturn]] static void fnaccFatal(const char *message) {
+  std::fprintf(stderr, "FNACC error: %s\n", message);
   std::abort();
 }
 
-static void fngpuCudaCheck(
+static void fnaccCudaCheck(
     CUresult result, const char *expr, const char *file, int line) {
   if (result == CUDA_SUCCESS)
     return;
@@ -289,20 +289,20 @@ static void fngpuCudaCheck(
   cuGetErrorString(result, &desc);
 
   std::fprintf(stderr,
-      "FNGPU CUDA driver error at %s:%d while executing %s: %s: %s\n", file,
+      "FNACC CUDA driver error at %s:%d while executing %s: %s: %s\n", file,
       line, expr, name ? name : "<unknown>", desc ? desc : "<no description>");
 
   std::abort();
 }
 
-#define FNGPU_CUDA_CHECK(expr) \
+#define FNACC_CUDA_CHECK(expr) \
   do { \
-    fngpuCudaCheck((expr), #expr, __FILE__, __LINE__); \
+    fnaccCudaCheck((expr), #expr, __FILE__, __LINE__); \
   } while (false)
 
-struct FNGPUHiddenTritonArgs {
+struct FNACCHiddenTritonArgs {
   // Triton/NVVM-generated PTX currently appends two hidden pointer parameters
-  // after the explicit kernel parameters. For the kernels FNGPU currently
+  // after the explicit kernel parameters. For the kernels FNACC currently
   // emits, these are not used, so null device pointers are sufficient.
   //
   // Example PTX:
@@ -317,7 +317,7 @@ struct FNGPUHiddenTritonArgs {
   CUdeviceptr hidden1 = 0;
 };
 
-struct FNGPUKernelDesc {
+struct FNACCKernelDesc {
   int32_t id = -1;
   std::string name;
   std::string kind = "binary";
@@ -339,42 +339,42 @@ struct FNGPUKernelDesc {
   int32_t tritonHiddenPtrArgs = 2;
 
   // PACK metadata from JSON.
-  std::vector<FNGPUPackEntry> pack;
+  std::vector<FNACCPackEntry> pack;
 };
 
-struct FNGPUDeviceAllocation {
+struct FNACCDeviceAllocation {
   CUdeviceptr ptr = 0;
   std::size_t bytes = 0;
 };
 
-struct FNGPUKernelRegistry {
+struct FNACCKernelRegistry {
   bool initialized = false;
 
   CUcontext context = nullptr;
   CUmodule module = nullptr;
 
-  std::unordered_map<int32_t, FNGPUKernelDesc> kernels;
+  std::unordered_map<int32_t, FNACCKernelDesc> kernels;
   std::unordered_map<int32_t, CUfunction> functionCache;
 
   // Device cache keyed by host pointer.
-  std::unordered_map<void *, FNGPUDeviceAllocation> deviceCache;
+  std::unordered_map<void *, FNACCDeviceAllocation> deviceCache;
 };
 
-static FNGPUKernelRegistry fngpuRegistry;
+static FNACCKernelRegistry fnaccRegistry;
 
-struct FNGPUDeviceArg {
+struct FNACCDeviceArg {
   CUdeviceptr ptr = 0;
   bool cached = false;
-  int32_t target = FNGPU_PACK_TARGET_HOST;
+  int32_t target = FNACC_PACK_TARGET_HOST;
   int32_t slot = -1;
 };
 
-static bool fngpuDebugEnabled() {
-  const char *value = std::getenv("FNGPU_DEBUG");
+static bool fnaccDebugEnabled() {
+  const char *value = std::getenv("FNACC_DEBUG");
   return value && value[0] != '\0' && std::strcmp(value, "0") != 0;
 }
 
-static const char *fngpuGetEnvOrDefault(
+static const char *fnaccGetEnvOrDefault(
     const char *envName, const char *fallback) {
   const char *value = std::getenv(envName);
   if (value && value[0] != '\0')
@@ -383,10 +383,10 @@ static const char *fngpuGetEnvOrDefault(
   return fallback;
 }
 
-static std::string fngpuReadTextFile(const char *path) {
+static std::string fnaccReadTextFile(const char *path) {
   std::ifstream file(path, std::ios::in | std::ios::binary);
   if (!file) {
-    std::fprintf(stderr, "FNGPU error: could not open file '%s'\n", path);
+    std::fprintf(stderr, "FNACC error: could not open file '%s'\n", path);
     std::abort();
   }
 
@@ -395,9 +395,9 @@ static std::string fngpuReadTextFile(const char *path) {
   return ss.str();
 }
 
-static std::unordered_map<int32_t, FNGPUKernelDesc>
-fngpuParseKernelDescsFromJson(const std::string &json) {
-  std::unordered_map<int32_t, FNGPUKernelDesc> result;
+static std::unordered_map<int32_t, FNACCKernelDesc>
+fnaccParseKernelDescsFromJson(const std::string &json) {
+  std::unordered_map<int32_t, FNACCKernelDesc> result;
 
   std::size_t pos = 0;
 
@@ -409,7 +409,7 @@ fngpuParseKernelDescsFromJson(const std::string &json) {
     std::size_t objectEnd = findKernelObjectEnd(json, idKey);
     std::string objectText = json.substr(idKey, objectEnd - idKey);
 
-    FNGPUKernelDesc desc;
+    FNACCKernelDesc desc;
 
     if (!jsonFindInt(objectText, "id", desc.id)) {
       pos = objectEnd;
@@ -417,7 +417,7 @@ fngpuParseKernelDescsFromJson(const std::string &json) {
     }
 
     if (!jsonFindString(objectText, "name", desc.name))
-      desc.name = "fngpu_kernel_" + std::to_string(desc.id);
+      desc.name = "fnacc_kernel_" + std::to_string(desc.id);
 
     jsonFindString(objectText, "kind", desc.kind);
 
@@ -462,147 +462,147 @@ fngpuParseKernelDescsFromJson(const std::string &json) {
   return result;
 }
 
-static void fngpuEnsureInitialized() {
-  if (fngpuRegistry.initialized)
+static void fnaccEnsureInitialized() {
+  if (fnaccRegistry.initialized)
     return;
 
-  const char *ptxPath = fngpuGetEnvOrDefault("FNGPU_PTX", "fngpu_kernels.ptx");
+  const char *ptxPath = fnaccGetEnvOrDefault("FNACC_PTX", "fnacc_kernels.ptx");
 
   const char *jsonPath =
-      fngpuGetEnvOrDefault("FNGPU_KERNELS_JSON", "fngpu_kernels.json");
+      fnaccGetEnvOrDefault("FNACC_KERNELS_JSON", "fnacc_kernels.json");
 
-  if (fngpuDebugEnabled()) {
-    std::fprintf(stderr, "FNGPU: loading PTX from '%s'\n", ptxPath);
-    std::fprintf(stderr, "FNGPU: loading JSON from '%s'\n", jsonPath);
+  if (fnaccDebugEnabled()) {
+    std::fprintf(stderr, "FNACC: loading PTX from '%s'\n", ptxPath);
+    std::fprintf(stderr, "FNACC: loading JSON from '%s'\n", jsonPath);
   }
 
-  FNGPU_CUDA_CHECK(cuInit(0));
+  FNACC_CUDA_CHECK(cuInit(0));
 
   CUdevice device = 0;
-  FNGPU_CUDA_CHECK(cuDeviceGet(&device, 0));
+  FNACC_CUDA_CHECK(cuDeviceGet(&device, 0));
 
-  FNGPU_CUDA_CHECK(cuDevicePrimaryCtxRetain(&fngpuRegistry.context, device));
-  FNGPU_CUDA_CHECK(cuCtxSetCurrent(fngpuRegistry.context));
+  FNACC_CUDA_CHECK(cuDevicePrimaryCtxRetain(&fnaccRegistry.context, device));
+  FNACC_CUDA_CHECK(cuCtxSetCurrent(fnaccRegistry.context));
 
-  std::string ptx = fngpuReadTextFile(ptxPath);
+  std::string ptx = fnaccReadTextFile(ptxPath);
 
-  FNGPU_CUDA_CHECK(cuModuleLoadDataEx(
-      &fngpuRegistry.module, ptx.c_str(), 0, nullptr, nullptr));
+  FNACC_CUDA_CHECK(cuModuleLoadDataEx(
+      &fnaccRegistry.module, ptx.c_str(), 0, nullptr, nullptr));
 
-  std::string json = fngpuReadTextFile(jsonPath);
-  fngpuRegistry.kernels = fngpuParseKernelDescsFromJson(json);
+  std::string json = fnaccReadTextFile(jsonPath);
+  fnaccRegistry.kernels = fnaccParseKernelDescsFromJson(json);
 
-  if (fngpuRegistry.kernels.empty()) {
+  if (fnaccRegistry.kernels.empty()) {
     std::fprintf(stderr,
-        "FNGPU warning: no kernel descriptors parsed from '%s'\n", jsonPath);
+        "FNACC warning: no kernel descriptors parsed from '%s'\n", jsonPath);
   }
 
-  if (fngpuDebugEnabled()) {
-    for (const auto &entry : fngpuRegistry.kernels) {
-      const FNGPUKernelDesc &desc = entry.second;
+  if (fnaccDebugEnabled()) {
+    for (const auto &entry : fnaccRegistry.kernels) {
+      const FNACCKernelDesc &desc = entry.second;
 
       std::fprintf(stderr,
-          "FNGPU: registered kernel id %d -> '%s' "
+          "FNACC: registered kernel id %d -> '%s' "
           "kind=%s rank=%d tile=(%d,%d,%d) "
           "warps=%d threads_per_warp=%d "
           "cuda_threads_per_cta=%d hidden_ptr_args=%d\n",
           desc.id, desc.name.c_str(), desc.kind.c_str(), desc.rank, desc.tileX,
           desc.tileY, desc.tileZ, desc.numWarps, desc.threadsPerWarp,
           desc.cudaThreadsPerCTA, desc.tritonHiddenPtrArgs);
-      for (const FNGPUPackEntry &entry : desc.pack) {
-        std::fprintf(stderr, "FNGPU:   pack slot %d -> %s\n",
+      for (const FNACCPackEntry &entry : desc.pack) {
+        std::fprintf(stderr, "FNACC:   pack slot %d -> %s\n",
             entry.kernelArgSlot,
-            entry.target == FNGPU_PACK_TARGET_DEVICE ? "device" : "host");
+            entry.target == FNACC_PACK_TARGET_DEVICE ? "device" : "host");
       }
     }
   }
 
-  fngpuRegistry.initialized = true;
+  fnaccRegistry.initialized = true;
 }
 
-static void fngpuEnsureCurrentContext() {
-  fngpuEnsureInitialized();
+static void fnaccEnsureCurrentContext() {
+  fnaccEnsureInitialized();
 
-  if (!fngpuRegistry.context) {
-    std::fprintf(stderr, "FNGPU error: CUDA context is null\n");
+  if (!fnaccRegistry.context) {
+    std::fprintf(stderr, "FNACC error: CUDA context is null\n");
     std::abort();
   }
 
-  FNGPU_CUDA_CHECK(cuCtxSetCurrent(fngpuRegistry.context));
+  FNACC_CUDA_CHECK(cuCtxSetCurrent(fnaccRegistry.context));
 
-  if (fngpuDebugEnabled()) {
+  if (fnaccDebugEnabled()) {
     CUcontext current = nullptr;
-    FNGPU_CUDA_CHECK(cuCtxGetCurrent(&current));
+    FNACC_CUDA_CHECK(cuCtxGetCurrent(&current));
 
     std::fprintf(stderr,
-        "FNGPU: current CUDA context = %p, registry context = %p\n",
+        "FNACC: current CUDA context = %p, registry context = %p\n",
         static_cast<void *>(current),
-        static_cast<void *>(fngpuRegistry.context));
+        static_cast<void *>(fnaccRegistry.context));
   }
 }
 
-static const FNGPUKernelDesc *fngpuLookupKernelDesc(int32_t kernelId) {
-  fngpuEnsureCurrentContext();
+static const FNACCKernelDesc *fnaccLookupKernelDesc(int32_t kernelId) {
+  fnaccEnsureCurrentContext();
 
-  auto it = fngpuRegistry.kernels.find(kernelId);
-  if (it == fngpuRegistry.kernels.end())
+  auto it = fnaccRegistry.kernels.find(kernelId);
+  if (it == fnaccRegistry.kernels.end())
     return nullptr;
 
   return &it->second;
 }
 
-static int32_t fngpuTritonHiddenPtrArgCount(int32_t kernelId) {
-  if (const FNGPUKernelDesc *desc = fngpuLookupKernelDesc(kernelId))
+static int32_t fnaccTritonHiddenPtrArgCount(int32_t kernelId) {
+  if (const FNACCKernelDesc *desc = fnaccLookupKernelDesc(kernelId))
     return desc->tritonHiddenPtrArgs;
 
   return 2;
 }
 
-static void fngpuValidateSupportedHiddenPtrArgCount(int32_t kernelId) {
-  int32_t count = fngpuTritonHiddenPtrArgCount(kernelId);
+static void fnaccValidateSupportedHiddenPtrArgCount(int32_t kernelId) {
+  int32_t count = fnaccTritonHiddenPtrArgCount(kernelId);
 
   if (count == 2)
     return;
 
   std::fprintf(stderr,
-      "FNGPU error: kernel id %d requires %d Triton hidden pointer "
+      "FNACC error: kernel id %d requires %d Triton hidden pointer "
       "args, but this runtime currently supports exactly 2\n",
       kernelId, count);
   std::abort();
 }
 
-static int32_t fngpuPackTargetForSlot(
-    const FNGPUKernelDesc *desc, int32_t slot) {
+static int32_t fnaccPackTargetForSlot(
+    const FNACCKernelDesc *desc, int32_t slot) {
   if (!desc)
-    return FNGPU_PACK_TARGET_HOST;
+    return FNACC_PACK_TARGET_HOST;
 
-  for (const FNGPUPackEntry &entry : desc->pack) {
+  for (const FNACCPackEntry &entry : desc->pack) {
     if (entry.kernelArgSlot == slot)
       return entry.target;
   }
 
-  return FNGPU_PACK_TARGET_HOST;
+  return FNACC_PACK_TARGET_HOST;
 }
 
-static const char *fngpuPackTargetName(int32_t target) {
-  return target == FNGPU_PACK_TARGET_DEVICE ? "device" : "host";
+static const char *fnaccPackTargetName(int32_t target) {
+  return target == FNACC_PACK_TARGET_DEVICE ? "device" : "host";
 }
 
-static FNGPUDeviceArg fngpuMakeTemporaryDeviceBuffer(void *hostPtr,
+static FNACCDeviceArg fnaccMakeTemporaryDeviceBuffer(void *hostPtr,
     std::size_t bytes, bool copyHostToDevice, int32_t slot, const char *role) {
-  FNGPUDeviceArg arg;
+  FNACCDeviceArg arg;
   arg.cached = false;
-  arg.target = FNGPU_PACK_TARGET_HOST;
+  arg.target = FNACC_PACK_TARGET_HOST;
   arg.slot = slot;
 
-  FNGPU_CUDA_CHECK(cuMemAlloc(&arg.ptr, bytes));
+  FNACC_CUDA_CHECK(cuMemAlloc(&arg.ptr, bytes));
 
   if (copyHostToDevice)
-    FNGPU_CUDA_CHECK(cuMemcpyHtoD(arg.ptr, hostPtr, bytes));
+    FNACC_CUDA_CHECK(cuMemcpyHtoD(arg.ptr, hostPtr, bytes));
 
-  if (fngpuDebugEnabled()) {
+  if (fnaccDebugEnabled()) {
     std::fprintf(stderr,
-        "FNGPU: temporary device buffer for %s slot %d: "
+        "FNACC: temporary device buffer for %s slot %d: "
         "host=%p device=0x%llx bytes=%zu copy_in=%s\n",
         role, slot, hostPtr, static_cast<unsigned long long>(arg.ptr), bytes,
         copyHostToDevice ? "yes" : "no");
@@ -611,50 +611,50 @@ static FNGPUDeviceArg fngpuMakeTemporaryDeviceBuffer(void *hostPtr,
   return arg;
 }
 
-static FNGPUDeviceArg fngpuGetCachedDeviceBuffer(void *hostPtr,
+static FNACCDeviceArg fnaccGetCachedDeviceBuffer(void *hostPtr,
     std::size_t bytes, bool copyHostToDeviceOnMiss, int32_t slot,
     const char *role) {
-  FNGPUDeviceArg arg;
+  FNACCDeviceArg arg;
   arg.cached = true;
-  arg.target = FNGPU_PACK_TARGET_DEVICE;
+  arg.target = FNACC_PACK_TARGET_DEVICE;
   arg.slot = slot;
 
-  auto it = fngpuRegistry.deviceCache.find(hostPtr);
+  auto it = fnaccRegistry.deviceCache.find(hostPtr);
 
   bool needAllocate = false;
   bool cacheMiss = false;
 
-  if (it == fngpuRegistry.deviceCache.end()) {
+  if (it == fnaccRegistry.deviceCache.end()) {
     needAllocate = true;
     cacheMiss = true;
   } else if (it->second.bytes != bytes) {
-    if (fngpuDebugEnabled()) {
+    if (fnaccDebugEnabled()) {
       std::fprintf(stderr,
-          "FNGPU: cache size mismatch for %s slot %d host=%p; "
+          "FNACC: cache size mismatch for %s slot %d host=%p; "
           "old bytes=%zu new bytes=%zu, reallocating\n",
           role, slot, hostPtr, it->second.bytes, bytes);
     }
 
-    FNGPU_CUDA_CHECK(cuMemFree(it->second.ptr));
-    fngpuRegistry.deviceCache.erase(it);
+    FNACC_CUDA_CHECK(cuMemFree(it->second.ptr));
+    fnaccRegistry.deviceCache.erase(it);
     needAllocate = true;
     cacheMiss = true;
   }
 
   if (needAllocate) {
-    FNGPUDeviceAllocation allocation;
+    FNACCDeviceAllocation allocation;
     allocation.bytes = bytes;
-    FNGPU_CUDA_CHECK(cuMemAlloc(&allocation.ptr, bytes));
+    FNACC_CUDA_CHECK(cuMemAlloc(&allocation.ptr, bytes));
 
     if (copyHostToDeviceOnMiss)
-      FNGPU_CUDA_CHECK(cuMemcpyHtoD(allocation.ptr, hostPtr, bytes));
+      FNACC_CUDA_CHECK(cuMemcpyHtoD(allocation.ptr, hostPtr, bytes));
 
-    auto inserted = fngpuRegistry.deviceCache.emplace(hostPtr, allocation);
+    auto inserted = fnaccRegistry.deviceCache.emplace(hostPtr, allocation);
     arg.ptr = inserted.first->second.ptr;
 
-    if (fngpuDebugEnabled()) {
+    if (fnaccDebugEnabled()) {
       std::fprintf(stderr,
-          "FNGPU: cache miss for %s slot %d target=device: "
+          "FNACC: cache miss for %s slot %d target=device: "
           "host=%p device=0x%llx bytes=%zu copy_in=%s\n",
           role, slot, hostPtr, static_cast<unsigned long long>(arg.ptr), bytes,
           copyHostToDeviceOnMiss ? "yes" : "no");
@@ -662,9 +662,9 @@ static FNGPUDeviceArg fngpuGetCachedDeviceBuffer(void *hostPtr,
   } else {
     arg.ptr = it->second.ptr;
 
-    if (fngpuDebugEnabled()) {
+    if (fnaccDebugEnabled()) {
       std::fprintf(stderr,
-          "FNGPU: cache hit for %s slot %d target=device: "
+          "FNACC: cache hit for %s slot %d target=device: "
           "host=%p device=0x%llx bytes=%zu\n",
           role, slot, hostPtr, static_cast<unsigned long long>(arg.ptr), bytes);
     }
@@ -673,57 +673,57 @@ static FNGPUDeviceArg fngpuGetCachedDeviceBuffer(void *hostPtr,
   return arg;
 }
 
-static FNGPUDeviceArg fngpuPrepareReadArray(
+static FNACCDeviceArg fnaccPrepareReadArray(
     float *hostPtr, std::size_t bytes, int32_t target, int32_t slot) {
-  if (target == FNGPU_PACK_TARGET_DEVICE) {
+  if (target == FNACC_PACK_TARGET_DEVICE) {
     // Device target means cache/reuse device allocation. Copy in only on miss.
-    return fngpuGetCachedDeviceBuffer(static_cast<void *>(hostPtr), bytes,
+    return fnaccGetCachedDeviceBuffer(static_cast<void *>(hostPtr), bytes,
         /*copyHostToDeviceOnMiss=*/true, slot, "read");
   }
 
-  return fngpuMakeTemporaryDeviceBuffer(static_cast<void *>(hostPtr), bytes,
+  return fnaccMakeTemporaryDeviceBuffer(static_cast<void *>(hostPtr), bytes,
       /*copyHostToDevice=*/true, slot, "read");
 }
 
-static FNGPUDeviceArg fngpuPrepareWriteArray(
+static FNACCDeviceArg fnaccPrepareWriteArray(
     float *hostPtr, std::size_t bytes, int32_t target, int32_t slot) {
-  if (target == FNGPU_PACK_TARGET_DEVICE) {
+  if (target == FNACC_PACK_TARGET_DEVICE) {
     // Device target means keep the output allocation cached. No copy-in needed.
-    return fngpuGetCachedDeviceBuffer(static_cast<void *>(hostPtr), bytes,
+    return fnaccGetCachedDeviceBuffer(static_cast<void *>(hostPtr), bytes,
         /*copyHostToDeviceOnMiss=*/false, slot, "write");
   }
 
-  return fngpuMakeTemporaryDeviceBuffer(static_cast<void *>(hostPtr), bytes,
+  return fnaccMakeTemporaryDeviceBuffer(static_cast<void *>(hostPtr), bytes,
       /*copyHostToDevice=*/false, slot, "write");
 }
 
-static void fngpuCopyBackWriteArray(
-    float *hostPtr, const FNGPUDeviceArg &arg, std::size_t bytes) {
+static void fnaccCopyBackWriteArray(
+    float *hostPtr, const FNACCDeviceArg &arg, std::size_t bytes) {
   // Conservative semantics: always copy writes back to host after launch.
   // Even target=device remains host-visible for now.
-  FNGPU_CUDA_CHECK(cuMemcpyDtoH(hostPtr, arg.ptr, bytes));
+  FNACC_CUDA_CHECK(cuMemcpyDtoH(hostPtr, arg.ptr, bytes));
 
-  if (fngpuDebugEnabled()) {
+  if (fnaccDebugEnabled()) {
     std::fprintf(stderr,
-        "FNGPU: copied write slot %d device=0x%llx -> host=%p "
+        "FNACC: copied write slot %d device=0x%llx -> host=%p "
         "bytes=%zu target=%s\n",
         arg.slot, static_cast<unsigned long long>(arg.ptr),
-        static_cast<void *>(hostPtr), bytes, fngpuPackTargetName(arg.target));
+        static_cast<void *>(hostPtr), bytes, fnaccPackTargetName(arg.target));
   }
 }
 
-static void fngpuReleaseDeviceArg(const FNGPUDeviceArg &arg) {
+static void fnaccReleaseDeviceArg(const FNACCDeviceArg &arg) {
   if (!arg.ptr)
     return;
 
   if (arg.cached)
     return;
 
-  FNGPU_CUDA_CHECK(cuMemFree(arg.ptr));
+  FNACC_CUDA_CHECK(cuMemFree(arg.ptr));
 
-  if (fngpuDebugEnabled()) {
+  if (fnaccDebugEnabled()) {
     std::fprintf(stderr,
-        "FNGPU: freed temporary device buffer for slot %d "
+        "FNACC: freed temporary device buffer for slot %d "
         "device=0x%llx\n",
         arg.slot, static_cast<unsigned long long>(arg.ptr));
   }
@@ -732,8 +732,8 @@ static void fngpuReleaseDeviceArg(const FNGPUDeviceArg &arg) {
 // -------------------------------------------------------------------------- //
 // CUDA module/function management
 // -------------------------------------------------------------------------- //
-static void fngpuDebugFunctionAttributes(CUfunction fn, int32_t kernelId) {
-  if (!fngpuDebugEnabled())
+static void fnaccDebugFunctionAttributes(CUfunction fn, int32_t kernelId) {
+  if (!fnaccDebugEnabled())
     return;
 
   int maxThreadsPerBlock = 0;
@@ -754,7 +754,7 @@ static void fngpuDebugFunctionAttributes(CUfunction fn, int32_t kernelId) {
   cuFuncGetAttribute(&ptxVersion, CU_FUNC_ATTRIBUTE_PTX_VERSION, fn);
 
   std::fprintf(stderr,
-      "FNGPU: function attrs for kernel id %d: "
+      "FNACC: function attrs for kernel id %d: "
       "max_threads_per_block=%d num_regs=%d shared_bytes=%d "
       "binary_version=%d ptx_version=%d\n",
       kernelId, maxThreadsPerBlock, numRegs, sharedBytes, binaryVersion,
@@ -762,40 +762,40 @@ static void fngpuDebugFunctionAttributes(CUfunction fn, int32_t kernelId) {
 }
 
 static CUfunction getKernelFunction(int32_t kernelId) {
-  fngpuEnsureCurrentContext();
+  fnaccEnsureCurrentContext();
 
-  auto cacheIt = fngpuRegistry.functionCache.find(kernelId);
-  if (cacheIt != fngpuRegistry.functionCache.end())
+  auto cacheIt = fnaccRegistry.functionCache.find(kernelId);
+  if (cacheIt != fnaccRegistry.functionCache.end())
     return cacheIt->second;
 
   std::string kernelName;
 
-  if (const FNGPUKernelDesc *desc = fngpuLookupKernelDesc(kernelId)) {
+  if (const FNACCKernelDesc *desc = fnaccLookupKernelDesc(kernelId)) {
     kernelName = desc->name;
   } else {
-    kernelName = "fngpu_kernel_" + std::to_string(kernelId);
+    kernelName = "fnacc_kernel_" + std::to_string(kernelId);
 
     std::fprintf(stderr,
-        "FNGPU warning: no JSON descriptor for kernel id %d; "
+        "FNACC warning: no JSON descriptor for kernel id %d; "
         "falling back to symbol name '%s'\n",
         kernelId, kernelName.c_str());
   }
 
-  if (fngpuDebugEnabled()) {
-    std::fprintf(stderr, "FNGPU: looking up CUDA kernel id %d as symbol '%s'\n",
+  if (fnaccDebugEnabled()) {
+    std::fprintf(stderr, "FNACC: looking up CUDA kernel id %d as symbol '%s'\n",
         kernelId, kernelName.c_str());
   }
 
   CUfunction fn = nullptr;
-  FNGPU_CUDA_CHECK(
-      cuModuleGetFunction(&fn, fngpuRegistry.module, kernelName.c_str()));
+  FNACC_CUDA_CHECK(
+      cuModuleGetFunction(&fn, fnaccRegistry.module, kernelName.c_str()));
 
-  fngpuRegistry.functionCache[kernelId] = fn;
+  fnaccRegistry.functionCache[kernelId] = fn;
   return fn;
 }
 
-static unsigned fngpuCudaThreadsPerCTA(int32_t kernelId) {
-  if (const FNGPUKernelDesc *desc = fngpuLookupKernelDesc(kernelId)) {
+static unsigned fnaccCudaThreadsPerCTA(int32_t kernelId) {
+  if (const FNACCKernelDesc *desc = fnaccLookupKernelDesc(kernelId)) {
     if (desc->cudaThreadsPerCTA > 0)
       return static_cast<unsigned>(desc->cudaThreadsPerCTA);
 
@@ -806,33 +806,33 @@ static unsigned fngpuCudaThreadsPerCTA(int32_t kernelId) {
   return 32;
 }
 
-static void fngpuValidateHostLaunchAgainstDesc(int32_t kernelId, int32_t rank,
+static void fnaccValidateHostLaunchAgainstDesc(int32_t kernelId, int32_t rank,
     int32_t blockX, int32_t blockY, int32_t blockZ) {
-  const FNGPUKernelDesc *desc = fngpuLookupKernelDesc(kernelId);
+  const FNACCKernelDesc *desc = fnaccLookupKernelDesc(kernelId);
   if (!desc)
     return;
 
   if (desc->rank != rank) {
     std::fprintf(stderr,
-        "FNGPU warning: host launch rank %d disagrees with JSON "
+        "FNACC warning: host launch rank %d disagrees with JSON "
         "rank %d for kernel id %d\n",
         rank, desc->rank, kernelId);
   }
 
   if (desc->tileX != blockX || desc->tileY != blockY || desc->tileZ != blockZ) {
     std::fprintf(stderr,
-        "FNGPU warning: host tile (%d,%d,%d) disagrees with JSON "
+        "FNACC warning: host tile (%d,%d,%d) disagrees with JSON "
         "tile (%d,%d,%d) for kernel id %d\n",
         blockX, blockY, blockZ, desc->tileX, desc->tileY, desc->tileZ,
         kernelId);
   }
 }
 
-static unsigned fngpuCdiv(int32_t x, int32_t y) {
+static unsigned fnaccCdiv(int32_t x, int32_t y) {
   return static_cast<unsigned>((x + y - 1) / y);
 }
 
-static std::size_t fngpuElementCount(
+static std::size_t fnaccElementCount(
     int32_t rank, int32_t extentX, int32_t extentY, int32_t extentZ) {
   std::size_t count = static_cast<std::size_t>(extentX);
 
@@ -845,25 +845,25 @@ static std::size_t fngpuElementCount(
   return count;
 }
 
-static void fngpuValidateCommonLaunchInputs(const char *entryName, int32_t rank,
+static void fnaccValidateCommonLaunchInputs(const char *entryName, int32_t rank,
     int32_t blockX, int32_t blockY, int32_t blockZ, float *a, float *b,
     float *c, int32_t extentX, int32_t extentY, int32_t extentZ) {
   if (blockX <= 0 || blockY <= 0 || blockZ <= 0) {
     std::fprintf(stderr,
-        "FNGPU error: invalid tile/block shape (%d,%d,%d) in %s\n", blockX,
+        "FNACC error: invalid tile/block shape (%d,%d,%d) in %s\n", blockX,
         blockY, blockZ, entryName);
     std::abort();
   }
 
   if (rank < 1 || rank > 3) {
     std::fprintf(
-        stderr, "FNGPU error: unsupported rank %d in %s\n", rank, entryName);
+        stderr, "FNACC error: unsupported rank %d in %s\n", rank, entryName);
     std::abort();
   }
 
   if (!a || !b || !c) {
     std::fprintf(stderr,
-        "FNGPU error: null host pointer in %s: "
+        "FNACC error: null host pointer in %s: "
         "a=%p b=%p c=%p\n",
         entryName, static_cast<void *>(a), static_cast<void *>(b),
         static_cast<void *>(c));
@@ -871,9 +871,9 @@ static void fngpuValidateCommonLaunchInputs(const char *entryName, int32_t rank,
   }
 
   if (extentX <= 0 || extentY <= 0 || extentZ <= 0) {
-    if (fngpuDebugEnabled()) {
+    if (fnaccDebugEnabled()) {
       std::fprintf(stderr,
-          "FNGPU: non-positive extent (%d,%d,%d) in %s; "
+          "FNACC: non-positive extent (%d,%d,%d) in %s; "
           "skipping launch\n",
           extentX, extentY, extentZ, entryName);
     }
@@ -895,37 +895,37 @@ static void fngpuValidateCommonLaunchInputs(const char *entryName, int32_t rank,
 //     (%a: ptr<f32>, %b: ptr<f32>, %c: ptr<f32>, %n: i32, %m: i32)
 //
 
-extern "C" void __fngpu_launch_nd_f32(int32_t kernelId, int32_t rank,
+extern "C" void __fnacc_launch_nd_f32(int32_t kernelId, int32_t rank,
     int32_t blockX, int32_t blockY, int32_t blockZ, float *a, float *b,
     float *c, int32_t extentX, int32_t extentY, int32_t extentZ) {
-  fngpuEnsureCurrentContext();
+  fnaccEnsureCurrentContext();
 
-  fngpuValidateHostLaunchAgainstDesc(kernelId, rank, blockX, blockY, blockZ);
+  fnaccValidateHostLaunchAgainstDesc(kernelId, rank, blockX, blockY, blockZ);
 
   if (rank != 1 && rank != 2) {
     std::fprintf(stderr,
-        "FNGPU error: __fngpu_launch_nd_f32 currently supports "
+        "FNACC error: __fnacc_launch_nd_f32 currently supports "
         "only rank 1 or 2, got rank %d\n",
         rank);
     std::abort();
   }
 
-  fngpuValidateCommonLaunchInputs("__fngpu_launch_nd_f32", rank, blockX, blockY,
+  fnaccValidateCommonLaunchInputs("__fnacc_launch_nd_f32", rank, blockX, blockY,
       blockZ, a, b, c, extentX, extentY, extentZ);
 
   if (extentX <= 0 || extentY <= 0 || extentZ <= 0)
     return;
 
   CUfunction fn = getKernelFunction(kernelId);
-  fngpuDebugFunctionAttributes(fn, kernelId);
+  fnaccDebugFunctionAttributes(fn, kernelId);
 
-  unsigned gridX = fngpuCdiv(extentX, blockX);
-  unsigned gridY = rank >= 2 ? fngpuCdiv(extentY, blockY) : 1;
+  unsigned gridX = fnaccCdiv(extentX, blockX);
+  unsigned gridY = rank >= 2 ? fnaccCdiv(extentY, blockY) : 1;
   unsigned gridZ = 1;
 
-  unsigned cudaBlockX = fngpuCudaThreadsPerCTA(kernelId);
+  unsigned cudaBlockX = fnaccCudaThreadsPerCTA(kernelId);
 
-  std::size_t elemCount = fngpuElementCount(rank, extentX, extentY, extentZ);
+  std::size_t elemCount = fnaccElementCount(rank, extentX, extentY, extentZ);
 
   std::size_t numBytes = elemCount * sizeof(float);
 
@@ -933,16 +933,16 @@ extern "C" void __fngpu_launch_nd_f32(int32_t kernelId, int32_t rank,
   CUdeviceptr dB = 0;
   CUdeviceptr dC = 0;
 
-  FNGPU_CUDA_CHECK(cuMemAlloc(&dA, numBytes));
-  FNGPU_CUDA_CHECK(cuMemAlloc(&dB, numBytes));
-  FNGPU_CUDA_CHECK(cuMemAlloc(&dC, numBytes));
+  FNACC_CUDA_CHECK(cuMemAlloc(&dA, numBytes));
+  FNACC_CUDA_CHECK(cuMemAlloc(&dB, numBytes));
+  FNACC_CUDA_CHECK(cuMemAlloc(&dC, numBytes));
 
-  FNGPU_CUDA_CHECK(cuMemcpyHtoD(dA, a, numBytes));
-  FNGPU_CUDA_CHECK(cuMemcpyHtoD(dB, b, numBytes));
+  FNACC_CUDA_CHECK(cuMemcpyHtoD(dA, a, numBytes));
+  FNACC_CUDA_CHECK(cuMemcpyHtoD(dB, b, numBytes));
 
-  if (fngpuDebugEnabled()) {
+  if (fnaccDebugEnabled()) {
     std::fprintf(stderr,
-        "FNGPU: launch binary kernel id=%d rank=%d "
+        "FNACC: launch binary kernel id=%d rank=%d "
         "grid=(%u,%u,%u) tile=(%d,%d,%d) "
         "cuda_block=(%u,1,1) extent=(%d,%d,%d) bytes=%zu\n",
         kernelId, rank, gridX, gridY, gridZ, blockX, blockY, blockZ, cudaBlockX,
@@ -950,9 +950,9 @@ extern "C" void __fngpu_launch_nd_f32(int32_t kernelId, int32_t rank,
   }
 
   if (rank == 1) {
-    fngpuValidateSupportedHiddenPtrArgCount(kernelId);
+    fnaccValidateSupportedHiddenPtrArgCount(kernelId);
 
-    FNGPUHiddenTritonArgs hidden;
+    FNACCHiddenTritonArgs hidden;
 
     void *args[] = {
         &dA,
@@ -963,9 +963,9 @@ extern "C" void __fngpu_launch_nd_f32(int32_t kernelId, int32_t rank,
         &hidden.hidden1,
     };
 
-    if (fngpuDebugEnabled()) {
+    if (fnaccDebugEnabled()) {
       std::fprintf(stderr,
-          "FNGPU: binary rank1 args: "
+          "FNACC: binary rank1 args: "
           "dA=0x%llx dB=0x%llx dC=0x%llx extentX=%d "
           "hidden0=0x%llx hidden1=0x%llx "
           "args={%p,%p,%p,%p,%p,%p}\n",
@@ -976,21 +976,21 @@ extern "C" void __fngpu_launch_nd_f32(int32_t kernelId, int32_t rank,
           static_cast<unsigned long long>(hidden.hidden1), args[0], args[1],
           args[2], args[3], args[4], args[5]);
 
-      std::fprintf(stderr, "FNGPU: about to cuLaunchKernel rank1\n");
+      std::fprintf(stderr, "FNACC: about to cuLaunchKernel rank1\n");
       std::fflush(stderr);
     }
 
-    FNGPU_CUDA_CHECK(cuLaunchKernel(
+    FNACC_CUDA_CHECK(cuLaunchKernel(
         fn, gridX, 1, 1, cudaBlockX, 1, 1, 0, nullptr, args, nullptr));
-    if (fngpuDebugEnabled()) {
-      std::fprintf(stderr, "FNGPU: cuLaunchKernel rank1 returned\n");
+    if (fnaccDebugEnabled()) {
+      std::fprintf(stderr, "FNACC: cuLaunchKernel rank1 returned\n");
       std::fflush(stderr);
     }
 
   } else {
-    fngpuValidateSupportedHiddenPtrArgCount(kernelId);
+    fnaccValidateSupportedHiddenPtrArgCount(kernelId);
 
-    FNGPUHiddenTritonArgs hidden;
+    FNACCHiddenTritonArgs hidden;
 
     void *args[] = {
         &dA,
@@ -1002,9 +1002,9 @@ extern "C" void __fngpu_launch_nd_f32(int32_t kernelId, int32_t rank,
         &hidden.hidden1,
     };
 
-    if (fngpuDebugEnabled()) {
+    if (fnaccDebugEnabled()) {
       std::fprintf(stderr,
-          "FNGPU: binary rank2 args: "
+          "FNACC: binary rank2 args: "
           "dA=0x%llx dB=0x%llx dC=0x%llx "
           "extentX=%d extentY=%d "
           "hidden0=0x%llx hidden1=0x%llx "
@@ -1016,47 +1016,47 @@ extern "C" void __fngpu_launch_nd_f32(int32_t kernelId, int32_t rank,
           static_cast<unsigned long long>(hidden.hidden1), args[0], args[1],
           args[2], args[3], args[4], args[5], args[6]);
 
-      std::fprintf(stderr, "FNGPU: about to cuLaunchKernel rank2\n");
+      std::fprintf(stderr, "FNACC: about to cuLaunchKernel rank2\n");
       std::fflush(stderr);
     }
 
-    FNGPU_CUDA_CHECK(cuLaunchKernel(
+    FNACC_CUDA_CHECK(cuLaunchKernel(
         fn, gridX, gridY, 1, cudaBlockX, 1, 1, 0, nullptr, args, nullptr));
-    if (fngpuDebugEnabled()) {
-      std::fprintf(stderr, "FNGPU: cuLaunchKernel rank2 returned\n");
+    if (fnaccDebugEnabled()) {
+      std::fprintf(stderr, "FNACC: cuLaunchKernel rank2 returned\n");
       std::fflush(stderr);
     }
   }
 
-  if (fngpuDebugEnabled()) {
-    std::fprintf(stderr, "FNGPU: about to cuCtxSynchronize\n");
+  if (fnaccDebugEnabled()) {
+    std::fprintf(stderr, "FNACC: about to cuCtxSynchronize\n");
     std::fflush(stderr);
   }
 
-  FNGPU_CUDA_CHECK(cuCtxSynchronize());
+  FNACC_CUDA_CHECK(cuCtxSynchronize());
 
-  if (fngpuDebugEnabled()) {
-    std::fprintf(stderr, "FNGPU: cuCtxSynchronize returned\n");
+  if (fnaccDebugEnabled()) {
+    std::fprintf(stderr, "FNACC: cuCtxSynchronize returned\n");
     std::fflush(stderr);
   }
 
-  if (fngpuDebugEnabled()) {
+  if (fnaccDebugEnabled()) {
     std::fprintf(stderr,
-        "FNGPU: about to cuMemcpyDtoH c=%p dC=0x%llx bytes=%zu\n",
+        "FNACC: about to cuMemcpyDtoH c=%p dC=0x%llx bytes=%zu\n",
         static_cast<void *>(c), static_cast<unsigned long long>(dC), numBytes);
     std::fflush(stderr);
   }
 
-  FNGPU_CUDA_CHECK(cuMemcpyDtoH(c, dC, numBytes));
+  FNACC_CUDA_CHECK(cuMemcpyDtoH(c, dC, numBytes));
 
-  if (fngpuDebugEnabled()) {
-    std::fprintf(stderr, "FNGPU: cuMemcpyDtoH returned\n");
+  if (fnaccDebugEnabled()) {
+    std::fprintf(stderr, "FNACC: cuMemcpyDtoH returned\n");
     std::fflush(stderr);
   }
 
-  FNGPU_CUDA_CHECK(cuMemFree(dA));
-  FNGPU_CUDA_CHECK(cuMemFree(dB));
-  FNGPU_CUDA_CHECK(cuMemFree(dC));
+  FNACC_CUDA_CHECK(cuMemFree(dA));
+  FNACC_CUDA_CHECK(cuMemFree(dB));
+  FNACC_CUDA_CHECK(cuMemFree(dC));
 }
 
 // -------------------------------------------------------------------------- //
@@ -1068,23 +1068,23 @@ extern "C" void __fngpu_launch_nd_f32(int32_t kernelId, int32_t rank,
 //   (%a: ptr<f32>, %b: ptr<f32>, %c: ptr<f32>, %alpha: f32, %n: i32)
 //
 
-extern "C" void __fngpu_launch_nd_f32_s1(int32_t kernelId, int32_t rank,
+extern "C" void __fnacc_launch_nd_f32_s1(int32_t kernelId, int32_t rank,
     int32_t blockX, int32_t blockY, int32_t blockZ, float *a, float *b,
     float *c, float scalar0, int32_t extentX, int32_t extentY,
     int32_t extentZ) {
-  fngpuEnsureCurrentContext();
+  fnaccEnsureCurrentContext();
 
-  fngpuValidateHostLaunchAgainstDesc(kernelId, rank, blockX, blockY, blockZ);
+  fnaccValidateHostLaunchAgainstDesc(kernelId, rank, blockX, blockY, blockZ);
 
   if (rank != 1) {
     std::fprintf(stderr,
-        "FNGPU error: __fngpu_launch_nd_f32_s1 currently supports "
+        "FNACC error: __fnacc_launch_nd_f32_s1 currently supports "
         "only rank 1, got rank %d\n",
         rank);
     std::abort();
   }
 
-  fngpuValidateCommonLaunchInputs("__fngpu_launch_nd_f32_s1", rank, blockX,
+  fnaccValidateCommonLaunchInputs("__fnacc_launch_nd_f32_s1", rank, blockX,
       blockY, blockZ, a, b, c, extentX, extentY, extentZ);
 
   if (extentX <= 0 || extentY <= 0 || extentZ <= 0)
@@ -1092,8 +1092,8 @@ extern "C" void __fngpu_launch_nd_f32_s1(int32_t kernelId, int32_t rank,
 
   CUfunction fn = getKernelFunction(kernelId);
 
-  unsigned gridX = fngpuCdiv(extentX, blockX);
-  unsigned cudaBlockX = fngpuCudaThreadsPerCTA(kernelId);
+  unsigned gridX = fnaccCdiv(extentX, blockX);
+  unsigned cudaBlockX = fnaccCudaThreadsPerCTA(kernelId);
 
   std::size_t numElems = static_cast<std::size_t>(extentX);
   std::size_t numBytes = numElems * sizeof(float);
@@ -1102,14 +1102,14 @@ extern "C" void __fngpu_launch_nd_f32_s1(int32_t kernelId, int32_t rank,
   CUdeviceptr dB = 0;
   CUdeviceptr dC = 0;
 
-  FNGPU_CUDA_CHECK(cuMemAlloc(&dA, numBytes));
-  FNGPU_CUDA_CHECK(cuMemAlloc(&dB, numBytes));
-  FNGPU_CUDA_CHECK(cuMemAlloc(&dC, numBytes));
+  FNACC_CUDA_CHECK(cuMemAlloc(&dA, numBytes));
+  FNACC_CUDA_CHECK(cuMemAlloc(&dB, numBytes));
+  FNACC_CUDA_CHECK(cuMemAlloc(&dC, numBytes));
 
-  FNGPU_CUDA_CHECK(cuMemcpyHtoD(dA, a, numBytes));
-  FNGPU_CUDA_CHECK(cuMemcpyHtoD(dB, b, numBytes));
+  FNACC_CUDA_CHECK(cuMemcpyHtoD(dA, a, numBytes));
+  FNACC_CUDA_CHECK(cuMemcpyHtoD(dB, b, numBytes));
 
-  FNGPUHiddenTritonArgs hidden;
+  FNACCHiddenTritonArgs hidden;
 
   void *args[] = {
       &dA,
@@ -1121,9 +1121,9 @@ extern "C" void __fngpu_launch_nd_f32_s1(int32_t kernelId, int32_t rank,
       &hidden.hidden1,
   };
 
-  if (fngpuDebugEnabled()) {
+  if (fnaccDebugEnabled()) {
     std::fprintf(stderr,
-        "FNGPU: launch SAXPY kernel id=%d rank=%d "
+        "FNACC: launch SAXPY kernel id=%d rank=%d "
         "grid=(%u,1,1) tile=(%d,%d,%d) "
         "cuda_block=(%u,1,1) extent=(%d,%d,%d) "
         "scalar0=%f bytes=%zu\n",
@@ -1131,9 +1131,9 @@ extern "C" void __fngpu_launch_nd_f32_s1(int32_t kernelId, int32_t rank,
         extentY, extentZ, static_cast<double>(scalar0), numBytes);
   }
 
-  if (fngpuDebugEnabled()) {
+  if (fnaccDebugEnabled()) {
     std::fprintf(stderr,
-        "FNGPU: SAXPY args: "
+        "FNACC: SAXPY args: "
         "dA=0x%llx dB=0x%llx dC=0x%llx "
         "scalar0=%f extentX=%d "
         "hidden0=0x%llx hidden1=0x%llx "
@@ -1145,44 +1145,44 @@ extern "C" void __fngpu_launch_nd_f32_s1(int32_t kernelId, int32_t rank,
         static_cast<unsigned long long>(hidden.hidden1), args[0], args[1],
         args[2], args[3], args[4], args[5], args[6]);
 
-    std::fprintf(stderr, "FNGPU: about to cuLaunchKernel SAXPY\n");
+    std::fprintf(stderr, "FNACC: about to cuLaunchKernel SAXPY\n");
     std::fflush(stderr);
   }
 
-  FNGPU_CUDA_CHECK(cuLaunchKernel(
+  FNACC_CUDA_CHECK(cuLaunchKernel(
       fn, gridX, 1, 1, cudaBlockX, 1, 1, 0, nullptr, args, nullptr));
 
-  if (fngpuDebugEnabled()) {
-    std::fprintf(stderr, "FNGPU: cuLaunchKernel SAXPY returned\n");
+  if (fnaccDebugEnabled()) {
+    std::fprintf(stderr, "FNACC: cuLaunchKernel SAXPY returned\n");
     std::fflush(stderr);
   }
 
-  FNGPU_CUDA_CHECK(cuCtxSynchronize());
+  FNACC_CUDA_CHECK(cuCtxSynchronize());
 
-  FNGPU_CUDA_CHECK(cuMemcpyDtoH(c, dC, numBytes));
+  FNACC_CUDA_CHECK(cuMemcpyDtoH(c, dC, numBytes));
 
-  FNGPU_CUDA_CHECK(cuMemFree(dA));
-  FNGPU_CUDA_CHECK(cuMemFree(dB));
-  FNGPU_CUDA_CHECK(cuMemFree(dC));
+  FNACC_CUDA_CHECK(cuMemFree(dA));
+  FNACC_CUDA_CHECK(cuMemFree(dB));
+  FNACC_CUDA_CHECK(cuMemFree(dC));
 }
 
-extern "C" void __fngpu_launch_nd_f32_s2(int32_t kernelId, int32_t rank,
+extern "C" void __fnacc_launch_nd_f32_s2(int32_t kernelId, int32_t rank,
     int32_t blockX, int32_t blockY, int32_t blockZ, float *a, float *b,
     float *c, float scalar0, float scalar1, int32_t extentX, int32_t extentY,
     int32_t extentZ) {
-  fngpuEnsureCurrentContext();
+  fnaccEnsureCurrentContext();
 
-  fngpuValidateHostLaunchAgainstDesc(kernelId, rank, blockX, blockY, blockZ);
+  fnaccValidateHostLaunchAgainstDesc(kernelId, rank, blockX, blockY, blockZ);
 
   if (rank != 1) {
     std::fprintf(stderr,
-        "FNGPU error: __fngpu_launch_nd_f32_s2 currently supports "
+        "FNACC error: __fnacc_launch_nd_f32_s2 currently supports "
         "only rank 1, got rank %d\n",
         rank);
     std::abort();
   }
 
-  fngpuValidateCommonLaunchInputs("__fngpu_launch_nd_f32_s2", rank, blockX,
+  fnaccValidateCommonLaunchInputs("__fnacc_launch_nd_f32_s2", rank, blockX,
       blockY, blockZ, a, b, c, extentX, extentY, extentZ);
 
   if (extentX <= 0 || extentY <= 0 || extentZ <= 0)
@@ -1190,8 +1190,8 @@ extern "C" void __fngpu_launch_nd_f32_s2(int32_t kernelId, int32_t rank,
 
   CUfunction fn = getKernelFunction(kernelId);
 
-  unsigned gridX = fngpuCdiv(extentX, blockX);
-  unsigned cudaBlockX = fngpuCudaThreadsPerCTA(kernelId);
+  unsigned gridX = fnaccCdiv(extentX, blockX);
+  unsigned cudaBlockX = fnaccCudaThreadsPerCTA(kernelId);
 
   std::size_t numElems = static_cast<std::size_t>(extentX);
   std::size_t numBytes = numElems * sizeof(float);
@@ -1200,16 +1200,16 @@ extern "C" void __fngpu_launch_nd_f32_s2(int32_t kernelId, int32_t rank,
   CUdeviceptr dB = 0;
   CUdeviceptr dC = 0;
 
-  FNGPU_CUDA_CHECK(cuMemAlloc(&dA, numBytes));
-  FNGPU_CUDA_CHECK(cuMemAlloc(&dB, numBytes));
-  FNGPU_CUDA_CHECK(cuMemAlloc(&dC, numBytes));
+  FNACC_CUDA_CHECK(cuMemAlloc(&dA, numBytes));
+  FNACC_CUDA_CHECK(cuMemAlloc(&dB, numBytes));
+  FNACC_CUDA_CHECK(cuMemAlloc(&dC, numBytes));
 
-  FNGPU_CUDA_CHECK(cuMemcpyHtoD(dA, a, numBytes));
-  FNGPU_CUDA_CHECK(cuMemcpyHtoD(dB, b, numBytes));
+  FNACC_CUDA_CHECK(cuMemcpyHtoD(dA, a, numBytes));
+  FNACC_CUDA_CHECK(cuMemcpyHtoD(dB, b, numBytes));
 
-  fngpuValidateSupportedHiddenPtrArgCount(kernelId);
+  fnaccValidateSupportedHiddenPtrArgCount(kernelId);
 
-  FNGPUHiddenTritonArgs hidden;
+  FNACCHiddenTritonArgs hidden;
 
   void *args[] = {
       &dA,
@@ -1222,9 +1222,9 @@ extern "C" void __fngpu_launch_nd_f32_s2(int32_t kernelId, int32_t rank,
       &hidden.hidden1,
   };
 
-  if (fngpuDebugEnabled()) {
+  if (fnaccDebugEnabled()) {
     std::fprintf(stderr,
-        "FNGPU: launch expr/s2 kernel id=%d rank=%d "
+        "FNACC: launch expr/s2 kernel id=%d rank=%d "
         "grid=(%u,1,1) tile=(%d,%d,%d) "
         "cuda_block=(%u,1,1) extent=(%d,%d,%d) "
         "scalar0=%f scalar1=%f bytes=%zu\n",
@@ -1233,7 +1233,7 @@ extern "C" void __fngpu_launch_nd_f32_s2(int32_t kernelId, int32_t rank,
         static_cast<double>(scalar1), numBytes);
 
     std::fprintf(stderr,
-        "FNGPU: s2 args: "
+        "FNACC: s2 args: "
         "dA=0x%llx dB=0x%llx dC=0x%llx "
         "scalar0=%f scalar1=%f extentX=%d "
         "hidden0=0x%llx hidden1=0x%llx "
@@ -1246,51 +1246,51 @@ extern "C" void __fngpu_launch_nd_f32_s2(int32_t kernelId, int32_t rank,
         static_cast<unsigned long long>(hidden.hidden1), args[0], args[1],
         args[2], args[3], args[4], args[5], args[6], args[7]);
 
-    std::fprintf(stderr, "FNGPU: about to cuLaunchKernel s2\n");
+    std::fprintf(stderr, "FNACC: about to cuLaunchKernel s2\n");
     std::fflush(stderr);
   }
 
-  FNGPU_CUDA_CHECK(cuLaunchKernel(
+  FNACC_CUDA_CHECK(cuLaunchKernel(
       fn, gridX, 1, 1, cudaBlockX, 1, 1, 0, nullptr, args, nullptr));
 
-  if (fngpuDebugEnabled()) {
-    std::fprintf(stderr, "FNGPU: cuLaunchKernel s2 returned\n");
+  if (fnaccDebugEnabled()) {
+    std::fprintf(stderr, "FNACC: cuLaunchKernel s2 returned\n");
     std::fflush(stderr);
   }
 
-  FNGPU_CUDA_CHECK(cuCtxSynchronize());
+  FNACC_CUDA_CHECK(cuCtxSynchronize());
 
-  FNGPU_CUDA_CHECK(cuMemcpyDtoH(c, dC, numBytes));
+  FNACC_CUDA_CHECK(cuMemcpyDtoH(c, dC, numBytes));
 
-  FNGPU_CUDA_CHECK(cuMemFree(dA));
-  FNGPU_CUDA_CHECK(cuMemFree(dB));
-  FNGPU_CUDA_CHECK(cuMemFree(dC));
+  FNACC_CUDA_CHECK(cuMemFree(dA));
+  FNACC_CUDA_CHECK(cuMemFree(dB));
+  FNACC_CUDA_CHECK(cuMemFree(dC));
 }
 
-extern "C" void __fngpu_launch_f32_v1(int32_t kernelId, int32_t rank,
+extern "C" void __fnacc_launch_f32_v1(int32_t kernelId, int32_t rank,
     int32_t blockX, int32_t blockY, int32_t blockZ, int32_t numReadArrays,
     int32_t numScalars, float *read0, float *read1, float *read2, float *write,
     float scalar0, float scalar1, float scalar2, int32_t extentX,
     int32_t extentY, int32_t extentZ) {
-  fngpuEnsureCurrentContext();
+  fnaccEnsureCurrentContext();
 
-  fngpuValidateHostLaunchAgainstDesc(kernelId, rank, blockX, blockY, blockZ);
+  fnaccValidateHostLaunchAgainstDesc(kernelId, rank, blockX, blockY, blockZ);
 
   if (numReadArrays < 1 || numReadArrays > 3) {
     std::fprintf(stderr,
-        "FNGPU error: unsupported numReadArrays=%d for kernel id %d\n",
+        "FNACC error: unsupported numReadArrays=%d for kernel id %d\n",
         numReadArrays, kernelId);
     std::abort();
   }
 
   if (numScalars < 0 || numScalars > 3) {
     std::fprintf(stderr,
-        "FNGPU error: unsupported numScalars=%d for kernel id %d\n", numScalars,
+        "FNACC error: unsupported numScalars=%d for kernel id %d\n", numScalars,
         kernelId);
     std::abort();
   }
 
-  fngpuValidateCommonLaunchInputs("__fngpu_launch_f32_v1", rank, blockX, blockY,
+  fnaccValidateCommonLaunchInputs("__fnacc_launch_f32_v1", rank, blockX, blockY,
       blockZ, read0, read1, write, extentX, extentY, extentZ);
 
   if (extentX <= 0 || extentY <= 0 || extentZ <= 0)
@@ -1298,15 +1298,15 @@ extern "C" void __fngpu_launch_f32_v1(int32_t kernelId, int32_t rank,
 
   CUfunction fn = getKernelFunction(kernelId);
 
-  unsigned gridX = fngpuCdiv(extentX, blockX);
-  unsigned gridY = rank >= 2 ? fngpuCdiv(extentY, blockY) : 1;
-  unsigned cudaBlockX = fngpuCudaThreadsPerCTA(kernelId);
+  unsigned gridX = fnaccCdiv(extentX, blockX);
+  unsigned gridY = rank >= 2 ? fnaccCdiv(extentY, blockY) : 1;
+  unsigned cudaBlockX = fnaccCudaThreadsPerCTA(kernelId);
 
-  std::size_t elemCount = fngpuElementCount(rank, extentX, extentY, extentZ);
+  std::size_t elemCount = fnaccElementCount(rank, extentX, extentY, extentZ);
 
   std::size_t numBytes = elemCount * sizeof(float);
 
-  const FNGPUKernelDesc *desc = fngpuLookupKernelDesc(kernelId);
+  const FNACCKernelDesc *desc = fnaccLookupKernelDesc(kernelId);
 
   // Current JSON parameter order is:
   //   slot 0 = read0
@@ -1314,49 +1314,49 @@ extern "C" void __fngpu_launch_f32_v1(int32_t kernelId, int32_t rank,
   //   slot 2 = read2 if present, otherwise write for current kernels
   //   slot numReadArrays = write
   //
-  // For current FNGPU kernels numReadArrays is normally 2, so write slot is 2.
+  // For current FNACC kernels numReadArrays is normally 2, so write slot is 2.
   int32_t read0Slot = 0;
   int32_t read1Slot = 1;
   int32_t read2Slot = 2;
   int32_t writeSlot = numReadArrays;
 
-  int32_t read0Target = fngpuPackTargetForSlot(desc, read0Slot);
-  int32_t read1Target = fngpuPackTargetForSlot(desc, read1Slot);
-  int32_t read2Target = fngpuPackTargetForSlot(desc, read2Slot);
-  int32_t writeTarget = fngpuPackTargetForSlot(desc, writeSlot);
+  int32_t read0Target = fnaccPackTargetForSlot(desc, read0Slot);
+  int32_t read1Target = fnaccPackTargetForSlot(desc, read1Slot);
+  int32_t read2Target = fnaccPackTargetForSlot(desc, read2Slot);
+  int32_t writeTarget = fnaccPackTargetForSlot(desc, writeSlot);
 
-  if (fngpuDebugEnabled()) {
+  if (fnaccDebugEnabled()) {
     std::fprintf(stderr,
-        "FNGPU: pack targets for kernel id %d: "
+        "FNACC: pack targets for kernel id %d: "
         "read0(slot %d)=%s read1(slot %d)=%s "
         "read2(slot %d)=%s write(slot %d)=%s\n",
-        kernelId, read0Slot, fngpuPackTargetName(read0Target), read1Slot,
-        fngpuPackTargetName(read1Target), read2Slot,
-        fngpuPackTargetName(read2Target), writeSlot,
-        fngpuPackTargetName(writeTarget));
+        kernelId, read0Slot, fnaccPackTargetName(read0Target), read1Slot,
+        fnaccPackTargetName(read1Target), read2Slot,
+        fnaccPackTargetName(read2Target), writeSlot,
+        fnaccPackTargetName(writeTarget));
   }
 
-  FNGPUDeviceArg read0Dev =
-      fngpuPrepareReadArray(read0, numBytes, read0Target, read0Slot);
+  FNACCDeviceArg read0Dev =
+      fnaccPrepareReadArray(read0, numBytes, read0Target, read0Slot);
 
-  FNGPUDeviceArg read1Dev;
+  FNACCDeviceArg read1Dev;
   if (numReadArrays >= 2)
-    read1Dev = fngpuPrepareReadArray(read1, numBytes, read1Target, read1Slot);
+    read1Dev = fnaccPrepareReadArray(read1, numBytes, read1Target, read1Slot);
 
-  FNGPUDeviceArg read2Dev;
+  FNACCDeviceArg read2Dev;
   if (numReadArrays >= 3)
-    read2Dev = fngpuPrepareReadArray(read2, numBytes, read2Target, read2Slot);
+    read2Dev = fnaccPrepareReadArray(read2, numBytes, read2Target, read2Slot);
 
-  FNGPUDeviceArg writeDev =
-      fngpuPrepareWriteArray(write, numBytes, writeTarget, writeSlot);
+  FNACCDeviceArg writeDev =
+      fnaccPrepareWriteArray(write, numBytes, writeTarget, writeSlot);
 
   CUdeviceptr dRead0 = read0Dev.ptr;
   CUdeviceptr dRead1 = read1Dev.ptr;
   CUdeviceptr dRead2 = read2Dev.ptr;
   CUdeviceptr dWrite = writeDev.ptr;
 
-  fngpuValidateSupportedHiddenPtrArgCount(kernelId);
-  FNGPUHiddenTritonArgs hidden;
+  fnaccValidateSupportedHiddenPtrArgCount(kernelId);
+  FNACCHiddenTritonArgs hidden;
 
   void *args[16];
   int argCount = 0;
@@ -1393,109 +1393,109 @@ extern "C" void __fngpu_launch_f32_v1(int32_t kernelId, int32_t rank,
 
   if (argCount > 16) {
     std::fprintf(stderr,
-        "FNGPU error: internal runtime argument buffer overflow "
+        "FNACC error: internal runtime argument buffer overflow "
         "for kernel id %d; argCount=%d\n",
         kernelId, argCount);
     std::abort();
   }
 
-  if (fngpuDebugEnabled()) {
+  if (fnaccDebugEnabled()) {
     std::fprintf(stderr,
-        "FNGPU: launch generic f32 kernel id=%d rank=%d "
+        "FNACC: launch generic f32 kernel id=%d rank=%d "
         "reads=%d scalars=%d grid=(%u,%u,1) tile=(%d,%d,%d) "
         "cuda_block=(%u,1,1) extent=(%d,%d,%d) bytes=%zu\n",
         kernelId, rank, numReadArrays, numScalars, gridX, gridY, blockX, blockY,
         blockZ, cudaBlockX, extentX, extentY, extentZ, numBytes);
   }
 
-  FNGPU_CUDA_CHECK(cuLaunchKernel(
+  FNACC_CUDA_CHECK(cuLaunchKernel(
       fn, gridX, gridY, 1, cudaBlockX, 1, 1, 0, nullptr, args, nullptr));
 
-  FNGPU_CUDA_CHECK(cuCtxSynchronize());
+  FNACC_CUDA_CHECK(cuCtxSynchronize());
 
-  fngpuCopyBackWriteArray(write, writeDev, numBytes);
+  fnaccCopyBackWriteArray(write, writeDev, numBytes);
 
-  fngpuReleaseDeviceArg(read0Dev);
+  fnaccReleaseDeviceArg(read0Dev);
 
   if (numReadArrays >= 2)
-    fngpuReleaseDeviceArg(read1Dev);
+    fnaccReleaseDeviceArg(read1Dev);
 
   if (numReadArrays >= 3)
-    fngpuReleaseDeviceArg(read2Dev);
+    fnaccReleaseDeviceArg(read2Dev);
 
-  fngpuReleaseDeviceArg(writeDev);
+  fnaccReleaseDeviceArg(writeDev);
 }
 
 // Memory management functions to help with cached data and data lifetimes
-extern "C" void __fngpu_update_host(void *hostPtr) {
-  fngpuEnsureCurrentContext();
+extern "C" void __fnacc_update_host(void *hostPtr) {
+  fnaccEnsureCurrentContext();
 
   if (!hostPtr) {
-    if (fngpuDebugEnabled())
-      std::fprintf(stderr, "FNGPU: update_host ignored null pointer\n");
+    if (fnaccDebugEnabled())
+      std::fprintf(stderr, "FNACC: update_host ignored null pointer\n");
     return;
   }
 
-  auto it = fngpuRegistry.deviceCache.find(hostPtr);
-  if (it == fngpuRegistry.deviceCache.end()) {
-    if (fngpuDebugEnabled()) {
+  auto it = fnaccRegistry.deviceCache.find(hostPtr);
+  if (it == fnaccRegistry.deviceCache.end()) {
+    if (fnaccDebugEnabled()) {
       std::fprintf(stderr,
-          "FNGPU: update_host ignored; no cached allocation for %p\n", hostPtr);
+          "FNACC: update_host ignored; no cached allocation for %p\n", hostPtr);
     }
     return;
   }
 
-  FNGPU_CUDA_CHECK(cuMemcpyDtoH(hostPtr, it->second.ptr, it->second.bytes));
+  FNACC_CUDA_CHECK(cuMemcpyDtoH(hostPtr, it->second.ptr, it->second.bytes));
 
-  if (fngpuDebugEnabled()) {
-    std::fprintf(stderr, "FNGPU: update_host host=%p device=0x%llx bytes=%zu\n",
+  if (fnaccDebugEnabled()) {
+    std::fprintf(stderr, "FNACC: update_host host=%p device=0x%llx bytes=%zu\n",
         hostPtr, static_cast<unsigned long long>(it->second.ptr),
         it->second.bytes);
   }
 }
 
-extern "C" void __fngpu_update_device(void *hostPtr) {
-  fngpuEnsureCurrentContext();
+extern "C" void __fnacc_update_device(void *hostPtr) {
+  fnaccEnsureCurrentContext();
 
   if (!hostPtr) {
-    if (fngpuDebugEnabled())
-      std::fprintf(stderr, "FNGPU: update_device ignored null pointer\n");
+    if (fnaccDebugEnabled())
+      std::fprintf(stderr, "FNACC: update_device ignored null pointer\n");
     return;
   }
 
-  auto it = fngpuRegistry.deviceCache.find(hostPtr);
-  if (it == fngpuRegistry.deviceCache.end()) {
-    if (fngpuDebugEnabled()) {
+  auto it = fnaccRegistry.deviceCache.find(hostPtr);
+  if (it == fnaccRegistry.deviceCache.end()) {
+    if (fnaccDebugEnabled()) {
       std::fprintf(stderr,
-          "FNGPU: update_device ignored; no cached allocation for %p\n",
+          "FNACC: update_device ignored; no cached allocation for %p\n",
           hostPtr);
     }
     return;
   }
 
-  FNGPU_CUDA_CHECK(cuMemcpyHtoD(it->second.ptr, hostPtr, it->second.bytes));
+  FNACC_CUDA_CHECK(cuMemcpyHtoD(it->second.ptr, hostPtr, it->second.bytes));
 
-  if (fngpuDebugEnabled()) {
+  if (fnaccDebugEnabled()) {
     std::fprintf(stderr,
-        "FNGPU: update_device host=%p device=0x%llx bytes=%zu\n", hostPtr,
+        "FNACC: update_device host=%p device=0x%llx bytes=%zu\n", hostPtr,
         static_cast<unsigned long long>(it->second.ptr), it->second.bytes);
   }
 }
 
-extern "C" void __fngpu_release(void *hostPtr) {
-  fngpuEnsureCurrentContext();
+extern "C" void __fnacc_release(void *hostPtr) {
+  fnaccEnsureCurrentContext();
 
   if (!hostPtr) {
-    if (fngpuDebugEnabled())
-      std::fprintf(stderr, "FNGPU: release ignored null pointer\n");
+    if (fnaccDebugEnabled())
+      std::fprintf(stderr, "FNACC: release ignored null pointer\n");
     return;
   }
 
-  auto it = fngpuRegistry.deviceCache.find(hostPtr);
-  if (it == fngpuRegistry.deviceCache.end()) {
-    if (fngpuDebugEnabled()) {
+  auto it = fnaccRegistry.deviceCache.find(hostPtr);
+  if (it == fnaccRegistry.deviceCache.end()) {
+    if (fnaccDebugEnabled()) {
       std::fprintf(stderr,
-          "FNGPU: release ignored; no cached allocation for %p\n", hostPtr);
+          "FNACC: release ignored; no cached allocation for %p\n", hostPtr);
     }
     return;
   }
@@ -1503,37 +1503,37 @@ extern "C" void __fngpu_release(void *hostPtr) {
   CUdeviceptr devicePtr = it->second.ptr;
   std::size_t bytes = it->second.bytes;
 
-  FNGPU_CUDA_CHECK(cuMemFree(devicePtr));
+  FNACC_CUDA_CHECK(cuMemFree(devicePtr));
 
-  fngpuRegistry.deviceCache.erase(it);
+  fnaccRegistry.deviceCache.erase(it);
 
-  if (fngpuDebugEnabled()) {
-    std::fprintf(stderr, "FNGPU: release host=%p device=0x%llx bytes=%zu\n",
+  if (fnaccDebugEnabled()) {
+    std::fprintf(stderr, "FNACC: release host=%p device=0x%llx bytes=%zu\n",
         hostPtr, static_cast<unsigned long long>(devicePtr), bytes);
   }
 }
 
-extern "C" void __fngpu_release_all() {
-  fngpuEnsureCurrentContext();
+extern "C" void __fnacc_release_all() {
+  fnaccEnsureCurrentContext();
 
-  if (fngpuDebugEnabled()) {
+  if (fnaccDebugEnabled()) {
     std::fprintf(stderr,
-        "FNGPU: release_all releasing %zu cached allocations\n",
-        fngpuRegistry.deviceCache.size());
+        "FNACC: release_all releasing %zu cached allocations\n",
+        fnaccRegistry.deviceCache.size());
   }
 
-  for (auto &entry : fngpuRegistry.deviceCache) {
+  for (auto &entry : fnaccRegistry.deviceCache) {
     void *hostPtr = entry.first;
-    FNGPUDeviceAllocation &allocation = entry.second;
+    FNACCDeviceAllocation &allocation = entry.second;
 
-    if (fngpuDebugEnabled()) {
+    if (fnaccDebugEnabled()) {
       std::fprintf(stderr,
-          "FNGPU: release_all host=%p device=0x%llx bytes=%zu\n", hostPtr,
+          "FNACC: release_all host=%p device=0x%llx bytes=%zu\n", hostPtr,
           static_cast<unsigned long long>(allocation.ptr), allocation.bytes);
     }
 
-    FNGPU_CUDA_CHECK(cuMemFree(allocation.ptr));
+    FNACC_CUDA_CHECK(cuMemFree(allocation.ptr));
   }
 
-  fngpuRegistry.deviceCache.clear();
+  fnaccRegistry.deviceCache.clear();
 }

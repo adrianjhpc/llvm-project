@@ -1,6 +1,6 @@
 // RUN: fir-opt \
-// RUN:   --fngpu-assign-kernel-ids \
-// RUN:   --fngpu-lower-to-runtime \
+// RUN:   --fnacc-assign-kernel-ids \
+// RUN:   --fnacc-lower-to-runtime \
 // RUN:   %s | FileCheck %s
 
 module {
@@ -15,7 +15,7 @@ module {
     %nidx = fir.convert %n : (i32) -> index
     %shape = fir.shape %nidx : (index) -> !fir.shape<1>
 
-    fngpu.launch tile_sizes = [128] pack(%a, %c : !fir.ref<!fir.array<?xf32>>, !fir.ref<!fir.array<?xf32>>) {
+    fnacc.launch tile_sizes = [128] pack(%a, %c : !fir.ref<!fir.array<?xf32>>, !fir.ref<!fir.array<?xf32>>) {
       fir.do_loop %iv = %c1_i32 to %n step %c1_i32 : i32 {
         fir.store %iv to %i : !fir.ref<i32>
 
@@ -60,7 +60,7 @@ module {
     %midx = fir.convert %m : (i32) -> index
     %shape = fir.shape %nidx, %midx : (index, index) -> !fir.shape<2>
 
-    fngpu.launch tile_sizes = [16, 16] pack(%a, %c : !fir.ref<!fir.array<?x?xf32>>, !fir.ref<!fir.array<?x?xf32>>) {
+    fnacc.launch tile_sizes = [16, 16] pack(%a, %c : !fir.ref<!fir.array<?x?xf32>>, !fir.ref<!fir.array<?x?xf32>>) {
       fir.do_loop %jv = %c1_i32 to %m step %c1_i32 : i32 {
         fir.store %jv to %j : !fir.ref<i32>
 
@@ -99,7 +99,7 @@ module {
   }
 }
 
-// CHECK: func.func private @__fngpu_launch_f32_v1
+// CHECK: func.func private @__fnacc_launch_f32_v1
 // CHECK-SAME: i32, i32, i32, i32, i32, i32, i32
 // CHECK-SAME: !fir.ref<f32>, !fir.ref<f32>, !fir.ref<f32>, !fir.ref<f32>
 // CHECK-SAME: f32, f32, f32
@@ -107,14 +107,14 @@ module {
 
 // CHECK-LABEL: func.func @kernel1d
 // CHECK: fir.convert {{.*}} : (!fir.ref<!fir.array<?xf32>>) -> !fir.ref<f32>
-// CHECK: call @__fngpu_launch_f32_v1
+// CHECK: call @__fnacc_launch_f32_v1
 // CHECK-SAME: !fir.ref<f32>, !fir.ref<f32>, !fir.ref<f32>, !fir.ref<f32>
 // CHECK-SAME: f32, f32, f32
 // CHECK-SAME: i32, i32, i32
 
 // CHECK-LABEL: func.func @kernel2d
 // CHECK: fir.convert {{.*}} : (!fir.ref<!fir.array<?x?xf32>>) -> !fir.ref<f32>
-// CHECK: call @__fngpu_launch_f32_v1
+// CHECK: call @__fnacc_launch_f32_v1
 // CHECK-SAME: !fir.ref<f32>, !fir.ref<f32>, !fir.ref<f32>, !fir.ref<f32>
 // CHECK-SAME: f32, f32, f32
 // CHECK-SAME: i32, i32, i32

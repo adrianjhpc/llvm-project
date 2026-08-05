@@ -2819,9 +2819,9 @@ public:
     EndOpenMP();
   }
 
-  void Unparse(const FnGPUConstruct &x) { Walk(x.t); }
-  void Unparse(const FnGPUParallelDirective &x) {
-    Word("!$FNGPU PARALLEL");
+  void Unparse(const FnACCConstruct &x) { Walk(x.t); }
+  void Unparse(const FnACCParallelDirective &x) {
+    Word("!$FNACC PARALLEL");
 
     const auto &clauses{std::get<0>(x.t)};
     if (!clauses.empty()) {
@@ -2831,55 +2831,55 @@ public:
 
     Put("\n");
   }
-  void Unparse(const FnGPUPackTarget &x) {
+  void Unparse(const FnACCPackTarget &x) {
     switch (x) {
-    case FnGPUPackTarget::Host:
+    case FnACCPackTarget::Host:
       Word("HOST");
       break;
-    case FnGPUPackTarget::Device:
+    case FnACCPackTarget::Device:
       Word("DEVICE");
       break;
     }
   }
-  void Unparse(const FnGPUClause &x) { Walk(x.u); }
-  void Unparse(const FnGPUTileClause &x) {
+  void Unparse(const FnACCClause &x) { Walk(x.u); }
+  void Unparse(const FnACCTileClause &x) {
     Word("TILE");
     Put("(");
     Walk(x.v, ", ");
     Put(")");
   }
-  void Unparse(const FnGPUPackClause &x) {
+  void Unparse(const FnACCPackClause &x) {
     Word("PACK");
     Put("(");
     Walk(x.v, ", ");
     Put(")");
   }
-  void Unparse(const FnGPUPackClause::Item &x) {
+  void Unparse(const FnACCPackClause::Item &x) {
     Walk(std::get<0>(x.t));
     Put(":");
     Walk(std::get<1>(x.t));
   }
-  void Unparse(const FnGPUUpdateHostDirective &x) {
+  void Unparse(const FnACCUpdateHostDirective &x) {
     Word("UPDATE HOST");
     Put("(");
     Walk(std::get<0>(x.t), ", ");
     Put(")");
   }
-  void Unparse(const FnGPUUpdateDeviceDirective &x) {
+  void Unparse(const FnACCUpdateDeviceDirective &x) {
     Word("UPDATE DEVICE");
     Put("(");
     Walk(std::get<0>(x.t), ", ");
     Put(")");
   }
-  void Unparse(const FnGPUReleaseDirective &x) {
+  void Unparse(const FnACCReleaseDirective &x) {
     Word("RELEASE");
     Put("(");
     Walk(std::get<0>(x.t), ", ");
     Put(")");
   }
-  void Unparse(const FnGPUReleaseAllDirective &) { Word("RELEASE ALL"); }
-  void Unparse(const FnGPUStandaloneConstruct &x) {
-    Word("!$FNGPU");
+  void Unparse(const FnACCReleaseAllDirective &) { Word("RELEASE ALL"); }
+  void Unparse(const FnACCStandaloneConstruct &x) {
+    Word("!$FNACC");
     Put(" ");
     Walk(x.u);
     Put("\n");

@@ -137,13 +137,13 @@ TYPE_CONTEXT_PARSER("declaration construct"_en_US,
             statement(indirect(Parser<StmtFunctionStmt>{}))),
         misplacedSpecificationStmt))
 
-// A !$FNGPU executable directive marks the start of the execution part;
+// A !$FNACC executable directive marks the start of the execution part;
 // the specification part must yield to it cleanly (negation consumes nothing).
-constexpr auto notFngpuDirective{
-    !(skipStuffBeforeStatement >> ("!$FNGPU "_sptok || "!DIR$ FNGPU "_sptok))};
+constexpr auto notfnaccDirective{
+    !(skipStuffBeforeStatement >> ("!$FNACC "_sptok || "!DIR$ FNACC "_sptok))};
 
 constexpr auto recoveredDeclarationConstruct{
-    notFngpuDirective >>
+    notfnaccDirective >>
     recovery(withMessage("expected declaration construct"_err_en_US,
                  declarationConstruct),
         construct<DeclarationConstruct>(declErrorRecovery))};

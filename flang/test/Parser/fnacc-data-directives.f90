@@ -1,39 +1,39 @@
 ! RUN: %flang_fc1 -fdebug-dump-parse-tree-no-sema %s 2>&1 | FileCheck %s
 
-subroutine test_fngpu_data_directives(n, a, b, c)
+subroutine test_fnacc_data_directives(n, a, b, c)
   integer :: n
   real :: a(n), b(n), c(n)
   integer :: i
 
-  !$fngpu parallel tile(128) pack(a:device, c:device)
+  !$fnacc parallel tile(128) pack(a:device, c:device)
   do i = 1, n
     c(i) = a(i) + b(i)
   end do
 
-  !$fngpu update host(c)
-  !$fngpu update device(a)
-  !$fngpu release(a, c)
-  !$fngpu release all
+  !$fnacc update host(c)
+  !$fnacc update device(a)
+  !$fnacc release(a, c)
+  !$fnacc release all
 end subroutine
 
-! CHECK: FnGPUConstruct
-! CHECK: FnGPUParallelDirective
-! CHECK: FnGPUTileClause
-! CHECK: FnGPUPackClause
+! CHECK: FnACCConstruct
+! CHECK: FnACCParallelDirective
+! CHECK: FnACCTileClause
+! CHECK: FnACCPackClause
 
-! CHECK: FnGPUStandaloneConstruct
-! CHECK: FnGPUUpdateHostDirective
+! CHECK: FnACCStandaloneConstruct
+! CHECK: FnACCUpdateHostDirective
 ! CHECK: Name = 'c'
 
-! CHECK: FnGPUStandaloneConstruct
-! CHECK: FnGPUUpdateDeviceDirective
+! CHECK: FnACCStandaloneConstruct
+! CHECK: FnACCUpdateDeviceDirective
 ! CHECK: Name = 'a'
 
-! CHECK: FnGPUStandaloneConstruct
-! CHECK: FnGPUReleaseDirective
+! CHECK: FnACCStandaloneConstruct
+! CHECK: FnACCReleaseDirective
 ! CHECK: Name = 'a'
 ! CHECK: Name = 'c'
 
-! CHECK: FnGPUStandaloneConstruct
-! CHECK: FnGPUReleaseAllDirective
+! CHECK: FnACCStandaloneConstruct
+! CHECK: FnACCReleaseAllDirective
 

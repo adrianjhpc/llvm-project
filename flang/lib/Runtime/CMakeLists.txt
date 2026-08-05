@@ -1,1 +1,1 @@
-add_subdirectory(FNGPU)
+add_subdirectory(FNACC)

@@ -47,20 +47,20 @@ add_flang_library(FIRDialect
   MLIRTargetLLVMIRExport
 )
 
-# --- FNGPU Dialect Library Target ---
-add_flang_library(FIRFNGPUDialect
-  FNGPU/FNGPUDialect.cpp
-  FNGPU/FNGPUAssignKernelIds.cpp
-  FNGPU/FNGPUEmitFortranAliases.cpp
-  FNGPU/FNGPUKernelAnalysis.cpp
-  FNGPU/FNGPUOutlineKernels.cpp
-  FNGPU/FNGPUPipelines.cpp
-  FNGPU/FNGPULowerToTriton.cpp
-  FNGPU/FNGPULowerToRuntime.cpp
+# --- FNACC Dialect Library Target ---
+add_flang_library(FIRFNACCDialect
+  FNACC/FNACCDialect.cpp
+  FNACC/FNACCAssignKernelIds.cpp
+  FNACC/FNACCEmitFortranAliases.cpp
+  FNACC/FNACCKernelAnalysis.cpp
+  FNACC/FNACCOutlineKernels.cpp
+  FNACC/FNACCPipelines.cpp
+  FNACC/FNACCLowerToTriton.cpp
+  FNACC/FNACCLowerToRuntime.cpp
 
   DEPENDS
-  FnGPUDialectIncGen
-  FNGPUPassesIncGen
+  FnACCDialectIncGen
+  FNACCPassesIncGen
 
   LINK_LIBS
   FIRDialect 

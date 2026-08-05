@@ -2079,24 +2079,24 @@ void OmpVisitor::ProcessMapperSpecifier(const parser::OmpMapperSpecifier &spec,
   PopScope();
 }
 
-// Resolve names in FNGPU constructs.
-class FnGPUVisitor : public virtual DeclarationVisitor {
+// Resolve names in FNACC constructs.
+class FnACCVisitor : public virtual DeclarationVisitor {
 public:
-  bool Pre(const parser::FnGPUConstruct &x) {
+  bool Pre(const parser::FnACCConstruct &x) {
     // Track source for diagnostics; descend into the construct.
-    const auto &dir{std::get<parser::FnGPUParallelDirective>(x.t)};
+    const auto &dir{std::get<parser::FnACCParallelDirective>(x.t)};
     messageHandler().set_currStmtSource(dir.source);
     currScope().AddSourceRange(dir.source);
     return true;
   }
 
-  void Post(const parser::FnGPUConstruct &) {
+  void Post(const parser::FnACCConstruct &) {
     messageHandler().set_currStmtSource(std::nullopt);
   }
 
-  bool Pre(const parser::FnGPUStandaloneConstruct &) { return true; }
+  bool Pre(const parser::FnACCStandaloneConstruct &) { return true; }
 
-  void Post(const parser::FnGPUStandaloneConstruct &) {
+  void Post(const parser::FnACCStandaloneConstruct &) {
     messageHandler().set_currStmtSource(std::nullopt);
   }
 
@@ -2106,43 +2106,43 @@ public:
   // This handler is const because the parse-tree walker invokes Post(const T &)
   // in this part of the semantic walk. We const_cast the contained Name because
   // Resolve() must set name.symbol.
-  void Post(const parser::FnGPUPackClause::Item &item) {
+  void Post(const parser::FnACCPackClause::Item &item) {
     auto &name{const_cast<parser::Name &>(std::get<parser::Name>(item.t))};
-    ResolveFNGPUName(name, "PACK clause");
+    ResolveFNACCName(name, "PACK clause");
   }
 
-  // !$fngpu update host(a, b)
-  void Post(const parser::FnGPUUpdateHostDirective &dir) {
+  // !$fnacc update host(a, b)
+  void Post(const parser::FnACCUpdateHostDirective &dir) {
     auto &names{const_cast<std::list<parser::Name> &>(
         std::get<std::list<parser::Name>>(dir.t))};
 
     for (parser::Name &name : names)
-      ResolveFNGPUName(name, "UPDATE HOST directive");
+      ResolveFNACCName(name, "UPDATE HOST directive");
   }
 
-  // !$fngpu update device(a, b)
-  void Post(const parser::FnGPUUpdateDeviceDirective &dir) {
+  // !$fnacc update device(a, b)
+  void Post(const parser::FnACCUpdateDeviceDirective &dir) {
     auto &names{const_cast<std::list<parser::Name> &>(
         std::get<std::list<parser::Name>>(dir.t))};
 
     for (parser::Name &name : names)
-      ResolveFNGPUName(name, "UPDATE DEVICE directive");
+      ResolveFNACCName(name, "UPDATE DEVICE directive");
   }
 
-  // !$fngpu release(a, b)
-  void Post(const parser::FnGPUReleaseDirective &dir) {
+  // !$fnacc release(a, b)
+  void Post(const parser::FnACCReleaseDirective &dir) {
     auto &names{const_cast<std::list<parser::Name> &>(
         std::get<std::list<parser::Name>>(dir.t))};
 
     for (parser::Name &name : names)
-      ResolveFNGPUName(name, "RELEASE directive");
+      ResolveFNACCName(name, "RELEASE directive");
   }
 
-  // !$fngpu release all
-  void Post(const parser::FnGPUReleaseAllDirective &) {}
+  // !$fnacc release all
+  void Post(const parser::FnACCReleaseAllDirective &) {}
 
 private:
-  void ResolveFNGPUName(parser::Name &name, const char *context) {
+  void ResolveFNACCName(parser::Name &name, const char *context) {
     if (name.symbol)
       return; // Already resolved.
 
@@ -2151,7 +2151,7 @@ private:
       return;
     }
 
-    Say(name.source, "'%s' in FNGPU %s is not a declared variable"_err_en_US,
+    Say(name.source, "'%s' in FNACC %s is not a declared variable"_err_en_US,
         name.source, context);
   }
 };
@@ -2363,7 +2363,7 @@ class ResolveNamesVisitor : public virtual ScopeHandler,
                             public ConstructVisitor,
                             public OmpVisitor,
                             public AccVisitor,
-                            public FnGPUVisitor {
+                            public FnACCVisitor {
 public:
   using AccVisitor::Post;
   using AccVisitor::Pre;
@@ -2372,8 +2372,8 @@ public:
   using ConstructVisitor::Pre;
   using DeclarationVisitor::Post;
   using DeclarationVisitor::Pre;
-  using FnGPUVisitor::Post;
-  using FnGPUVisitor::Pre;
+  using FnACCVisitor::Post;
+  using FnACCVisitor::Pre;
   using ImplicitRulesVisitor::Post;
   using ImplicitRulesVisitor::Pre;
   using InterfaceVisitor::Post;

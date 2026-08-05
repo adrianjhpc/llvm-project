@@ -1,4 +1,4 @@
-#include "flang/Optimizer/Dialect/FNGPU/FNGPUKernelAnalysis.h"
+#include "flang/Optimizer/Dialect/FNACC/FNACCKernelAnalysis.h"
 
 #include "flang/Optimizer/Dialect/FIRType.h"
 
@@ -8,10 +8,10 @@
 
 using namespace mlir;
 
-namespace fir::fngpu {
+namespace fir::fnacc {
   namespace {
 
-    static ElementwiseRecognitionResult fail(fir::fngpu::LaunchOp launchOp,
+    static ElementwiseRecognitionResult fail(fir::fnacc::LaunchOp launchOp,
 					     StringRef reason) {
       return ElementwiseRecognitionResult::failure(launchOp.getOperation(),
 						   reason.str());
@@ -91,7 +91,7 @@ namespace fir::fngpu {
       return intValue.getSExtValue() == expected;
     }
 
-    /// For now FNGPU only supports canonical Fortran loops:
+    /// For now FNACC only supports canonical Fortran loops:
     ///
     ///   do i = 1, n
     ///
@@ -715,7 +715,7 @@ namespace fir::fngpu {
     }
 
     
-    static ElementwiseRecognitionResult recognize1D(fir::fngpu::LaunchOp launchOp) {
+    static ElementwiseRecognitionResult recognize1D(fir::fnacc::LaunchOp launchOp) {
       Region &region = launchOp.getRegion();
       if (region.empty())
 	return fail(launchOp, "launch region is empty");
@@ -763,7 +763,7 @@ namespace fir::fngpu {
     }
 
     static ElementwiseRecognitionResult
-    recognize2D(fir::fngpu::LaunchOp launchOp) {
+    recognize2D(fir::fnacc::LaunchOp launchOp) {
       Region &region = launchOp.getRegion();
       if (region.empty())
 	return fail(launchOp, "launch region is empty");
@@ -852,7 +852,7 @@ namespace fir::fngpu {
   }
 
   ElementwiseRecognitionResult
-  recognizeElementwiseKernel(fir::fngpu::LaunchOp launchOp) {
+  recognizeElementwiseKernel(fir::fnacc::LaunchOp launchOp) {
     // Try 2-D first because a 2-D launch also has one top-level loop.
     auto r2 = recognize2D(launchOp);
     if (r2.succeeded())
@@ -871,5 +871,5 @@ namespace fir::fngpu {
     return fail(launchOp, reason);
   }
 
-} // namespace fir::fngpu
+} // namespace fir::fnacc
 

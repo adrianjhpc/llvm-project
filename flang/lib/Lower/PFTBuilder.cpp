@@ -1225,7 +1225,7 @@ private:
             eval.isUnstructured = true;
           },
           [&](const parser::WhereConstruct &) { setConstructExit(eval); },
-          [&](const parser::FnGPUConstruct &) {
+          [&](const parser::FnACCConstruct &) {
             eval.constructExit = &eval.evaluationList->back();
           },
           // Default - Common analysis for IO statements; otherwise nop.
@@ -1394,23 +1394,23 @@ public:
     return eval.visit([](const auto &parseTreeNode) -> llvm::StringRef {
       using NodeTy = std::decay_t<decltype(parseTreeNode)>;
 
-      if constexpr (std::is_same_v<NodeTy, Fortran::parser::FnGPUConstruct>) {
-        return "FnGPUConstruct";
+      if constexpr (std::is_same_v<NodeTy, Fortran::parser::FnACCConstruct>) {
+        return "FnACCConstruct";
       } else if constexpr (std::is_same_v<
                                NodeTy,
-                               Fortran::parser::FnGPUStandaloneConstruct>) {
-        return "FnGPUStandaloneConstruct";
-      } else if constexpr (std::is_same_v<
-                               NodeTy,
-                               Fortran::common::Indirection<
-                                   Fortran::parser::FnGPUConstruct, false>>) {
-        return "FnGPUConstruct";
+                               Fortran::parser::FnACCStandaloneConstruct>) {
+        return "FnACCStandaloneConstruct";
       } else if constexpr (std::is_same_v<
                                NodeTy,
                                Fortran::common::Indirection<
-                                   Fortran::parser::FnGPUStandaloneConstruct,
+                                   Fortran::parser::FnACCConstruct, false>>) {
+        return "FnACCConstruct";
+      } else if constexpr (std::is_same_v<
+                               NodeTy,
+                               Fortran::common::Indirection<
+                                   Fortran::parser::FnACCStandaloneConstruct,
                                    false>>) {
-        return "FnGPUStandaloneConstruct";
+        return "FnACCStandaloneConstruct";
       } else {
         return parser::ParseTreeDumper::GetNodeName(parseTreeNode);
       }

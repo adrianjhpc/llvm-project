@@ -1,7 +1,7 @@
-#ifndef FORTRAN_OPTIMIZER_DIALECT_FNGPU_FNGPUKERNELANALYSIS_H
-#define FORTRAN_OPTIMIZER_DIALECT_FNGPU_FNGPUKERNELANALYSIS_H
+#ifndef FORTRAN_OPTIMIZER_DIALECT_FNACC_FNACCKERNELANALYSIS_H
+#define FORTRAN_OPTIMIZER_DIALECT_FNACC_FNACCKERNELANALYSIS_H
 
-#include "flang/Optimizer/Dialect/FNGPU/FNGPUDialect.h"
+#include "flang/Optimizer/Dialect/FNACC/FNACCDialect.h"
 #include "flang/Optimizer/Dialect/FIROps.h"
 
 #include "mlir/IR/Matchers.h"
@@ -14,7 +14,7 @@
 #include <string>
 #include <memory>
 
-namespace fir::fngpu {
+namespace fir::fnacc {
 
   enum class ElementwiseKernelKind {
     BinaryArrayArray,
@@ -125,11 +125,11 @@ namespace fir::fngpu {
   };
 
   ElementwiseRecognitionResult
-  recognizeElementwiseKernel(fir::fngpu::LaunchOp launchOp);
+  recognizeElementwiseKernel(fir::fnacc::LaunchOp launchOp);
 
   bool isSupportedElementwiseCompute(mlir::Operation *op);
 
-} // namespace fir::fngpu
+} // namespace fir::fnacc
 
-#endif // FORTRAN_OPTIMIZER_DIALECT_FNGPU_FNGPUKERNELANALYSIS_H
+#endif // FORTRAN_OPTIMIZER_DIALECT_FNACC_FNACCKERNELANALYSIS_H
 

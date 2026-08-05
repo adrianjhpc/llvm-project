@@ -1,6 +1,6 @@
 // RUN: fir-opt \
-// RUN:   --fngpu-assign-kernel-ids \
-// RUN:   --fngpu-lower-to-runtime \
+// RUN:   --fnacc-assign-kernel-ids \
+// RUN:   --fnacc-lower-to-runtime \
 // RUN:   %s -o /dev/null 2>&1 | FileCheck %s
 
 module {
@@ -11,7 +11,7 @@ module {
     %c1_i32 = arith.constant 1 : i32
     %n = fir.load %nref : !fir.ref<i32>
 
-    fngpu.launch tile_sizes = [128] {
+    fnacc.launch tile_sizes = [128] {
       fir.do_loop %iv = %c0_i32 to %n step %c1_i32 : i32 {
         fir.store %iv to %i : !fir.ref<i32>
       }
@@ -29,7 +29,7 @@ module {
     %c2_i32 = arith.constant 2 : i32
     %n = fir.load %nref : !fir.ref<i32>
 
-    fngpu.launch tile_sizes = [128] {
+    fnacc.launch tile_sizes = [128] {
       fir.do_loop %iv = %c1_i32 to %n step %c2_i32 : i32 {
         fir.store %iv to %i : !fir.ref<i32>
       }
@@ -41,9 +41,9 @@ module {
   }
 }
 
-// CHECK: warning: FNGPU runtime lowering skipped launch:
+// CHECK: warning: FNACC runtime lowering skipped launch:
 // CHECK-SAME: 1-D loop lower bound must be constant 1
 
-// CHECK: warning: FNGPU runtime lowering skipped launch:
+// CHECK: warning: FNACC runtime lowering skipped launch:
 // CHECK-SAME: 1-D loop step must be constant 1
 

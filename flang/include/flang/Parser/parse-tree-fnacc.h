@@ -4,67 +4,67 @@
 #include <tuple>
 #include <variant>
 
-ENUM_CLASS(FnGPUPackTarget, Host, Device);
+ENUM_CLASS(FnACCPackTarget, Host, Device);
 
-struct FnGPUPackClause {
+struct FnACCPackClause {
   struct Item {
     TUPLE_CLASS_BOILERPLATE(Item);
-    std::tuple<Name, FnGPUPackTarget> t;
+    std::tuple<Name, FnACCPackTarget> t;
   };
-  WRAPPER_CLASS_BOILERPLATE(FnGPUPackClause, std::list<Item>);
+  WRAPPER_CLASS_BOILERPLATE(FnACCPackClause, std::list<Item>);
 };
 
-struct FnGPUTileClause {
-  WRAPPER_CLASS_BOILERPLATE(FnGPUTileClause, std::list<ScalarIntConstantExpr>);
+struct FnACCTileClause {
+  WRAPPER_CLASS_BOILERPLATE(FnACCTileClause, std::list<ScalarIntConstantExpr>);
 };
 
-struct FnGPUClause {
-  UNION_CLASS_BOILERPLATE(FnGPUClause);
-  std::variant<FnGPUTileClause, FnGPUPackClause> u;
+struct FnACCClause {
+  UNION_CLASS_BOILERPLATE(FnACCClause);
+  std::variant<FnACCTileClause, FnACCPackClause> u;
 };
 
-struct FnGPUParallelDirective {
-  TUPLE_CLASS_BOILERPLATE(FnGPUParallelDirective);
-  std::tuple<std::list<FnGPUClause>> t;
+struct FnACCParallelDirective {
+  TUPLE_CLASS_BOILERPLATE(FnACCParallelDirective);
+  std::tuple<std::list<FnACCClause>> t;
   CharBlock source;
 };
 
-struct FnGPUConstruct {
-  TUPLE_CLASS_BOILERPLATE(FnGPUConstruct);
-  std::tuple<FnGPUParallelDirective, DoConstruct> t;
+struct FnACCConstruct {
+  TUPLE_CLASS_BOILERPLATE(FnACCConstruct);
+  std::tuple<FnACCParallelDirective, DoConstruct> t;
 };
 
-// FNGPU standalone data-management directives.
+// FNACC standalone data-management directives.
 //
 // Source forms:
 //
-//   !$fngpu update host(a, b)
-//   !$fngpu update device(a, b)
-//   !$fngpu release(a, b)
-//   !$fngpu release all
+//   !$fnacc update host(a, b)
+//   !$fnacc update device(a, b)
+//   !$fnacc release(a, b)
+//   !$fnacc release all
 
-struct FnGPUUpdateHostDirective {
-  TUPLE_CLASS_BOILERPLATE(FnGPUUpdateHostDirective);
+struct FnACCUpdateHostDirective {
+  TUPLE_CLASS_BOILERPLATE(FnACCUpdateHostDirective);
   std::tuple<std::list<Name>> t;
 };
 
-struct FnGPUUpdateDeviceDirective {
-  TUPLE_CLASS_BOILERPLATE(FnGPUUpdateDeviceDirective);
+struct FnACCUpdateDeviceDirective {
+  TUPLE_CLASS_BOILERPLATE(FnACCUpdateDeviceDirective);
   std::tuple<std::list<Name>> t;
 };
 
-struct FnGPUReleaseDirective {
-  TUPLE_CLASS_BOILERPLATE(FnGPUReleaseDirective);
+struct FnACCReleaseDirective {
+  TUPLE_CLASS_BOILERPLATE(FnACCReleaseDirective);
   std::tuple<std::list<Name>> t;
 };
 
-struct FnGPUReleaseAllDirective {
-  WRAPPER_CLASS_BOILERPLATE(FnGPUReleaseAllDirective, bool);
+struct FnACCReleaseAllDirective {
+  WRAPPER_CLASS_BOILERPLATE(FnACCReleaseAllDirective, bool);
 };
 
-struct FnGPUStandaloneConstruct {
-  UNION_CLASS_BOILERPLATE(FnGPUStandaloneConstruct);
-  std::variant<FnGPUUpdateHostDirective, FnGPUUpdateDeviceDirective,
-      FnGPUReleaseDirective, FnGPUReleaseAllDirective>
+struct FnACCStandaloneConstruct {
+  UNION_CLASS_BOILERPLATE(FnACCStandaloneConstruct);
+  std::variant<FnACCUpdateHostDirective, FnACCUpdateDeviceDirective,
+      FnACCReleaseDirective, FnACCReleaseAllDirective>
       u;
 };

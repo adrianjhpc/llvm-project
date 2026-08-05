@@ -39,7 +39,7 @@ add_flang_library(flangFrontend
   FortranSupport
   FIRDialect
   FIRDialectSupport
-  FIRFNGPUDialect
+  FIRFNACCDialect
   FIRSupport
   FIRBuilder
   FIRCodeGen

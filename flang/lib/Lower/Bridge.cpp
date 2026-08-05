@@ -49,7 +49,7 @@
 #include "flang/Optimizer/Dialect/CUF/CUFOps.h"
 #include "flang/Optimizer/Dialect/FIRAttr.h"
 #include "flang/Optimizer/Dialect/FIROps.h"
-#include "flang/Optimizer/Dialect/FNGPU/FNGPUDialect.h"
+#include "flang/Optimizer/Dialect/FNACC/FNACCDialect.h"
 #include "flang/Optimizer/Dialect/Support/FIRContext.h"
 #include "flang/Optimizer/HLFIR/HLFIROps.h"
 #include "flang/Optimizer/Support/DataLayout.h"
@@ -3652,38 +3652,38 @@ private:
         dir.u);
   }
 
-  void genFIR(const Fortran::parser::FnGPUConstruct &fngpu) {
-    setCurrentPositionAt(fngpu);
+  void genFIR(const Fortran::parser::FnACCConstruct &fnacc) {
+    setCurrentPositionAt(fnacc);
     Fortran::lower::pft::Evaluation &eval = getEval();
     mlir::Location loc = toLocation();
 
     const auto &directive{
-        std::get<Fortran::parser::FnGPUParallelDirective>(fngpu.t)};
+        std::get<Fortran::parser::FnACCParallelDirective>(fnacc.t)};
     const auto &clauses{
-        std::get<std::list<Fortran::parser::FnGPUClause>>(directive.t)};
+        std::get<std::list<Fortran::parser::FnACCClause>>(directive.t)};
 
     llvm::SmallVector<int64_t> tileSizes;
     llvm::SmallVector<mlir::Value> packVars;
     llvm::SmallVector<int32_t> packTargets;
 
-    for (const Fortran::parser::FnGPUClause &clause : clauses) {
+    for (const Fortran::parser::FnACCClause &clause : clauses) {
       Fortran::common::visit(
           Fortran::common::visitors{
-              [&](const Fortran::parser::FnGPUTileClause &tileClause) {
+              [&](const Fortran::parser::FnACCTileClause &tileClause) {
                 for (const auto &expr : tileClause.v)
                   if (std::optional<int64_t> val =
                           Fortran::semantics::GetIntValue(expr))
                     tileSizes.push_back(*val);
               },
-              [&](const Fortran::parser::FnGPUPackClause &packClause) {
+              [&](const Fortran::parser::FnACCPackClause &packClause) {
                 for (const auto &item : packClause.v) {
                   const auto &name{std::get<Fortran::parser::Name>(item.t)};
                   const auto tgt{
-                      std::get<Fortran::parser::FnGPUPackTarget>(item.t)};
+                      std::get<Fortran::parser::FnACCPackTarget>(item.t)};
                   if (name.symbol) {
                     packVars.push_back(getSymbolAddress(*name.symbol));
                     packTargets.push_back(
-                        tgt == Fortran::parser::FnGPUPackTarget::Device ? 1
+                        tgt == Fortran::parser::FnACCPackTarget::Device ? 1
                                                                         : 0);
                   }
                 }
@@ -3692,7 +3692,7 @@ private:
           clause.u);
     }
 
-    auto launchOp = fir::fngpu::LaunchOp::create(*builder, loc, tileSizes,
+    auto launchOp = fir::fnacc::LaunchOp::create(*builder, loc, tileSizes,
                                                  packVars, packTargets);
 
     // 4. New block inside the region
@@ -3708,22 +3708,22 @@ private:
     builder->setInsertionPointAfter(launchOp);
   }
 
-  void genFIR(const Fortran::parser::FnGPUStandaloneConstruct &fngpu) {
-    setCurrentPositionAt(fngpu);
+  void genFIR(const Fortran::parser::FnACCStandaloneConstruct &fnacc) {
+    setCurrentPositionAt(fnacc);
     mlir::Location loc = toLocation();
 
     auto getValueForName =
         [&](const Fortran::parser::Name &name) -> mlir::Value {
       if (!name.symbol) {
         mlir::emitError(loc)
-            << "FNGPU data directive variable has no resolved symbol";
+            << "FNACC data directive variable has no resolved symbol";
         return {};
       }
 
       mlir::Value value = getSymbolAddress(*name.symbol);
       if (!value) {
         mlir::emitError(loc)
-            << "FNGPU data directive variable has no FIR address";
+            << "FNACC data directive variable has no FIR address";
         return {};
       }
 
@@ -3732,7 +3732,7 @@ private:
 
     Fortran::common::visit(
         Fortran::common::visitors{
-            [&](const Fortran::parser::FnGPUUpdateHostDirective &dir) {
+            [&](const Fortran::parser::FnACCUpdateHostDirective &dir) {
               const auto &names{std::get<0>(dir.t)};
                   
 
@@ -3741,11 +3741,11 @@ private:
                 if (!value)
                   continue;
 
-                fir::fngpu::UpdateHostOp::create(*builder, loc, value);
+                fir::fnacc::UpdateHostOp::create(*builder, loc, value);
               }
             },
 
-            [&](const Fortran::parser::FnGPUUpdateDeviceDirective &dir) {
+            [&](const Fortran::parser::FnACCUpdateDeviceDirective &dir) {
               const auto &names{std::get<0>(dir.t)};
 
               for (const Fortran::parser::Name &name : names) {
@@ -3753,11 +3753,11 @@ private:
                 if (!value)
                   continue;
 
-                fir::fngpu::UpdateDeviceOp::create(*builder, loc, value);
+                fir::fnacc::UpdateDeviceOp::create(*builder, loc, value);
               }
             },
 
-            [&](const Fortran::parser::FnGPUReleaseDirective &dir) {
+            [&](const Fortran::parser::FnACCReleaseDirective &dir) {
               const auto &names{std::get<0>(dir.t)};
 
               llvm::SmallVector<mlir::Value> values;
@@ -3768,13 +3768,13 @@ private:
               }
 
               if (!values.empty())
-                fir::fngpu::ReleaseOp::create(*builder, loc, values);
+                fir::fnacc::ReleaseOp::create(*builder, loc, values);
             },
 
-            [&](const Fortran::parser::FnGPUReleaseAllDirective &) {
-              fir::fngpu::ReleaseAllOp::create(*builder, loc);
+            [&](const Fortran::parser::FnACCReleaseAllDirective &) {
+              fir::fnacc::ReleaseAllOp::create(*builder, loc);
             }},
-        fngpu.u);
+        fnacc.u);
   }
 
   void genFIR(const Fortran::parser::OpenACCConstruct &acc) {

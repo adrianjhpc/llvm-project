@@ -1,6 +1,6 @@
 // RUN: fir-opt \
-// RUN:   --fngpu-assign-kernel-ids \
-// RUN:   --fngpu-lower-to-triton="ttir-output=%t.ttir json-output=%t.json" \
+// RUN:   --fnacc-assign-kernel-ids \
+// RUN:   --fnacc-lower-to-triton="ttir-output=%t.ttir json-output=%t.json" \
 // RUN:   %s -o /dev/null
 // RUN: FileCheck %s --check-prefix=JSON --input-file=%t.json
 // RUN: python3 -m json.tool %t.json > /dev/null
@@ -17,7 +17,7 @@ module {
     %nidx = fir.convert %n : (i32) -> index
     %shape = fir.shape %nidx : (index) -> !fir.shape<1>
 
-    fngpu.launch tile_sizes = [128] {
+    fnacc.launch tile_sizes = [128] {
       fir.do_loop %iv = %c1_i32 to %n step %c1_i32 : i32 {
         fir.store %iv to %i : !fir.ref<i32>
 
@@ -47,7 +47,7 @@ module {
 }
 
 // JSON: "id": 0
-// JSON: "name": "fngpu_kernel_0"
+// JSON: "name": "fnacc_kernel_0"
 // JSON: "kind": "binary"
 // JSON: "rank": 1
 // JSON: "tile": [128, 1, 1]

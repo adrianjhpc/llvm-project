@@ -8,57 +8,57 @@
 
 namespace Fortran::parser {
 
-constexpr auto startFngpuLine =
-    skipStuffBeforeStatement >> ("!$FNGPU "_sptok || "!DIR$ FNGPU "_sptok);
+constexpr auto startfnaccLine =
+    skipStuffBeforeStatement >> ("!$FNACC "_sptok || "!DIR$ FNACC "_sptok);
 
-constexpr auto endFngpuLine = space >> endOfLine;
+constexpr auto endfnaccLine = space >> endOfLine;
 
 template <typename PA> inline constexpr auto nonemptyList(PA p) {
   return nonemptySeparated(p, ","_tok);
 }
 
-TYPE_PARSER("HOST"_tok >> pure(FnGPUPackTarget::Host) ||
-    "DEVICE"_tok >> pure(FnGPUPackTarget::Device))
+TYPE_PARSER("HOST"_tok >> pure(FnACCPackTarget::Host) ||
+    "DEVICE"_tok >> pure(FnACCPackTarget::Device))
 
-TYPE_PARSER(construct<FnGPUPackClause::Item>(
-    name, ":"_tok >> Parser<FnGPUPackTarget>{}))
+TYPE_PARSER(construct<FnACCPackClause::Item>(
+    name, ":"_tok >> Parser<FnACCPackTarget>{}))
 
-TYPE_PARSER(construct<FnGPUPackClause>(
-    "PACK"_tok >> parenthesized(nonemptyList(Parser<FnGPUPackClause::Item>{}))))
+TYPE_PARSER(construct<FnACCPackClause>(
+    "PACK"_tok >> parenthesized(nonemptyList(Parser<FnACCPackClause::Item>{}))))
 
-TYPE_PARSER(construct<FnGPUTileClause>(
+TYPE_PARSER(construct<FnACCTileClause>(
     "TILE"_tok >> parenthesized(nonemptyList(scalarIntConstantExpr))))
 
-TYPE_PARSER(construct<FnGPUClause>(Parser<FnGPUTileClause>{}) ||
-    construct<FnGPUClause>(Parser<FnGPUPackClause>{}))
+TYPE_PARSER(construct<FnACCClause>(Parser<FnACCTileClause>{}) ||
+    construct<FnACCClause>(Parser<FnACCPackClause>{}))
 
-TYPE_PARSER(construct<FnGPUParallelDirective>(
-    "PARALLEL"_tok >> many(Parser<FnGPUClause>{})))
+TYPE_PARSER(construct<FnACCParallelDirective>(
+    "PARALLEL"_tok >> many(Parser<FnACCClause>{})))
 
-TYPE_PARSER(construct<FnGPUConstruct>(
-    sourced(startFngpuLine >> Parser<FnGPUParallelDirective>{} / endOfLine),
+TYPE_PARSER(construct<FnACCConstruct>(
+    sourced(startfnaccLine >> Parser<FnACCParallelDirective>{} / endOfLine),
     Parser<DoConstruct>{}))
 
-TYPE_PARSER(construct<FnGPUUpdateHostDirective>(
+TYPE_PARSER(construct<FnACCUpdateHostDirective>(
     "UPDATE"_tok >> "HOST"_tok >> parenthesized(nonemptyList(name))))
 
-TYPE_PARSER(construct<FnGPUUpdateDeviceDirective>(
+TYPE_PARSER(construct<FnACCUpdateDeviceDirective>(
     "UPDATE"_tok >> "DEVICE"_tok >> parenthesized(nonemptyList(name))))
 
-TYPE_PARSER(construct<FnGPUReleaseDirective>(
+TYPE_PARSER(construct<FnACCReleaseDirective>(
     "RELEASE"_tok >> parenthesized(nonemptyList(name))))
 
-TYPE_PARSER(construct<FnGPUReleaseAllDirective>(
+TYPE_PARSER(construct<FnACCReleaseAllDirective>(
     ("RELEASE"_tok >> "ALL"_tok >> pure(true)) ||
     ("RELEASE_ALL"_tok >> pure(true))))
 
-TYPE_PARSER(construct<FnGPUStandaloneConstruct>(startFngpuLine >>
-                Parser<FnGPUUpdateHostDirective>{} / endOfLine) ||
-    construct<FnGPUStandaloneConstruct>(
-        startFngpuLine >> Parser<FnGPUUpdateDeviceDirective>{} / endOfLine) ||
-    construct<FnGPUStandaloneConstruct>(
-        startFngpuLine >> Parser<FnGPUReleaseDirective>{} / endOfLine) ||
-    construct<FnGPUStandaloneConstruct>(
-        startFngpuLine >> Parser<FnGPUReleaseAllDirective>{} / endOfLine))
+TYPE_PARSER(construct<FnACCStandaloneConstruct>(startfnaccLine >>
+                Parser<FnACCUpdateHostDirective>{} / endOfLine) ||
+    construct<FnACCStandaloneConstruct>(
+        startfnaccLine >> Parser<FnACCUpdateDeviceDirective>{} / endOfLine) ||
+    construct<FnACCStandaloneConstruct>(
+        startfnaccLine >> Parser<FnACCReleaseDirective>{} / endOfLine) ||
+    construct<FnACCStandaloneConstruct>(
+        startfnaccLine >> Parser<FnACCReleaseAllDirective>{} / endOfLine))
 
 } // namespace Fortran::parser

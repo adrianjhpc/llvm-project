@@ -14,6 +14,6 @@ if (FLANG_INCLUDE_TESTS)
   add_subdirectory(Testing)
 endif ()
 
-if (FLANG_FNGPU)
+if (FLANG_FNACC)
   add_subdirectory(Runtime)
 endif()

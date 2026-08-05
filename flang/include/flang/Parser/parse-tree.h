@@ -276,8 +276,8 @@ struct OpenMPDeclarativeConstruct;
 struct OpenMPInvalidDirective;
 struct OpenMPMisplacedEndDirective;
 struct CUFKernelDoConstruct;
-struct FnGPUConstruct;
-struct FnGPUStandaloneConstruct;
+struct FnACCConstruct;
+struct FnACCStandaloneConstruct;
 
 // Cooked character stream locations
 using Location = const char *;
@@ -551,8 +551,8 @@ struct ExecutableConstruct {
       common::Indirection<OpenMPMisplacedEndDirective>,
       common::Indirection<OpenMPInvalidDirective>,
       common::Indirection<CUFKernelDoConstruct>,
-      common::Indirection<FnGPUConstruct>,
-      common::Indirection<FnGPUStandaloneConstruct>>
+      common::Indirection<FnACCConstruct>,
+      common::Indirection<FnACCStandaloneConstruct>>
       u;
 };
 
@@ -5587,8 +5587,8 @@ struct OpenMPInvalidDirective {
   CharBlock source;
 };
 
-// FnGPU parsing
-#include "flang/Parser/parse-tree-fngpu.h"
+// FnACC parsing
+#include "flang/Parser/parse-tree-fnacc.h"
 
 // Parse tree nodes for OpenACC 3.3 directives and clauses
 

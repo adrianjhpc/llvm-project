@@ -1,24 +1,24 @@
-#include "flang/Optimizer/Dialect/FNGPU/FNGPUDialect.h"
-#include "flang/Optimizer/Dialect/FNGPU/FNGPUPasses.h"
+#include "flang/Optimizer/Dialect/FNACC/FNACCDialect.h"
+#include "flang/Optimizer/Dialect/FNACC/FNACCPasses.h"
 
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinOps.h"
 
-namespace fir::fngpu {
-#define GEN_PASS_DEF_FNGPUASSIGNKERNELIDS
-#include "flang/Optimizer/Dialect/FNGPU/FNGPUPasses.h.inc"
-} // namespace fir::fngpu
+namespace fir::fnacc {
+#define GEN_PASS_DEF_FNACCASSIGNKERNELIDS
+#include "flang/Optimizer/Dialect/FNACC/FNACCPasses.h.inc"
+} // namespace fir::fnacc
 
 using namespace mlir;
 
 namespace {
 
-static constexpr llvm::StringLiteral kKernelIdAttrName = "fngpu.kernel_id";
-static constexpr llvm::StringLiteral kKernelNameAttrName = "fngpu.kernel_name";
+static constexpr llvm::StringLiteral kKernelIdAttrName = "fnacc.kernel_id";
+static constexpr llvm::StringLiteral kKernelNameAttrName = "fnacc.kernel_name";
 
-struct FNGPUAssignKernelIdsPass
-    : public fir::fngpu::impl::FNGPUAssignKernelIdsBase<
-          FNGPUAssignKernelIdsPass> {
+struct FNACCAssignKernelIdsPass
+    : public fir::fnacc::impl::FNACCAssignKernelIdsBase<
+          FNACCAssignKernelIdsPass> {
   void runOnOperation() override {
     ModuleOp module = getOperation();
     MLIRContext *ctx = module.getContext();
@@ -26,7 +26,7 @@ struct FNGPUAssignKernelIdsPass
 
     int32_t nextId = 0;
 
-    module.walk([&](fir::fngpu::LaunchOp launchOp) {
+    module.walk([&](fir::fnacc::LaunchOp launchOp) {
       int32_t id = nextId++;
 
       // If an id already exists, preserve it. This makes the pass idempotent
@@ -39,7 +39,7 @@ struct FNGPUAssignKernelIdsPass
       }
 
       if (!launchOp->hasAttr(kKernelNameAttrName)) {
-        std::string name = "fngpu_kernel_" + std::to_string(id);
+        std::string name = "fnacc_kernel_" + std::to_string(id);
         launchOp->setAttr(kKernelNameAttrName, builder.getStringAttr(name));
       }
     });
@@ -48,6 +48,6 @@ struct FNGPUAssignKernelIdsPass
 
 } // namespace
 
-std::unique_ptr<mlir::Pass> fir::fngpu::createFNGPUAssignKernelIdsPass() {
-  return std::make_unique<FNGPUAssignKernelIdsPass>();
+std::unique_ptr<mlir::Pass> fir::fnacc::createFNACCAssignKernelIdsPass() {
+  return std::make_unique<FNACCAssignKernelIdsPass>();
 }

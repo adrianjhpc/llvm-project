@@ -97,8 +97,8 @@ const SourceFile *Parsing::Prescan(const std::string &path, Options options) {
     prescanner.AddCompilerDirectiveSentinel("$cuf");
     prescanner.AddCompilerDirectiveSentinel("@cuf");
   }
-  prescanner.AddCompilerDirectiveSentinel("$fngpu");
-  prescanner.AddCompilerDirectiveSentinel("@fngpu");
+  prescanner.AddCompilerDirectiveSentinel("$fnacc");
+  prescanner.AddCompilerDirectiveSentinel("@fnacc");
   for (const auto &sentinel : options.compilerDirectiveSentinels) {
     prescanner.AddCompilerDirectiveSentinel(sentinel);
   }
@@ -137,7 +137,7 @@ void Parsing::EmitPreprocessedSource(
   // The sentinel ends at the first non-sentinel character (usually the
   // space separating it from the directive body).  A defensive upper
   // bound guards against pathological input; the longest sentinel is
-  // "$fngpu" (6), so 8 leaves headroom.
+  // "$fnacc" (6), so 8 leaves headroom.
   constexpr std::size_t maxSentinelLength{8};
   bool sentinelComplete{false};
   // We need to know the current directive in order to provide correct

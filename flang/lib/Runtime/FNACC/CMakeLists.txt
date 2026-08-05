@@ -8,21 +8,21 @@ find_library(CUDA_DRIVER_LIBRARY cuda
 
 if(NOT CUDA_DRIVER_INCLUDE_DIR OR NOT CUDA_DRIVER_LIBRARY)
   message(FATAL_ERROR
-    "FLANG_FNGPU is ON, but the CUDA driver "
+    "FLANG_FNACC is ON, but the CUDA driver "
     "headers/library were not found. Set CUDA_DRIVER_INCLUDE_DIR and "
-    "CUDA_DRIVER_LIBRARY, or disable FLANG_FNGPU.")
+    "CUDA_DRIVER_LIBRARY, or disable FLANG_FNACC.")
 endif()
 
-add_flang_library(FortranFNGPURuntime
-  fngpu_runtime.cpp
+add_flang_library(FortranFNACCRuntime
+  fnacc_runtime.cpp
 )
 
-target_include_directories(FortranFNGPURuntime
+target_include_directories(FortranFNACCRuntime
   PRIVATE
     ${CUDA_DRIVER_INCLUDE_DIR}
 )
 
-target_link_libraries(FortranFNGPURuntime
+target_link_libraries(FortranFNACCRuntime
   PRIVATE
     ${CUDA_DRIVER_LIBRARY}
 )

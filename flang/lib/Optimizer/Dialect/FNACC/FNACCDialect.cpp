@@ -1,25 +1,25 @@
-#include "flang/Optimizer/Dialect/FNGPU/FNGPUDialect.h"
+#include "flang/Optimizer/Dialect/FNACC/FNACCDialect.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/DialectImplementation.h"
 #include "mlir/IR/OpImplementation.h"
 
-using namespace fir::fngpu;
+using namespace fir::fnacc;
 
-// The .inc files automatically generate the fir::fngpu namespaces
-#include "flang/Optimizer/Dialect/FNGPU/FNGPUDialect.cpp.inc"
+// The .inc files automatically generate the fir::fnacc namespaces
+#include "flang/Optimizer/Dialect/FNACC/FNACCDialect.cpp.inc"
 
 #define GET_OP_CLASSES
-#include "flang/Optimizer/Dialect/FNGPU/FNGPUOps.cpp.inc"
+#include "flang/Optimizer/Dialect/FNACC/FNACCOps.cpp.inc"
 
 // Explicitly scope the initialize method to the namespace
-void fir::fngpu::FNGPUDialect::initialize() {
+void fir::fnacc::FNACCDialect::initialize() {
   addOperations<
 #define GET_OP_LIST
-#include "flang/Optimizer/Dialect/FNGPU/FNGPUOps.cpp.inc"
+#include "flang/Optimizer/Dialect/FNACC/FNACCOps.cpp.inc"
       >();
 }
 
-llvm::LogicalResult fir::fngpu::LaunchOp::verify() {
+llvm::LogicalResult fir::fnacc::LaunchOp::verify() {
   if (getPackVars().size() != getPackTargets().size())
     return emitOpError(
         "expected pack_targets to have exactly one entry per pack var");

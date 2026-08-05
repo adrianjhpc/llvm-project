@@ -528,7 +528,7 @@ if (FLANG_INCLUDE_DOCS)
   add_subdirectory(docs)
 endif()
 
-option(FLANG_FNGPU "Build FNGPU functionality" OFF)
+option(FLANG_FNACC "Build FNACC functionality" OFF)
 
 # Custom target to install Flang libraries.
 add_custom_target(flang-libraries)

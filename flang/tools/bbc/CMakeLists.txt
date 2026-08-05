@@ -20,7 +20,7 @@ target_link_libraries(bbc PRIVATE
   CUFDialect
   FIRDialect
   FIRDialectSupport
-  FIRFNGPUDialect
+  FIRFNACCDialect
   FIROpenACCSupport
   FIROpenMPSupport
   FIRSupport

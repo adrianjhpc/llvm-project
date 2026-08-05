@@ -1,6 +1,6 @@
-#include "flang/Optimizer/Dialect/FNGPU/FNGPUDialect.h"
-#include "flang/Optimizer/Dialect/FNGPU/FNGPUKernelAnalysis.h"
-#include "flang/Optimizer/Dialect/FNGPU/FNGPUPasses.h"
+#include "flang/Optimizer/Dialect/FNACC/FNACCDialect.h"
+#include "flang/Optimizer/Dialect/FNACC/FNACCKernelAnalysis.h"
+#include "flang/Optimizer/Dialect/FNACC/FNACCPasses.h"
 
 #include "flang/Optimizer/Dialect/FIRDialect.h"
 #include "flang/Optimizer/Dialect/FIROps.h"
@@ -13,16 +13,16 @@
 
 #include "llvm/ADT/APFloat.h"
 
-namespace fir::fngpu {
-#define GEN_PASS_DEF_FNGPULOWERTORUNTIME
-#include "flang/Optimizer/Dialect/FNGPU/FNGPUPasses.h.inc"
-} // namespace fir::fngpu
+namespace fir::fnacc {
+#define GEN_PASS_DEF_FNACCLOWERTORUNTIME
+#include "flang/Optimizer/Dialect/FNACC/FNACCPasses.h.inc"
+} // namespace fir::fnacc
 
 using namespace mlir;
 
 namespace {
 
-static constexpr llvm::StringLiteral kKernelIdAttrName = "fngpu.kernel_id";
+static constexpr llvm::StringLiteral kKernelIdAttrName = "fnacc.kernel_id";
 
 struct BlockShape {
   int32_t rank = 1;
@@ -31,7 +31,7 @@ struct BlockShape {
   int32_t z = 1;
 };
 
-static BlockShape getBlockShape(fir::fngpu::LaunchOp launchOp) {
+static BlockShape getBlockShape(fir::fnacc::LaunchOp launchOp) {
   BlockShape shape;
 
   llvm::ArrayRef<int64_t> tiles = launchOp.getTileSizes();
@@ -56,11 +56,11 @@ static BlockShape getBlockShape(fir::fngpu::LaunchOp launchOp) {
   return shape;
 }
 
-static int32_t getKernelId(fir::fngpu::LaunchOp launchOp, int32_t fallbackId) {
+static int32_t getKernelId(fir::fnacc::LaunchOp launchOp, int32_t fallbackId) {
   if (auto attr = launchOp->getAttrOfType<IntegerAttr>(kKernelIdAttrName))
     return static_cast<int32_t>(attr.getInt());
 
-  launchOp.emitWarning("fngpu.launch has no fngpu.kernel_id attribute; using "
+  launchOp.emitWarning("fnacc.launch has no fnacc.kernel_id attribute; using "
                        "walk-order fallback");
 
   return fallbackId;
@@ -73,7 +73,7 @@ static func::FuncOp getOrCreateRuntimeDecl(ModuleOp module, OpBuilder &builder,
 
   if (auto existing = module.lookupSymbol<func::FuncOp>(name)) {
     if (existing.getFunctionType() != fnType) {
-      existing.emitError("existing FNGPU runtime declaration has incompatible "
+      existing.emitError("existing FNACC runtime declaration has incompatible "
                          "function type for symbol ")
           << name << ". Existing type is " << existing.getFunctionType()
           << ", requested type is " << fnType;
@@ -116,96 +116,96 @@ static void createVoidRuntimeCall(ModuleOp module, OpBuilder &builder,
                        operands);
 }
 
-static void lowerFNGPUDataOpsToRuntime(ModuleOp module, OpBuilder &builder) {
-  llvm::SmallVector<fir::fngpu::UpdateHostOp> updateHostOps;
-  llvm::SmallVector<fir::fngpu::UpdateDeviceOp> updateDeviceOps;
-  llvm::SmallVector<fir::fngpu::ReleaseOp> releaseOps;
-  llvm::SmallVector<fir::fngpu::ReleaseAllOp> releaseAllOps;
+static void lowerFNACCDataOpsToRuntime(ModuleOp module, OpBuilder &builder) {
+  llvm::SmallVector<fir::fnacc::UpdateHostOp> updateHostOps;
+  llvm::SmallVector<fir::fnacc::UpdateDeviceOp> updateDeviceOps;
+  llvm::SmallVector<fir::fnacc::ReleaseOp> releaseOps;
+  llvm::SmallVector<fir::fnacc::ReleaseAllOp> releaseAllOps;
 
   module.walk(
-      [&](fir::fngpu::UpdateHostOp op) { updateHostOps.push_back(op); });
+      [&](fir::fnacc::UpdateHostOp op) { updateHostOps.push_back(op); });
 
   module.walk(
-      [&](fir::fngpu::UpdateDeviceOp op) { updateDeviceOps.push_back(op); });
+      [&](fir::fnacc::UpdateDeviceOp op) { updateDeviceOps.push_back(op); });
 
-  module.walk([&](fir::fngpu::ReleaseOp op) { releaseOps.push_back(op); });
+  module.walk([&](fir::fnacc::ReleaseOp op) { releaseOps.push_back(op); });
 
   module.walk(
-      [&](fir::fngpu::ReleaseAllOp op) { releaseAllOps.push_back(op); });
+      [&](fir::fnacc::ReleaseAllOp op) { releaseAllOps.push_back(op); });
 
-  for (fir::fngpu::UpdateHostOp op : updateHostOps) {
+  for (fir::fnacc::UpdateHostOp op : updateHostOps) {
     Location loc = op.getLoc();
     builder.setInsertionPoint(op);
 
     Value ptr = convertToOpaqueRuntimePtr(builder, loc, op.getVar());
 
-    createVoidRuntimeCall(module, builder, loc, "__fngpu_update_host",
+    createVoidRuntimeCall(module, builder, loc, "__fnacc_update_host",
                           ValueRange{ptr});
 
     op.erase();
   }
 
-  for (fir::fngpu::UpdateDeviceOp op : updateDeviceOps) {
+  for (fir::fnacc::UpdateDeviceOp op : updateDeviceOps) {
     Location loc = op.getLoc();
     builder.setInsertionPoint(op);
 
     Value ptr = convertToOpaqueRuntimePtr(builder, loc, op.getVar());
 
-    createVoidRuntimeCall(module, builder, loc, "__fngpu_update_device",
+    createVoidRuntimeCall(module, builder, loc, "__fnacc_update_device",
                           ValueRange{ptr});
 
     op.erase();
   }
 
-  for (fir::fngpu::ReleaseOp op : releaseOps) {
+  for (fir::fnacc::ReleaseOp op : releaseOps) {
     Location loc = op.getLoc();
     builder.setInsertionPoint(op);
 
     for (Value var : op.getVars()) {
       Value ptr = convertToOpaqueRuntimePtr(builder, loc, var);
 
-      createVoidRuntimeCall(module, builder, loc, "__fngpu_release",
+      createVoidRuntimeCall(module, builder, loc, "__fnacc_release",
                             ValueRange{ptr});
     }
 
     op.erase();
   }
 
-  for (fir::fngpu::ReleaseAllOp op : releaseAllOps) {
+  for (fir::fnacc::ReleaseAllOp op : releaseAllOps) {
     Location loc = op.getLoc();
     builder.setInsertionPoint(op);
 
-    createVoidRuntimeCall(module, builder, loc, "__fngpu_release_all",
+    createVoidRuntimeCall(module, builder, loc, "__fnacc_release_all",
                           ValueRange{});
 
     op.erase();
   }
 }
 
-struct FNGPULowerToRuntimePass
-    : public fir::fngpu::impl::FNGPULowerToRuntimeBase<
-          FNGPULowerToRuntimePass> {
+struct FNACCLowerToRuntimePass
+    : public fir::fnacc::impl::FNACCLowerToRuntimeBase<
+          FNACCLowerToRuntimePass> {
   void runOnOperation() override {
     ModuleOp module = getOperation();
     OpBuilder builder(module.getContext());
 
-    llvm::SmallVector<fir::fngpu::LaunchOp> launches;
+    llvm::SmallVector<fir::fnacc::LaunchOp> launches;
     module.walk(
-        [&](fir::fngpu::LaunchOp launchOp) { launches.push_back(launchOp); });
+        [&](fir::fnacc::LaunchOp launchOp) { launches.push_back(launchOp); });
 
     int32_t fallbackKernelId = 0;
 
-    for (fir::fngpu::LaunchOp launchOp : launches) {
-      auto result = fir::fngpu::recognizeElementwiseKernel(launchOp);
+    for (fir::fnacc::LaunchOp launchOp : launches) {
+      auto result = fir::fnacc::recognizeElementwiseKernel(launchOp);
 
       if (result.failed()) {
-        launchOp.emitWarning("FNGPU runtime lowering skipped launch: ")
+        launchOp.emitWarning("FNACC runtime lowering skipped launch: ")
             << result.getFailure().reason;
         ++fallbackKernelId;
         continue;
       }
 
-      const fir::fngpu::ElementwiseKernel &k = result.getKernel();
+      const fir::fnacc::ElementwiseKernel &k = result.getKernel();
 
       Location loc = launchOp.getLoc();
       BlockShape blockShape = getBlockShape(launchOp);
@@ -247,7 +247,7 @@ struct FNGPULowerToRuntimePass
       //   !fir.ref<!fir.array<?x?xf32>>
       //
       // Convert all arrays to !fir.ref<f32> before the call.
-      StringRef runtimeName = "__fngpu_launch_f32_v1";
+      StringRef runtimeName = "__fnacc_launch_f32_v1";
 
       FloatType f32Ty = builder.getF32Type();
       Type f32RefTy = fir::ReferenceType::get(f32Ty);
@@ -272,14 +272,14 @@ struct FNGPULowerToRuntimePass
 
       if (k.readArrays.size() > 3) {
         launchOp.emitError(
-            "FNGPU generic runtime supports at most three read arrays");
+            "FNACC generic runtime supports at most three read arrays");
         signalPassFailure();
         return;
       }
 
       if (scalarCount > 3) {
         launchOp.emitError(
-            "FNGPU generic runtime supports at most three f32 scalars");
+            "FNACC generic runtime supports at most three f32 scalars");
         signalPassFailure();
         return;
       }
@@ -355,12 +355,12 @@ struct FNGPULowerToRuntimePass
 
       ++fallbackKernelId;
     }
-    lowerFNGPUDataOpsToRuntime(module, builder);
+    lowerFNACCDataOpsToRuntime(module, builder);
   }
 };
 
 } // namespace
 
-std::unique_ptr<mlir::Pass> fir::fngpu::createFNGPULowerToRuntimePass() {
-  return std::make_unique<FNGPULowerToRuntimePass>();
+std::unique_ptr<mlir::Pass> fir::fnacc::createFNACCLowerToRuntimePass() {
+  return std::make_unique<FNACCLowerToRuntimePass>();
 }

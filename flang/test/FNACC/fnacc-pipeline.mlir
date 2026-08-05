@@ -1,5 +1,5 @@
 // RUN: fir-opt \
-// RUN:   --fngpu-pipeline="ttir-output=%t.ttir json-output=%t.json" \
+// RUN:   --fnacc-pipeline="ttir-output=%t.ttir json-output=%t.json" \
 // RUN:   %s -o %t.host.mlir
 // RUN: FileCheck %s --check-prefix=HOST --input-file=%t.host.mlir
 // RUN: FileCheck %s --check-prefix=TTIR --input-file=%t.ttir
@@ -18,7 +18,7 @@ module {
     %nidx = fir.convert %n : (i32) -> index
     %shape = fir.shape %nidx : (index) -> !fir.shape<1>
 
-    fngpu.launch tile_sizes = [128] {
+    fnacc.launch tile_sizes = [128] {
       fir.do_loop %iv = %c1_i32 to %n step %c1_i32 : i32 {
         fir.store %iv to %i : !fir.ref<i32>
 
@@ -47,15 +47,15 @@ module {
   }
 }
 
-// HOST: func.func private @__fngpu_launch_f32_v1
-// HOST: call @__fngpu_launch_f32_v1
-// HOST-NOT: fngpu.launch
+// HOST: func.func private @__fnacc_launch_f32_v1
+// HOST: call @__fnacc_launch_f32_v1
+// HOST-NOT: fnacc.launch
 
-// TTIR: tt.func @fngpu_kernel_0
+// TTIR: tt.func @fnacc_kernel_0
 // TTIR: arith.addf
 
 // JSON: "id": 0
-// JSON: "name": "fngpu_kernel_0"
+// JSON: "name": "fnacc_kernel_0"
 // JSON: "rank": 1
 // JSON: "tile": [128, 1, 1]
 

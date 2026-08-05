@@ -5,13 +5,13 @@ subroutine pack_directive(n, a, b, c)
   real :: a(n), b(n), c(n)
   integer :: i
 
-  !$fngpu parallel tile(128) pack(a:device, c:device)
+  !$fnacc parallel tile(128) pack(a:device, c:device)
   do i = 1, n
     c(i) = a(i) + b(i)
   end do
 end subroutine
 
-! CHECK: fngpu.launch
+! CHECK: fnacc.launch
 ! CHECK-SAME: tile_sizes = [128]
 ! CHECK: pack(
 ! CHECK: pack_targets = array<i32: 1, 1>
