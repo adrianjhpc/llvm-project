@@ -1228,9 +1228,6 @@ private:
           [&](const parser::FnGPUConstruct &) {
             eval.constructExit = &eval.evaluationList->back();
           },
-          [&](const parser::FnGPUStandaloneConstruct &) {
-            eval.constructExit = &eval.evaluationList->back();
-          },
           // Default - Common analysis for IO statements; otherwise nop.
           [&](const auto &stmt) {
             using A = std::decay_t<decltype(stmt)>;

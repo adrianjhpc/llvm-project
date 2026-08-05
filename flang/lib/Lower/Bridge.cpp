@@ -3709,6 +3709,7 @@ private:
   }
 
   void genFIR(const Fortran::parser::FnGPUStandaloneConstruct &fngpu) {
+    setCurrentPositionAt(fngpu);
     mlir::Location loc = toLocation();
 
     auto getValueForName =
@@ -3732,8 +3733,8 @@ private:
     Fortran::common::visit(
         Fortran::common::visitors{
             [&](const Fortran::parser::FnGPUUpdateHostDirective &dir) {
-              const auto &names{
-                  std::get<std::list<Fortran::parser::Name>>(dir.t)};
+              const auto &names{std::get<0>(dir.t)};
+                  
 
               for (const Fortran::parser::Name &name : names) {
                 mlir::Value value = getValueForName(name);
@@ -3745,8 +3746,7 @@ private:
             },
 
             [&](const Fortran::parser::FnGPUUpdateDeviceDirective &dir) {
-              const auto &names{
-                  std::get<std::list<Fortran::parser::Name>>(dir.t)};
+              const auto &names{std::get<0>(dir.t)};
 
               for (const Fortran::parser::Name &name : names) {
                 mlir::Value value = getValueForName(name);
@@ -3758,8 +3758,7 @@ private:
             },
 
             [&](const Fortran::parser::FnGPUReleaseDirective &dir) {
-              const auto &names{
-                  std::get<std::list<Fortran::parser::Name>>(dir.t)};
+              const auto &names{std::get<0>(dir.t)};
 
               llvm::SmallVector<mlir::Value> values;
               for (const Fortran::parser::Name &name : names) {

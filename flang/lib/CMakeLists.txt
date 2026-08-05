@@ -7,10 +7,13 @@ add_subdirectory(Support)
 add_subdirectory(Frontend)
 add_subdirectory(FrontendTool)
 add_subdirectory(Utils)
-add_subdirectory(Runtime)
 
 add_subdirectory(Optimizer)
 
 if (FLANG_INCLUDE_TESTS)
   add_subdirectory(Testing)
 endif ()
+
+if (FLANG_FNGPU)
+  add_subdirectory(Runtime)
+endif()

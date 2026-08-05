@@ -528,6 +528,8 @@ if (FLANG_INCLUDE_DOCS)
   add_subdirectory(docs)
 endif()
 
+option(FLANG_FNGPU "Build FNGPU functionality" OFF)
+
 # Custom target to install Flang libraries.
 add_custom_target(flang-libraries)
 set_target_properties(flang-libraries PROPERTIES FOLDER "Flang/Meta")

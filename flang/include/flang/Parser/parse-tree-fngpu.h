@@ -4,6 +4,8 @@
 #include <tuple>
 #include <variant>
 
+ENUM_CLASS(FnGPUPackTarget, Host, Device);
+
 struct FnGPUPackClause {
   struct Item {
     TUPLE_CLASS_BOILERPLATE(Item);

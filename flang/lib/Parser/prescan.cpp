@@ -29,12 +29,7 @@ Prescanner::Prescanner(Messages &messages, CookedSource &cooked,
     : messages_{messages}, cooked_{cooked}, preprocessor_{preprocessor},
       allSources_{preprocessor_.allSources()}, features_{lfc},
       backslashFreeFormContinuation_{preprocessor.AnyDefinitions()},
-      encoding_{allSources_.encoding()} {
-  AddCompilerDirectiveSentinel("$fngpu");
-  // Register our custom GPU directive
-  AddCompilerDirectiveSentinel("");
-
-}
+      encoding_{allSources_.encoding()} {}
 
 Prescanner::Prescanner(const Prescanner &that, Preprocessor &prepro,
     bool isNestedInIncludeDirective)

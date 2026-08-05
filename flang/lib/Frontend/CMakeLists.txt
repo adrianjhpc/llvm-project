@@ -48,7 +48,6 @@ add_flang_library(flangFrontend
   HLFIRDialect
   HLFIRTransforms
   flangPasses
-  FIRFNGPUDialect
   FIROpenACCSupport
   FIROpenMPSupport
   FlangOpenMPTransforms

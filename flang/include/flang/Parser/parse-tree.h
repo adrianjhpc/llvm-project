@@ -28,7 +28,6 @@
 #include "flang/Common/reference.h"
 #include "flang/Support/Fortran.h"
 #include "llvm/ADT/ArrayRef.h"
-#include "llvm/Frontend/FnGPU/FnGPU.h"
 #include "llvm/Frontend/OpenACC/ACC.h.inc"
 #include "llvm/Frontend/OpenMP/OMP.h"
 #include "llvm/Frontend/OpenMP/OMPConstants.h"

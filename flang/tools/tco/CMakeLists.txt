@@ -20,7 +20,6 @@ target_link_libraries(tco PRIVATE
   HLFIRDialect
   HLFIRTransforms
   flangPasses
-  FIRFNGPUDialect
   FIROpenACCSupport
   FIROpenMPSupport
   FlangOpenMPTransforms
