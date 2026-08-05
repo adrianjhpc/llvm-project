@@ -576,6 +576,14 @@ static void emitJsonDescriptor(fir::fngpu::LaunchOp launchOp,
 
 struct FNGPULowerToTritonPass
     : public fir::fngpu::impl::FNGPULowerToTritonBase<FNGPULowerToTritonPass> {
+  FNGPULowerToTritonPass() = default;
+
+  FNGPULowerToTritonPass(llvm::StringRef ttirOutput,
+                         llvm::StringRef jsonOutput) {
+    this->ttirOutput = ttirOutput.str();
+    this->jsonOutput = jsonOutput.str();
+  }
+
   void runOnOperation() override {
     ModuleOp module = getOperation();
 
@@ -669,4 +677,10 @@ struct FNGPULowerToTritonPass
 
 std::unique_ptr<mlir::Pass> fir::fngpu::createFNGPULowerToTritonPass() {
   return std::make_unique<FNGPULowerToTritonPass>();
+}
+
+std::unique_ptr<mlir::Pass>
+fir::fngpu::createFNGPULowerToTritonPass(llvm::StringRef ttirOutput,
+                                         llvm::StringRef jsonOutput) {
+  return std::make_unique<FNGPULowerToTritonPass>(ttirOutput, jsonOutput);
 }

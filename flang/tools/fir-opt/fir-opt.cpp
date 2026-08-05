@@ -13,10 +13,10 @@
 
 #include "mlir/Tools/mlir-opt/MlirOptMain.h"
 #include "flang/Optimizer/CodeGen/CodeGen.h"
+#include "flang/Optimizer/Dialect/FNGPU/FNGPUPasses.h"
 #include "flang/Optimizer/HLFIR/Passes.h"
 #include "flang/Optimizer/OpenACC/Passes.h"
 #include "flang/Optimizer/OpenMP/Passes.h"
-#include "flang/Optimizer/Dialect/FNGPU/FNGPUPasses.h"
 #include "flang/Optimizer/Passes/Pipelines.h"
 #include "flang/Optimizer/Support/InitFIR.h"
 #include "flang/Optimizer/Transforms/Passes.h"
@@ -45,6 +45,7 @@ int main(int argc, char **argv) {
   fir::fngpu::registerFNGPULowerToTritonPass();
   fir::fngpu::registerFNGPULowerToRuntimePass();
   fir::fngpu::registerFNGPUAssignKernelIdsPass();
+  fir::fngpu::registerFNGPUPipelines();
 #ifdef FLANG_INCLUDE_TESTS
   fir::test::registerTestFIRAliasAnalysisPass();
   fir::test::registerTestFIROpenACCInterfacesPass();

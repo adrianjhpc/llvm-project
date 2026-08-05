@@ -54,6 +54,7 @@ add_flang_library(FIRFNGPUDialect
   FNGPU/FNGPUEmitFortranAliases.cpp
   FNGPU/FNGPUKernelAnalysis.cpp
   FNGPU/FNGPUOutlineKernels.cpp
+  FNGPU/FNGPUPipelines.cpp
   FNGPU/FNGPULowerToTriton.cpp
   FNGPU/FNGPULowerToRuntime.cpp
 
