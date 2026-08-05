@@ -49,8 +49,8 @@
 #include "flang/Optimizer/Dialect/CUF/CUFOps.h"
 #include "flang/Optimizer/Dialect/FIRAttr.h"
 #include "flang/Optimizer/Dialect/FIROps.h"
-#include "flang/Optimizer/Dialect/Support/FIRContext.h"
 #include "flang/Optimizer/Dialect/FNGPU/FNGPUDialect.h"
+#include "flang/Optimizer/Dialect/Support/FIRContext.h"
 #include "flang/Optimizer/HLFIR/HLFIROps.h"
 #include "flang/Optimizer/Support/DataLayout.h"
 #include "flang/Optimizer/Support/FatalError.h"
@@ -2121,8 +2121,6 @@ private:
     return builder->createFunction(toLocation(), name, ty);
   }
 
-   
-
   /// Lowering of CALL statement
   void genFIR(const Fortran::parser::CallStmt &stmt) {
     Fortran::lower::StatementContext stmtCtx;
@@ -3658,37 +3656,43 @@ private:
     Fortran::lower::pft::Evaluation &eval = getEval();
     mlir::Location loc = toLocation();
 
-    const auto &directive{std::get<Fortran::parser::FnGPUParallelDirective>(fngpu.t)};
-    const auto &clauses{std::get<std::list<Fortran::parser::FnGPUClause>>(directive.t)};
+    const auto &directive{
+        std::get<Fortran::parser::FnGPUParallelDirective>(fngpu.t)};
+    const auto &clauses{
+        std::get<std::list<Fortran::parser::FnGPUClause>>(directive.t)};
 
     llvm::SmallVector<int64_t> tileSizes;
     llvm::SmallVector<mlir::Value> packVars;
     llvm::SmallVector<int32_t> packTargets;
 
     for (const Fortran::parser::FnGPUClause &clause : clauses) {
-      Fortran::common::visit(Fortran::common::visitors{
-        [&](const Fortran::parser::FnGPUTileClause &tileClause) {
-          for (const auto &expr : tileClause.v)
-            if (std::optional<int64_t> val = Fortran::semantics::GetIntValue(expr))
-              tileSizes.push_back(*val);
-        },
-        [&](const Fortran::parser::FnGPUPackClause &packClause) {
-          for (const auto &item : packClause.v) {
-            const auto &name{std::get<Fortran::parser::Name>(item.t)};
-            const auto tgt{std::get<Fortran::parser::FnGPUPackTarget>(item.t)};
-            if (name.symbol) {
-              packVars.push_back(getSymbolAddress(*name.symbol));
-              packTargets.push_back(
-                  tgt == Fortran::parser::FnGPUPackTarget::Device ? 1 : 0);
-            }
-          }
-        },
-        [&](const auto &) {}
-      }, clause.u);
+      Fortran::common::visit(
+          Fortran::common::visitors{
+              [&](const Fortran::parser::FnGPUTileClause &tileClause) {
+                for (const auto &expr : tileClause.v)
+                  if (std::optional<int64_t> val =
+                          Fortran::semantics::GetIntValue(expr))
+                    tileSizes.push_back(*val);
+              },
+              [&](const Fortran::parser::FnGPUPackClause &packClause) {
+                for (const auto &item : packClause.v) {
+                  const auto &name{std::get<Fortran::parser::Name>(item.t)};
+                  const auto tgt{
+                      std::get<Fortran::parser::FnGPUPackTarget>(item.t)};
+                  if (name.symbol) {
+                    packVars.push_back(getSymbolAddress(*name.symbol));
+                    packTargets.push_back(
+                        tgt == Fortran::parser::FnGPUPackTarget::Device ? 1
+                                                                        : 0);
+                  }
+                }
+              },
+              [&](const auto &) {}},
+          clause.u);
     }
 
-    auto launchOp = fir::fngpu::LaunchOp::create(*builder, loc, tileSizes, packVars, packTargets); 
-
+    auto launchOp = fir::fngpu::LaunchOp::create(*builder, loc, tileSizes,
+                                                 packVars, packTargets);
 
     // 4. New block inside the region
     builder->createBlock(&launchOp.getRegion());
@@ -3703,6 +3707,75 @@ private:
     builder->setInsertionPointAfter(launchOp);
   }
 
+  void genFIR(const Fortran::parser::FnGPUStandaloneConstruct &fngpu) {
+    mlir::Location loc = toLocation();
+
+    auto getValueForName =
+        [&](const Fortran::parser::Name &name) -> mlir::Value {
+      if (!name.symbol) {
+        mlir::emitError(loc)
+            << "FNGPU data directive variable has no resolved symbol";
+        return {};
+      }
+
+      mlir::Value value = getSymbolAddress(*name.symbol);
+      if (!value) {
+        mlir::emitError(loc)
+            << "FNGPU data directive variable has no FIR address";
+        return {};
+      }
+
+      return value;
+    };
+
+    Fortran::common::visit(
+        Fortran::common::visitors{
+            [&](const Fortran::parser::FnGPUUpdateHostDirective &dir) {
+              const auto &names{
+                  std::get<std::list<Fortran::parser::Name>>(dir.t)};
+
+              for (const Fortran::parser::Name &name : names) {
+                mlir::Value value = getValueForName(name);
+                if (!value)
+                  continue;
+
+                fir::fngpu::UpdateHostOp::create(*builder, loc, value);
+              }
+            },
+
+            [&](const Fortran::parser::FnGPUUpdateDeviceDirective &dir) {
+              const auto &names{
+                  std::get<std::list<Fortran::parser::Name>>(dir.t)};
+
+              for (const Fortran::parser::Name &name : names) {
+                mlir::Value value = getValueForName(name);
+                if (!value)
+                  continue;
+
+                fir::fngpu::UpdateDeviceOp::create(*builder, loc, value);
+              }
+            },
+
+            [&](const Fortran::parser::FnGPUReleaseDirective &dir) {
+              const auto &names{
+                  std::get<std::list<Fortran::parser::Name>>(dir.t)};
+
+              llvm::SmallVector<mlir::Value> values;
+              for (const Fortran::parser::Name &name : names) {
+                mlir::Value value = getValueForName(name);
+                if (value)
+                  values.push_back(value);
+              }
+
+              if (!values.empty())
+                fir::fngpu::ReleaseOp::create(*builder, loc, values);
+            },
+
+            [&](const Fortran::parser::FnGPUReleaseAllDirective &) {
+              fir::fngpu::ReleaseAllOp::create(*builder, loc);
+            }},
+        fngpu.u);
+  }
 
   void genFIR(const Fortran::parser::OpenACCConstruct &acc) {
     setCurrentPositionAt(acc);
@@ -6034,28 +6107,28 @@ private:
   // calls does block management, possibly starting a new block, and possibly
   // generating a branch to end a block. So these calls may still be required
   // for that functionality.
-  void genFIR(const Fortran::parser::AssociateStmt &) {}       // nop
-  void genFIR(const Fortran::parser::BlockStmt &) {}           // nop
-  void genFIR(const Fortran::parser::CaseStmt &) {}            // nop
-  void genFIR(const Fortran::parser::ContinueStmt &) {}        // nop
-  void genFIR(const Fortran::parser::ElseIfStmt &) {}          // nop
-  void genFIR(const Fortran::parser::ElseStmt &) {}            // nop
-  void genFIR(const Fortran::parser::EndAssociateStmt &) {}    // nop
-  void genFIR(const Fortran::parser::EndBlockStmt &) {}        // nop
-  void genFIR(const Fortran::parser::EndDoStmt &) {}           // nop
-  void genFIR(const Fortran::parser::EndFunctionStmt &) {}     // nop
-  void genFIR(const Fortran::parser::EndIfStmt &) {}           // nop
-  void genFIR(const Fortran::parser::EndMpSubprogramStmt &) {} // nop
-  void genFIR(const Fortran::parser::EndProgramStmt &) {}      // nop
-  void genFIR(const Fortran::parser::EndSelectStmt &) {}       // nop
-  void genFIR(const Fortran::parser::EndSubroutineStmt &) {}   // nop
-  void genFIR(const Fortran::parser::EntryStmt &) {}           // nop
-  void genFIR(const Fortran::parser::IfStmt &) {}              // nop
-  void genFIR(const Fortran::parser::IfThenStmt &) {}          // nop
-  void genFIR(const Fortran::parser::NonLabelDoStmt &) {}      // nop
-  void genFIR(const Fortran::parser::SelectTypeStmt &) {}      // nop
-  void genFIR(const Fortran::parser::TypeGuardStmt &) {}       // nop
-  void genFIR(const Fortran::parser::ChangeTeamStmt &stmt) {}  // nop
+  void genFIR(const Fortran::parser::AssociateStmt &) {}         // nop
+  void genFIR(const Fortran::parser::BlockStmt &) {}             // nop
+  void genFIR(const Fortran::parser::CaseStmt &) {}              // nop
+  void genFIR(const Fortran::parser::ContinueStmt &) {}          // nop
+  void genFIR(const Fortran::parser::ElseIfStmt &) {}            // nop
+  void genFIR(const Fortran::parser::ElseStmt &) {}              // nop
+  void genFIR(const Fortran::parser::EndAssociateStmt &) {}      // nop
+  void genFIR(const Fortran::parser::EndBlockStmt &) {}          // nop
+  void genFIR(const Fortran::parser::EndDoStmt &) {}             // nop
+  void genFIR(const Fortran::parser::EndFunctionStmt &) {}       // nop
+  void genFIR(const Fortran::parser::EndIfStmt &) {}             // nop
+  void genFIR(const Fortran::parser::EndMpSubprogramStmt &) {}   // nop
+  void genFIR(const Fortran::parser::EndProgramStmt &) {}        // nop
+  void genFIR(const Fortran::parser::EndSelectStmt &) {}         // nop
+  void genFIR(const Fortran::parser::EndSubroutineStmt &) {}     // nop
+  void genFIR(const Fortran::parser::EntryStmt &) {}             // nop
+  void genFIR(const Fortran::parser::IfStmt &) {}                // nop
+  void genFIR(const Fortran::parser::IfThenStmt &) {}            // nop
+  void genFIR(const Fortran::parser::NonLabelDoStmt &) {}        // nop
+  void genFIR(const Fortran::parser::SelectTypeStmt &) {}        // nop
+  void genFIR(const Fortran::parser::TypeGuardStmt &) {}         // nop
+  void genFIR(const Fortran::parser::ChangeTeamStmt &stmt) {}    // nop
   void genFIR(const Fortran::parser::EndChangeTeamStmt &stmt) {} // nop
 
   /// Generate FIR for Evaluation \p eval.

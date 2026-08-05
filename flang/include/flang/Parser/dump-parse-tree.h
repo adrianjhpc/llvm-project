@@ -363,7 +363,7 @@ public:
   NODE(parser, ExplicitShapeSpec)
   NODE(parser, ExplicitShapeBoundsSpec)
   NODE(parser, Expr)
-// --- FnGPU AST Nodes ---
+  // --- FnGPU AST Nodes ---
   NODE(parser, FnGPUConstruct)
   NODE(parser, FnGPUParallelDirective)
   NODE(parser, FnGPUClause)
@@ -371,6 +371,11 @@ public:
   NODE(parser, FnGPUPackClause)
   NODE(FnGPUPackClause, Item)
   NODE_NAME(FnGPUPackTarget, "FnGPUPackTarget")
+  NODE(parser, FnGPUStandaloneConstruct)
+  NODE(parser, FnGPUUpdateHostDirective)
+  NODE(parser, FnGPUUpdateDeviceDirective)
+  NODE(parser, FnGPUReleaseDirective)
+  NODE(parser, FnGPUReleaseAllDirective)
   NODE(Expr, Parentheses)
   NODE(Expr, UnaryPlus)
   NODE(Expr, Negate)

@@ -1,5 +1,5 @@
-#include "flang/Optimizer/Dialect/FNGPU/FNGPUPasses.h"
 #include "flang/Optimizer/Dialect/FNGPU/FNGPUDialect.h"
+#include "flang/Optimizer/Dialect/FNGPU/FNGPUPasses.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/IRMapping.h"
@@ -13,9 +13,10 @@ namespace fir::fngpu {
 using namespace mlir;
 
 namespace {
-struct FNGPUOutlineKernelsPass 
-    : public fir::fngpu::impl::FNGPUOutlineKernelsBase<FNGPUOutlineKernelsPass> {
-  
+struct FNGPUOutlineKernelsPass
+    : public fir::fngpu::impl::FNGPUOutlineKernelsBase<
+          FNGPUOutlineKernelsPass> {
+
   void runOnOperation() override {
     ModuleOp module = getOperation();
     SymbolTable symbolTable(module);
@@ -30,10 +31,10 @@ struct FNGPUOutlineKernelsPass
   }
 
 private:
-  void outlineKernel(fir::fngpu::LaunchOp launchOp, OpBuilder &builder, 
+  void outlineKernel(fir::fngpu::LaunchOp launchOp, OpBuilder &builder,
                      SymbolTable &symbolTable, int kernelId) {
     Location loc = launchOp.getLoc();
-    
+
     // 1. Variable Capturing
     llvm::SetVector<Value> captures;
     getUsedValuesDefinedAbove(launchOp.getRegion(), captures);
@@ -46,13 +47,15 @@ private:
     }
 
     // 2. Create the Kernel Function
-    builder.setInsertionPointToEnd(launchOp->getParentOfType<ModuleOp>().getBody());
-    
+    builder.setInsertionPointToEnd(
+        launchOp->getParentOfType<ModuleOp>().getBody());
+
     FunctionType funcType = builder.getFunctionType(argTypes, TypeRange{});
     std::string kernelName = "fngpu_kernel_" + std::to_string(kernelId);
-    
+
     // Create function using StringRef to avoid deprecation warning
-    auto kernelFunc = builder.create<func::FuncOp>(loc, StringRef(kernelName), funcType);
+    auto kernelFunc =
+        builder.create<func::FuncOp>(loc, StringRef(kernelName), funcType);
     kernelFunc.setPrivate();
     symbolTable.insert(kernelFunc);
 
@@ -65,8 +68,9 @@ private:
     for (Value capture : captures) {
       // Add an argument to the kernel entry block for each captured variable
       BlockArgument arg = entryBlock.addArgument(capture.getType(), loc);
-      
-      // Replace all uses of the captured value *inside* the kernel with the block argument
+
+      // Replace all uses of the captured value *inside* the kernel with the
+      // block argument
       capture.replaceUsesWithIf(arg, [&](OpOperand &operand) {
         return kernelRegion.isAncestor(operand.getOwner()->getParentRegion());
       });

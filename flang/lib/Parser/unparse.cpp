@@ -2819,16 +2819,71 @@ public:
     EndOpenMP();
   }
 
- // Adding in FnGPU unparse functionality
+  void Unparse(const FnGPUConstruct &x) { Walk(x.t); }
+  void Unparse(const FnGPUParallelDirective &x) {
+    Word("!$FNGPU PARALLEL");
 
-  void Unparse(const FnGPUConstruct &x) { /* Walk the tuple members */ }
-  void Unparse(const FnGPUParallelDirective &x);
-  void Unparse(const FnGPUClause &x);      // WalkUnion
-  void Unparse(const FnGPUTileClause &x);
-  void Unparse(const FnGPUPackClause &x);
-  void Unparse(const FnGPUPackClause::Item &x);
-  // and the FnGPUPackTarget enum
+    const auto &clauses{std::get<0>(x.t)};
+    if (!clauses.empty()) {
+      Put(" ");
+      Walk(clauses, " ");
+    }
 
+    Put("\n");
+  }
+  void Unparse(const FnGPUPackTarget &x) {
+    switch (x) {
+    case FnGPUPackTarget::Host:
+      Word("HOST");
+      break;
+    case FnGPUPackTarget::Device:
+      Word("DEVICE");
+      break;
+    }
+  }
+  void Unparse(const FnGPUClause &x) { Walk(x.u); }
+  void Unparse(const FnGPUTileClause &x) {
+    Word("TILE");
+    Put("(");
+    Walk(x.v, ", ");
+    Put(")");
+  }
+  void Unparse(const FnGPUPackClause &x) {
+    Word("PACK");
+    Put("(");
+    Walk(x.v, ", ");
+    Put(")");
+  }
+  void Unparse(const FnGPUPackClause::Item &x) {
+    Walk(std::get<0>(x.t));
+    Put(":");
+    Walk(std::get<1>(x.t));
+  }
+  void Unparse(const FnGPUUpdateHostDirective &x) {
+    Word("UPDATE HOST");
+    Put("(");
+    Walk(std::get<0>(x.t), ", ");
+    Put(")");
+  }
+  void Unparse(const FnGPUUpdateDeviceDirective &x) {
+    Word("UPDATE DEVICE");
+    Put("(");
+    Walk(std::get<0>(x.t), ", ");
+    Put(")");
+  }
+  void Unparse(const FnGPUReleaseDirective &x) {
+    Word("RELEASE");
+    Put("(");
+    Walk(std::get<0>(x.t), ", ");
+    Put(")");
+  }
+  void Unparse(const FnGPUReleaseAllDirective &) { Word("RELEASE ALL"); }
+  void Unparse(const FnGPUStandaloneConstruct &x) {
+    Word("!$FNGPU");
+    Put(" ");
+    Walk(x.u);
+    Put("\n");
+  }
 
   void Unparse(const BasedPointer &x) {
     Put('('), Walk(std::get<0>(x.t)), Put(","), Walk(std::get<1>(x.t));

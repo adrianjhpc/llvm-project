@@ -141,9 +141,8 @@ using Directives =
     std::tuple<parser::CompilerDirective, parser::OpenACCConstruct,
                parser::OpenACCRoutineConstruct,
                parser::OpenACCDeclarativeConstruct, parser::OpenMPConstruct,
-               parser::OpenMPDeclarativeConstruct,
-               parser::CUFKernelDoConstruct,
-               parser::FnGPUConstruct>;
+               parser::OpenMPDeclarativeConstruct, parser::CUFKernelDoConstruct,
+               parser::FnGPUConstruct, parser::FnGPUStandaloneConstruct>;
 
 using DeclConstructs = std::tuple<parser::OpenMPDeclarativeConstruct,
                                   parser::OpenACCDeclarativeConstruct>;
@@ -373,8 +372,8 @@ struct Evaluation : EvaluationVariant {
   // arithmetic IF). Empty for single-target branches; the first target is in
   // controlSuccessor and the remaining ones are stored here in source order.
   llvm::SmallVector<Evaluation *, 0> extraControlSuccessors;
-  Evaluation *constructExit{nullptr};    // set for constructs
-  bool isNewBlock{false};                // evaluation begins a new basic block
+  Evaluation *constructExit{nullptr}; // set for constructs
+  bool isNewBlock{false};             // evaluation begins a new basic block
   bool isUnstructured{false};  // evaluation has unstructured control flow
   bool negateCondition{false}; // If[Then]Stmt condition must be negated
   bool activeConstruct{false}; // temporarily set for some constructs

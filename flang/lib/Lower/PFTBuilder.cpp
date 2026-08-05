@@ -1225,7 +1225,10 @@ private:
             eval.isUnstructured = true;
           },
           [&](const parser::WhereConstruct &) { setConstructExit(eval); },
-          [&](const parser::FnGPUConstruct &) { 
+          [&](const parser::FnGPUConstruct &) {
+            eval.constructExit = &eval.evaluationList->back();
+          },
+          [&](const parser::FnGPUStandaloneConstruct &) {
             eval.constructExit = &eval.evaluationList->back();
           },
           // Default - Common analysis for IO statements; otherwise nop.
@@ -1393,10 +1396,24 @@ public:
   llvm::StringRef evaluationName(const lower::pft::Evaluation &eval) {
     return eval.visit([](const auto &parseTreeNode) -> llvm::StringRef {
       using NodeTy = std::decay_t<decltype(parseTreeNode)>;
-      
-      // Intercept our custom AST node so the dumper doesn't crash
+
       if constexpr (std::is_same_v<NodeTy, Fortran::parser::FnGPUConstruct>) {
         return "FnGPUConstruct";
+      } else if constexpr (std::is_same_v<
+                               NodeTy,
+                               Fortran::parser::FnGPUStandaloneConstruct>) {
+        return "FnGPUStandaloneConstruct";
+      } else if constexpr (std::is_same_v<
+                               NodeTy,
+                               Fortran::common::Indirection<
+                                   Fortran::parser::FnGPUConstruct, false>>) {
+        return "FnGPUConstruct";
+      } else if constexpr (std::is_same_v<
+                               NodeTy,
+                               Fortran::common::Indirection<
+                                   Fortran::parser::FnGPUStandaloneConstruct,
+                                   false>>) {
+        return "FnGPUStandaloneConstruct";
       } else {
         return parser::ParseTreeDumper::GetNodeName(parseTreeNode);
       }

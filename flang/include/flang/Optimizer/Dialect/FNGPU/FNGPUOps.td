@@ -35,5 +35,29 @@ def FNGPU_LaunchOp : FNGPU_Op<"launch", [RecursiveMemoryEffects]> {
   let hasVerifier = 1;
 }
 
+def FNGPU_UpdateHostOp : FNGPU_Op<"update_host", []> {
+  let arguments = (ins AnyType:$var);
+  let assemblyFormat = "$var attr-dict `:` type($var)";
+}
+
+def FNGPU_UpdateDeviceOp : FNGPU_Op<"update_device", []> {
+  let arguments = (ins AnyType:$var);
+  let assemblyFormat = "$var attr-dict `:` type($var)";
+}
+
+def FNGPU_ReleaseOp : FNGPU_Op<"release", []> {
+  let arguments = (ins Variadic<AnyType>:$vars);
+  let assemblyFormat = "$vars attr-dict `:` type($vars)";
+}
+
+def FNGPU_ReleaseAllOp : FNGPU_Op<"release_all", []> {
+  let summary = "Release all cached FNGPU device allocations";
+  let description = [{
+    Releases every cached device allocation managed by the FNGPU runtime.
+  }];
+
+  let assemblyFormat = "attr-dict";
+}
+
 
 #endif // FORTRAN_OPTIMIZER_DIALECT_FNGPU_OPS

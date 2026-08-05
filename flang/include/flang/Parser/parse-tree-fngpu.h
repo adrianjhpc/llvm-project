@@ -18,7 +18,7 @@ struct FnGPUTileClause {
 
 struct FnGPUClause {
   UNION_CLASS_BOILERPLATE(FnGPUClause);
-  std::variant<FnGPUTileClause, FnGPUPackClause> u; 
+  std::variant<FnGPUTileClause, FnGPUPackClause> u;
 };
 
 struct FnGPUParallelDirective {
@@ -29,7 +29,40 @@ struct FnGPUParallelDirective {
 
 struct FnGPUConstruct {
   TUPLE_CLASS_BOILERPLATE(FnGPUConstruct);
-  std::tuple<FnGPUParallelDirective, DoConstruct> t; 
+  std::tuple<FnGPUParallelDirective, DoConstruct> t;
 };
 
+// FNGPU standalone data-management directives.
+//
+// Source forms:
+//
+//   !$fngpu update host(a, b)
+//   !$fngpu update device(a, b)
+//   !$fngpu release(a, b)
+//   !$fngpu release all
 
+struct FnGPUUpdateHostDirective {
+  TUPLE_CLASS_BOILERPLATE(FnGPUUpdateHostDirective);
+  std::tuple<std::list<Name>> t;
+};
+
+struct FnGPUUpdateDeviceDirective {
+  TUPLE_CLASS_BOILERPLATE(FnGPUUpdateDeviceDirective);
+  std::tuple<std::list<Name>> t;
+};
+
+struct FnGPUReleaseDirective {
+  TUPLE_CLASS_BOILERPLATE(FnGPUReleaseDirective);
+  std::tuple<std::list<Name>> t;
+};
+
+struct FnGPUReleaseAllDirective {
+  WRAPPER_CLASS_BOILERPLATE(FnGPUReleaseAllDirective, bool);
+};
+
+struct FnGPUStandaloneConstruct {
+  UNION_CLASS_BOILERPLATE(FnGPUStandaloneConstruct);
+  std::variant<FnGPUUpdateHostDirective, FnGPUUpdateDeviceDirective,
+      FnGPUReleaseDirective, FnGPUReleaseAllDirective>
+      u;
+};

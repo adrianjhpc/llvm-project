@@ -1,8 +1,8 @@
-#include "flang/Optimizer/Dialect/FNGPU/FNGPUPasses.h"
 #include "flang/Optimizer/Dialect/FNGPU/FNGPUDialect.h"
+#include "flang/Optimizer/Dialect/FNGPU/FNGPUPasses.h"
 
-#include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/Builders.h"
+#include "mlir/IR/BuiltinOps.h"
 
 namespace fir::fngpu {
 #define GEN_PASS_DEF_FNGPUASSIGNKERNELIDS
@@ -51,4 +51,3 @@ struct FNGPUAssignKernelIdsPass
 std::unique_ptr<mlir::Pass> fir::fngpu::createFNGPUAssignKernelIdsPass() {
   return std::make_unique<FNGPUAssignKernelIdsPass>();
 }
-

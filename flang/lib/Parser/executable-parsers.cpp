@@ -54,6 +54,8 @@ constexpr auto executableConstruct{first(
     construct<ExecutableConstruct>(indirect(Parser<OpenACCConstruct>{})),
     construct<ExecutableConstruct>(indirect(compilerDirective)),
     construct<ExecutableConstruct>(indirect(Parser<FnGPUConstruct>{})),
+    construct<ExecutableConstruct>(
+        indirect(Parser<FnGPUStandaloneConstruct>{})),
     construct<ExecutableConstruct>(indirect(Parser<CUFKernelDoConstruct>{})))};
 
 // R510 execution-part-construct ->
