@@ -12,6 +12,9 @@
 #include "mlir/IR/SymbolTable.h"
 
 #include "llvm/ADT/APFloat.h"
+#include "llvm/ADT/SmallVector.h"
+
+#include <optional>
 
 namespace fir::fnacc {
 #define GEN_PASS_DEF_FNACCLOWERTORUNTIME
@@ -96,10 +99,109 @@ static Type getI8RefType(OpBuilder &builder) {
   return fir::ReferenceType::get(builder.getI8Type());
 }
 
+static Value getAddressOfBoxIfNeeded(OpBuilder &builder, Location loc,
+                                     Value value) {
+  if (auto boxTy = dyn_cast<fir::BoxType>(value.getType())) {
+    Type addrTy = fir::ReferenceType::get(boxTy.getEleTy());
+    return fir::BoxAddrOp::create(builder, loc, addrTy, value);
+  }
+
+  return value;
+}
+
 static Value convertToOpaqueRuntimePtr(OpBuilder &builder, Location loc,
                                        Value value) {
+  value = getAddressOfBoxIfNeeded(builder, loc, value);
+
   Type i8RefTy = getI8RefType(builder);
+
+  if (value.getType() == i8RefTy)
+    return value;
+
   return fir::ConvertOp::create(builder, loc, i8RefTy, value);
+}
+
+static Value convertToI64(OpBuilder &builder, Location loc, Value value) {
+  if (value.getType().isInteger(64))
+    return value;
+
+  return fir::ConvertOp::create(builder, loc, builder.getI64Type(), value);
+}
+
+static Value constantI64(OpBuilder &builder, Location loc, int64_t value) {
+  return arith::ConstantIntOp::create(builder, loc, value, 64);
+}
+
+static Value constantI32(OpBuilder &builder, Location loc, int32_t value) {
+  return arith::ConstantIntOp::create(builder, loc, value, 32);
+}
+
+static Value convertToI32(OpBuilder &builder, Location loc, Value value) {
+  if (value.getType().isInteger(32))
+    return value;
+
+  return fir::ConvertOp::create(builder, loc, builder.getI32Type(), value);
+}
+
+static Value
+materializeExtentValue(OpBuilder &builder, Location loc,
+                       const fir::fnacc::ElementwiseExtentSource &source) {
+  using Kind = fir::fnacc::ElementwiseExtentSourceKind;
+
+  switch (source.kind) {
+  case Kind::LoadI32Ref: {
+    Value loaded = fir::LoadOp::create(builder, loc, source.value);
+    return convertToI32(builder, loc, loaded);
+  }
+
+  case Kind::BoxDim: {
+    Value dim = arith::ConstantIndexOp::create(builder, loc, source.dim);
+
+    // fir.box_dims returns lower bound, extent, stride.
+    auto dims = fir::BoxDimsOp::create(builder, loc, source.value, dim);
+
+    Value extent = dims.getExtent();
+    return convertToI32(builder, loc, extent);
+  }
+
+  case Kind::Value:
+    return convertToI32(builder, loc, source.value);
+
+  case Kind::Unknown:
+    llvm_unreachable("unknown FNACC extent source");
+  }
+
+  llvm_unreachable("unhandled FNACC extent source");
+}
+
+static std::optional<int64_t> getElementByteSize(Type elementType) {
+  if (elementType.isF32())
+    return 4;
+
+  if (elementType.isF64())
+    return 8;
+
+  if (auto intTy = dyn_cast<IntegerType>(elementType)) {
+    unsigned width = intTy.getWidth();
+    if (width % 8 == 0)
+      return width / 8;
+  }
+
+  return std::nullopt;
+}
+
+static Value getRuntimeF32Pointer(OpBuilder &builder, Location loc,
+                                  Value arrayLike) {
+  FloatType f32Ty = builder.getF32Type();
+  Type f32RefTy = fir::ReferenceType::get(f32Ty);
+
+  if (auto boxTy = dyn_cast<fir::BoxType>(arrayLike.getType())) {
+    Type addrTy = fir::ReferenceType::get(boxTy.getEleTy());
+    Value baseAddr = fir::BoxAddrOp::create(builder, loc, addrTy, arrayLike);
+    return fir::ConvertOp::create(builder, loc, f32RefTy, baseAddr);
+  }
+
+  return fir::ConvertOp::create(builder, loc, f32RefTy, arrayLike);
 }
 
 static void createVoidRuntimeCall(ModuleOp module, OpBuilder &builder,
@@ -116,6 +218,82 @@ static void createVoidRuntimeCall(ModuleOp module, OpBuilder &builder,
                        operands);
 }
 
+static void createRuntimeCall(ModuleOp module, OpBuilder &builder, Location loc,
+                              StringRef runtimeName, ValueRange operands) {
+  llvm::SmallVector<Type> argTypes;
+  for (Value operand : operands)
+    argTypes.push_back(operand.getType());
+
+  func::FuncOp callee =
+      getOrCreateRuntimeDecl(module, builder, loc, runtimeName, argTypes);
+
+  func::CallOp::create(builder, loc, callee.getSymName(), TypeRange{},
+                       operands);
+}
+
+struct FNACCContiguousArrayDescriptorArgs {
+  llvm::SmallVector<Value, 6> values;
+};
+
+static void
+createDescriptorRuntimeCall(ModuleOp module, OpBuilder &builder, Location loc,
+                            StringRef runtimeName,
+                            const FNACCContiguousArrayDescriptorArgs &desc) {
+  createRuntimeCall(module, builder, loc, runtimeName, desc.values);
+}
+
+static std::optional<FNACCContiguousArrayDescriptorArgs>
+tryCreateContiguousArrayDescriptorArgs(OpBuilder &builder, Location loc,
+                                       Value arrayLike) {
+  auto boxTy = dyn_cast<fir::BoxType>(arrayLike.getType());
+  if (!boxTy)
+    return std::nullopt;
+
+  auto seqTy = dyn_cast<fir::SequenceType>(boxTy.getEleTy());
+  if (!seqTy)
+    return std::nullopt;
+
+  unsigned rank = seqTy.getDimension();
+
+  // This ABI v1 supports rank 1-3.
+  if (rank < 1 || rank > 3)
+    return std::nullopt;
+
+  std::optional<int64_t> elementBytes = getElementByteSize(seqTy.getEleTy());
+  if (!elementBytes)
+    return std::nullopt;
+
+  FNACCContiguousArrayDescriptorArgs desc;
+
+  Value ptr = convertToOpaqueRuntimePtr(builder, loc, arrayLike);
+  Value elementBytesValue = constantI64(builder, loc, *elementBytes);
+  Value rankValue = constantI32(builder, loc, static_cast<int32_t>(rank));
+
+  desc.values.push_back(ptr);
+  desc.values.push_back(elementBytesValue);
+  desc.values.push_back(rankValue);
+
+  for (unsigned dim = 0; dim < rank; ++dim) {
+    Value dimValue = arith::ConstantIndexOp::create(builder, loc, dim);
+
+    auto dims = fir::BoxDimsOp::create(builder, loc, arrayLike, dimValue);
+
+    // fir.box_dims returns:
+    //   result #0 = lower bound
+    //   result #1 = extent
+    //   result #2 = stride
+    Value extent = dims->getResult(1);
+
+    desc.values.push_back(convertToI64(builder, loc, extent));
+  }
+
+  // Pad to three extents.
+  for (unsigned dim = rank; dim < 3; ++dim)
+    desc.values.push_back(constantI64(builder, loc, 1));
+
+  return desc;
+}
+
 static void lowerFNACCDataOpsToRuntime(ModuleOp module, OpBuilder &builder) {
   llvm::SmallVector<fir::fnacc::UpdateHostOp> updateHostOps;
   llvm::SmallVector<fir::fnacc::UpdateDeviceOp> updateDeviceOps;
@@ -124,12 +302,9 @@ static void lowerFNACCDataOpsToRuntime(ModuleOp module, OpBuilder &builder) {
 
   module.walk(
       [&](fir::fnacc::UpdateHostOp op) { updateHostOps.push_back(op); });
-
   module.walk(
       [&](fir::fnacc::UpdateDeviceOp op) { updateDeviceOps.push_back(op); });
-
   module.walk([&](fir::fnacc::ReleaseOp op) { releaseOps.push_back(op); });
-
   module.walk(
       [&](fir::fnacc::ReleaseAllOp op) { releaseAllOps.push_back(op); });
 
@@ -137,10 +312,16 @@ static void lowerFNACCDataOpsToRuntime(ModuleOp module, OpBuilder &builder) {
     Location loc = op.getLoc();
     builder.setInsertionPoint(op);
 
-    Value ptr = convertToOpaqueRuntimePtr(builder, loc, op.getVar());
+    Value var = op.getVar();
 
-    createVoidRuntimeCall(module, builder, loc, "__fnacc_update_host",
-                          ValueRange{ptr});
+    if (auto desc = tryCreateContiguousArrayDescriptorArgs(builder, loc, var)) {
+      createDescriptorRuntimeCall(module, builder, loc,
+                                  "__fnacc_update_host_desc", *desc);
+    } else {
+      Value ptr = convertToOpaqueRuntimePtr(builder, loc, var);
+      createRuntimeCall(module, builder, loc, "__fnacc_update_host",
+                        ValueRange{ptr});
+    }
 
     op.erase();
   }
@@ -149,10 +330,16 @@ static void lowerFNACCDataOpsToRuntime(ModuleOp module, OpBuilder &builder) {
     Location loc = op.getLoc();
     builder.setInsertionPoint(op);
 
-    Value ptr = convertToOpaqueRuntimePtr(builder, loc, op.getVar());
+    Value var = op.getVar();
 
-    createVoidRuntimeCall(module, builder, loc, "__fnacc_update_device",
-                          ValueRange{ptr});
+    if (auto desc = tryCreateContiguousArrayDescriptorArgs(builder, loc, var)) {
+      createDescriptorRuntimeCall(module, builder, loc,
+                                  "__fnacc_update_device_desc", *desc);
+    } else {
+      Value ptr = convertToOpaqueRuntimePtr(builder, loc, var);
+      createRuntimeCall(module, builder, loc, "__fnacc_update_device",
+                        ValueRange{ptr});
+    }
 
     op.erase();
   }
@@ -164,8 +351,13 @@ static void lowerFNACCDataOpsToRuntime(ModuleOp module, OpBuilder &builder) {
     for (Value var : op.getVars()) {
       Value ptr = convertToOpaqueRuntimePtr(builder, loc, var);
 
-      createVoidRuntimeCall(module, builder, loc, "__fnacc_release",
-                            ValueRange{ptr});
+      if (isa<fir::BoxType>(var.getType())) {
+        createRuntimeCall(module, builder, loc, "__fnacc_release_desc",
+                          ValueRange{ptr});
+      } else {
+        createRuntimeCall(module, builder, loc, "__fnacc_release",
+                          ValueRange{ptr});
+      }
     }
 
     op.erase();
@@ -175,8 +367,8 @@ static void lowerFNACCDataOpsToRuntime(ModuleOp module, OpBuilder &builder) {
     Location loc = op.getLoc();
     builder.setInsertionPoint(op);
 
-    createVoidRuntimeCall(module, builder, loc, "__fnacc_release_all",
-                          ValueRange{});
+    createRuntimeCall(module, builder, loc, "__fnacc_release_all",
+                      ValueRange{});
 
     op.erase();
   }
@@ -228,11 +420,11 @@ struct FNACCLowerToRuntimePass
       Value blockZValue =
           arith::ConstantIntOp::create(builder, loc, blockShape.z, 32);
 
-      Value extentXValue = fir::LoadOp::create(builder, loc, k.nRef);
+      Value extentXValue = materializeExtentValue(builder, loc, k.extentX);
 
       Value extentYValue;
       if (k.rank == 2) {
-        extentYValue = fir::LoadOp::create(builder, loc, k.mRef);
+        extentYValue = materializeExtentValue(builder, loc, k.extentY);
       } else {
         extentYValue = arith::ConstantIntOp::create(builder, loc, 1, 32);
       }
@@ -252,21 +444,18 @@ struct FNACCLowerToRuntimePass
       FloatType f32Ty = builder.getF32Type();
       Type f32RefTy = fir::ReferenceType::get(f32Ty);
 
-      Value read0Ptr =
-          fir::ConvertOp::create(builder, loc, f32RefTy, k.readArrays[0]);
+      Value read0Ptr = getRuntimeF32Pointer(builder, loc, k.readArrays[0]);
 
       Value read1Ptr;
       if (k.readArrays.size() >= 2) {
-        read1Ptr =
-            fir::ConvertOp::create(builder, loc, f32RefTy, k.readArrays[1]);
+        read1Ptr = getRuntimeF32Pointer(builder, loc, k.readArrays[1]);
       } else {
         read1Ptr = read0Ptr;
       }
 
       Value read2Ptr = read0Ptr;
 
-      Value writePtr =
-          fir::ConvertOp::create(builder, loc, f32RefTy, k.writeArray);
+      Value writePtr = getRuntimeF32Pointer(builder, loc, k.writeArray);
 
       unsigned scalarCount = k.scalarRefs.size();
 

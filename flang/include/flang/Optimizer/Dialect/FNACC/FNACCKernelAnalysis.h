@@ -1,8 +1,8 @@
 #ifndef FORTRAN_OPTIMIZER_DIALECT_FNACC_FNACCKERNELANALYSIS_H
 #define FORTRAN_OPTIMIZER_DIALECT_FNACC_FNACCKERNELANALYSIS_H
 
-#include "flang/Optimizer/Dialect/FNACC/FNACCDialect.h"
 #include "flang/Optimizer/Dialect/FIROps.h"
+#include "flang/Optimizer/Dialect/FNACC/FNACCDialect.h"
 
 #include "mlir/IR/Matchers.h"
 #include "mlir/IR/Operation.h"
@@ -10,126 +10,133 @@
 
 #include "llvm/ADT/SmallVector.h"
 
+#include <memory>
 #include <optional>
 #include <string>
-#include <memory>
 
 namespace fir::fnacc {
 
-  enum class ElementwiseKernelKind {
-    BinaryArrayArray,
-    Saxpy1D,
-    Expr1D
-  };
+enum class ElementwiseExtentSourceKind { Unknown, Value, LoadI32Ref, BoxDim };
 
-  enum class ElementwiseExprKind {
-    ArrayLoad,
-    ScalarLoad,
-    ConstantF32,
-    AddF,
-    SubF,
-    MulF,
-    DivF
-  };
+struct ElementwiseExtentSource {
+  ElementwiseExtentSourceKind kind = ElementwiseExtentSourceKind::Unknown;
 
-  struct ElementwiseExpr {
-    ElementwiseExprKind kind;
+  // Meaning depends on kind:
+  //
+  // Value:
+  //   An SSA value usable directly as an extent.
+  //
+  // LoadI32Ref:
+  //   An !fir.ref<i32> or equivalent scalar reference. Runtime lowering will
+  //   emit fir.load outside the launch.
+  //
+  // BoxDim:
+  //   A !fir.box<!fir.array<...>>. Runtime lowering will emit fir.box_dims
+  //   outside the launch and use result #1, the extent.
+  mlir::Value value;
 
-    // For ArrayLoad and ScalarLoad.
-    mlir::Value source;
+  // For BoxDim. Zero-based dimension number.
+  unsigned dim = 0;
+};
 
-    // For ConstantF32.
-    double f32Value = 0.0;
+enum class ElementwiseKernelKind { BinaryArrayArray, Saxpy1D, Expr1D };
 
-    llvm::SmallVector<std::unique_ptr<ElementwiseExpr>> operands;
-  };
+enum class ElementwiseExprKind {
+  ArrayLoad,
+  ScalarLoad,
+  ConstantF32,
+  AddF,
+  SubF,
+  MulF,
+  DivF
+};
 
-  struct ElementwiseKernel {
-    int32_t rank = 1;
+struct ElementwiseExpr {
+  ElementwiseExprKind kind;
 
-    ElementwiseKernelKind kind = ElementwiseKernelKind::BinaryArrayArray;
+  // For ArrayLoad and ScalarLoad.
+  mlir::Value source;
 
-    // 1-D case.
-    fir::DoLoopOp loop1D;
+  // For ConstantF32.
+  double f32Value = 0.0;
 
-    // 2-D case.
-    // outerLoop = j loop
-    // innerLoop = i loop
-    fir::DoLoopOp outerLoop;
-    fir::DoLoopOp innerLoop;
+  llvm::SmallVector<std::unique_ptr<ElementwiseExpr>> operands;
+};
 
-    // Runtime extent references.
-    // For 1-D:
-    //   nRef = n
-    //
-    // For 2-D:
-    //   nRef = x extent / first dimension / i bound
-    //   mRef = y extent / second dimension / j bound
-    mlir::Value nRef;
-    mlir::Value mRef;
+struct ElementwiseKernel {
+  int32_t rank = 1;
 
-    // Induction-variable storage discovered from:
-    //
-    //   fir.store %iv to %i
-    mlir::Value innerIndMemref;
-    mlir::Value outerIndMemref;
+  ElementwiseKernelKind kind = ElementwiseKernelKind::BinaryArrayArray;
 
-    llvm::SmallVector<mlir::Value> readArrays;
-    mlir::Value writeArray;
+  fir::DoLoopOp loop1D;
 
-    llvm::SmallVector<mlir::Value> scalarRefs;
-    
-    mlir::Operation *computeOp = nullptr;
+  fir::DoLoopOp outerLoop;
+  fir::DoLoopOp innerLoop;
 
-    // Generic 1-D expression tree.
-    //
-    // Used for kernels such as:
-    //
-    //   c(i) = alpha * a(i) + beta * b(i)
-    std::unique_ptr<ElementwiseExpr> expression;
+  // Runtime extent sources.
+  //
+  // For 1-D:
+  //   extentX = loop trip upper extent.
+  //
+  // For 2-D:
+  //   extentX = inner/i extent.
+  //   extentY = outer/j extent.
+  ElementwiseExtentSource extentX;
+  ElementwiseExtentSource extentY;
+  ElementwiseExtentSource extentZ;
 
-  };
+  mlir::Value innerIndMemref;
+  mlir::Value outerIndMemref;
 
-  struct RecognitionFailure {
-    mlir::Operation *where = nullptr;
-    std::string reason;
-  };
+  llvm::SmallVector<mlir::Value> readArrays;
+  mlir::Value writeArray;
 
-  class ElementwiseRecognitionResult {
-  public:
-    static ElementwiseRecognitionResult success(ElementwiseKernel kernel) {
-      ElementwiseRecognitionResult result;
-      result.kernel = std::move(kernel);
-      return result;
-    }
+  llvm::SmallVector<mlir::Value> scalarRefs;
 
-    static ElementwiseRecognitionResult failure(mlir::Operation *where,
-						std::string reason) {
-      ElementwiseRecognitionResult result;
-      result.failureInfo.where = where;
-      result.failureInfo.reason = std::move(reason);
-      return result;
-    }
+  mlir::Operation *computeOp = nullptr;
 
-    bool succeeded() const { return kernel.has_value(); }
-    bool failed() const { return !succeeded(); }
+  std::unique_ptr<ElementwiseExpr> expression;
+};
 
-    ElementwiseKernel &getKernel() { return *kernel; }
-    const ElementwiseKernel &getKernel() const { return *kernel; }
+struct RecognitionFailure {
+  mlir::Operation *where = nullptr;
+  std::string reason;
+};
 
-    const RecognitionFailure &getFailure() const { return failureInfo; }
+class ElementwiseRecognitionResult {
+public:
+  static ElementwiseRecognitionResult success(ElementwiseKernel kernel) {
+    ElementwiseRecognitionResult result;
+    result.kernel = std::move(kernel);
+    return result;
+  }
 
-  private:
-    std::optional<ElementwiseKernel> kernel;
-    RecognitionFailure failureInfo;
-  };
+  static ElementwiseRecognitionResult failure(mlir::Operation *where,
+                                              std::string reason) {
+    ElementwiseRecognitionResult result;
+    result.failureInfo.where = where;
+    result.failureInfo.reason = std::move(reason);
+    return result;
+  }
 
-  ElementwiseRecognitionResult
-  recognizeElementwiseKernel(fir::fnacc::LaunchOp launchOp);
+  bool succeeded() const { return kernel.has_value(); }
+  bool failed() const { return !succeeded(); }
 
-  bool isSupportedElementwiseCompute(mlir::Operation *op);
+  ElementwiseKernel &getKernel() { return *kernel; }
+  const ElementwiseKernel &getKernel() const { return *kernel; }
+
+  const RecognitionFailure &getFailure() const { return failureInfo; }
+
+private:
+  std::optional<ElementwiseKernel> kernel;
+  RecognitionFailure failureInfo;
+};
+
+ElementwiseRecognitionResult
+recognizeElementwiseKernel(fir::fnacc::LaunchOp launchOp);
+
+bool isSupportedElementwiseCompute(mlir::Operation *op);
 
 } // namespace fir::fnacc
 
 #endif // FORTRAN_OPTIMIZER_DIALECT_FNACC_FNACCKERNELANALYSIS_H
-

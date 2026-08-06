@@ -360,6 +360,12 @@ struct FNACCKernelRegistry {
   std::unordered_map<void *, FNACCDeviceAllocation> deviceCache;
 };
 
+static const char *fnaccEmbeddedPtxData = nullptr;
+static std::size_t fnaccEmbeddedPtxSize = 0;
+
+static const char *fnaccEmbeddedJsonData = nullptr;
+static std::size_t fnaccEmbeddedJsonSize = 0;
+
 static FNACCKernelRegistry fnaccRegistry;
 
 struct FNACCDeviceArg {
@@ -374,13 +380,12 @@ static bool fnaccDebugEnabled() {
   return value && value[0] != '\0' && std::strcmp(value, "0") != 0;
 }
 
-static const char *fnaccGetEnvOrDefault(
-    const char *envName, const char *fallback) {
-  const char *value = std::getenv(envName);
-  if (value && value[0] != '\0')
-    return value;
+static bool fnaccHasEmbeddedPtx() {
+  return fnaccEmbeddedPtxData && fnaccEmbeddedPtxSize > 0;
+}
 
-  return fallback;
+static bool fnaccHasEmbeddedJson() {
+  return fnaccEmbeddedJsonData && fnaccEmbeddedJsonSize > 0;
 }
 
 static std::string fnaccReadTextFile(const char *path) {
@@ -393,6 +398,69 @@ static std::string fnaccReadTextFile(const char *path) {
   std::ostringstream ss;
   ss << file.rdbuf();
   return ss.str();
+}
+
+static std::string fnaccGetPtxText() {
+  const char *ptxPath = std::getenv("FNACC_PTX");
+
+  if (ptxPath && ptxPath[0] != '\0') {
+    if (fnaccDebugEnabled())
+      std::fprintf(stderr, "FNACC: loading PTX from '%s'\n", ptxPath);
+
+    return fnaccReadTextFile(ptxPath);
+  }
+
+  if (fnaccHasEmbeddedPtx()) {
+    if (fnaccDebugEnabled()) {
+      std::fprintf(stderr, "FNACC: loading embedded PTX, bytes=%zu\n",
+          fnaccEmbeddedPtxSize);
+    }
+
+    return std::string(fnaccEmbeddedPtxData, fnaccEmbeddedPtxSize);
+  }
+
+  const char *fallback = "fnacc_kernels.ptx";
+
+  if (fnaccDebugEnabled())
+    std::fprintf(stderr, "FNACC: loading PTX from '%s'\n", fallback);
+
+  return fnaccReadTextFile(fallback);
+}
+
+static std::string fnaccGetJsonText() {
+  const char *jsonPath = std::getenv("FNACC_KERNELS_JSON");
+
+  if (jsonPath && jsonPath[0] != '\0') {
+    if (fnaccDebugEnabled())
+      std::fprintf(stderr, "FNACC: loading JSON from '%s'\n", jsonPath);
+
+    return fnaccReadTextFile(jsonPath);
+  }
+
+  if (fnaccHasEmbeddedJson()) {
+    if (fnaccDebugEnabled()) {
+      std::fprintf(stderr, "FNACC: loading embedded JSON, bytes=%zu\n",
+          fnaccEmbeddedJsonSize);
+    }
+
+    return std::string(fnaccEmbeddedJsonData, fnaccEmbeddedJsonSize);
+  }
+
+  const char *fallback = "fnacc_kernels.json";
+
+  if (fnaccDebugEnabled())
+    std::fprintf(stderr, "FNACC: loading JSON from '%s'\n", fallback);
+
+  return fnaccReadTextFile(fallback);
+}
+
+static const char *fnaccGetEnvOrDefault(
+    const char *envName, const char *fallback) {
+  const char *value = std::getenv(envName);
+  if (value && value[0] != '\0')
+    return value;
+
+  return fallback;
 }
 
 static std::unordered_map<int32_t, FNACCKernelDesc>
@@ -466,15 +534,7 @@ static void fnaccEnsureInitialized() {
   if (fnaccRegistry.initialized)
     return;
 
-  const char *ptxPath = fnaccGetEnvOrDefault("FNACC_PTX", "fnacc_kernels.ptx");
-
-  const char *jsonPath =
-      fnaccGetEnvOrDefault("FNACC_KERNELS_JSON", "fnacc_kernels.json");
-
-  if (fnaccDebugEnabled()) {
-    std::fprintf(stderr, "FNACC: loading PTX from '%s'\n", ptxPath);
-    std::fprintf(stderr, "FNACC: loading JSON from '%s'\n", jsonPath);
-  }
+  std::string ptx = fnaccGetPtxText();
 
   FNACC_CUDA_CHECK(cuInit(0));
 
@@ -484,18 +544,11 @@ static void fnaccEnsureInitialized() {
   FNACC_CUDA_CHECK(cuDevicePrimaryCtxRetain(&fnaccRegistry.context, device));
   FNACC_CUDA_CHECK(cuCtxSetCurrent(fnaccRegistry.context));
 
-  std::string ptx = fnaccReadTextFile(ptxPath);
-
   FNACC_CUDA_CHECK(cuModuleLoadDataEx(
       &fnaccRegistry.module, ptx.c_str(), 0, nullptr, nullptr));
 
-  std::string json = fnaccReadTextFile(jsonPath);
+  std::string json = fnaccGetJsonText();
   fnaccRegistry.kernels = fnaccParseKernelDescsFromJson(json);
-
-  if (fnaccRegistry.kernels.empty()) {
-    std::fprintf(stderr,
-        "FNACC warning: no kernel descriptors parsed from '%s'\n", jsonPath);
-  }
 
   if (fnaccDebugEnabled()) {
     for (const auto &entry : fnaccRegistry.kernels) {
@@ -894,6 +947,217 @@ static void fnaccValidateCommonLaunchInputs(const char *entryName, int32_t rank,
 //   rank 2 TTIR:
 //     (%a: ptr<f32>, %b: ptr<f32>, %c: ptr<f32>, %n: i32, %m: i32)
 //
+static std::size_t fnaccElementCountFromExtents(
+    int32_t rank, int64_t extent0, int64_t extent1, int64_t extent2) {
+  if (rank < 1 || rank > 3) {
+    std::fprintf(stderr,
+        "FNACC error: descriptor data directive received unsupported rank %d\n",
+        rank);
+    std::abort();
+  }
+
+  if (extent0 < 0 || extent1 < 0 || extent2 < 0) {
+    std::fprintf(stderr,
+        "FNACC error: descriptor data directive received negative extent "
+        "(%lld,%lld,%lld)\n",
+        static_cast<long long>(extent0), static_cast<long long>(extent1),
+        static_cast<long long>(extent2));
+    std::abort();
+  }
+
+  std::size_t count = static_cast<std::size_t>(extent0);
+
+  if (rank >= 2)
+    count *= static_cast<std::size_t>(extent1);
+
+  if (rank >= 3)
+    count *= static_cast<std::size_t>(extent2);
+
+  return count;
+}
+
+static std::size_t fnaccBytesFromDescriptor(int64_t elementBytes, int32_t rank,
+    int64_t extent0, int64_t extent1, int64_t extent2) {
+  if (elementBytes <= 0) {
+    std::fprintf(stderr,
+        "FNACC error: descriptor data directive received invalid element size "
+        "%lld\n",
+        static_cast<long long>(elementBytes));
+    std::abort();
+  }
+
+  std::size_t elements =
+      fnaccElementCountFromExtents(rank, extent0, extent1, extent2);
+
+  return elements * static_cast<std::size_t>(elementBytes);
+}
+
+static FNACCDeviceAllocation &fnaccGetOrCreateCachedAllocation(void *hostPtr,
+    std::size_t bytes, bool copyHostToDeviceOnCreateOrResize,
+    const char *operationName) {
+  auto it = fnaccRegistry.deviceCache.find(hostPtr);
+
+  if (it != fnaccRegistry.deviceCache.end()) {
+    if (it->second.bytes == bytes)
+      return it->second;
+
+    if (fnaccDebugEnabled()) {
+      std::fprintf(stderr,
+          "FNACC: %s resizing cached allocation for host=%p "
+          "old_bytes=%zu new_bytes=%zu\n",
+          operationName, hostPtr, it->second.bytes, bytes);
+    }
+
+    FNACC_CUDA_CHECK(cuMemFree(it->second.ptr));
+    fnaccRegistry.deviceCache.erase(it);
+  }
+
+  FNACCDeviceAllocation allocation;
+  allocation.bytes = bytes;
+
+  if (bytes > 0) {
+    FNACC_CUDA_CHECK(cuMemAlloc(&allocation.ptr, bytes));
+
+    if (copyHostToDeviceOnCreateOrResize)
+      FNACC_CUDA_CHECK(cuMemcpyHtoD(allocation.ptr, hostPtr, bytes));
+  }
+
+  auto inserted = fnaccRegistry.deviceCache.emplace(hostPtr, allocation);
+
+  if (fnaccDebugEnabled()) {
+    std::fprintf(stderr,
+        "FNACC: %s created cached allocation host=%p device=0x%llx "
+        "bytes=%zu copy_in=%s\n",
+        operationName, hostPtr,
+        static_cast<unsigned long long>(inserted.first->second.ptr), bytes,
+        copyHostToDeviceOnCreateOrResize ? "yes" : "no");
+  }
+
+  return inserted.first->second;
+}
+
+extern "C" void __fnacc_update_device_desc(void *hostPtr, int64_t elementBytes,
+    int32_t rank, int64_t extent0, int64_t extent1, int64_t extent2) {
+  fnaccEnsureCurrentContext();
+
+  if (!hostPtr) {
+    if (fnaccDebugEnabled())
+      std::fprintf(stderr, "FNACC: update_device_desc ignored null pointer\n");
+    return;
+  }
+
+  std::size_t bytes =
+      fnaccBytesFromDescriptor(elementBytes, rank, extent0, extent1, extent2);
+
+  if (bytes == 0) {
+    if (fnaccDebugEnabled()) {
+      std::fprintf(stderr,
+          "FNACC: update_device_desc ignored zero-size object host=%p\n",
+          hostPtr);
+    }
+    return;
+  }
+
+  FNACCDeviceAllocation &allocation = fnaccGetOrCreateCachedAllocation(hostPtr,
+      bytes, /*copyHostToDeviceOnCreateOrResize=*/false, "update_device_desc");
+
+  FNACC_CUDA_CHECK(cuMemcpyHtoD(allocation.ptr, hostPtr, bytes));
+
+  if (fnaccDebugEnabled()) {
+    std::fprintf(stderr,
+        "FNACC: update_device_desc host=%p device=0x%llx "
+        "elem_bytes=%lld rank=%d extents=(%lld,%lld,%lld) bytes=%zu\n",
+        hostPtr, static_cast<unsigned long long>(allocation.ptr),
+        static_cast<long long>(elementBytes), rank,
+        static_cast<long long>(extent0), static_cast<long long>(extent1),
+        static_cast<long long>(extent2), bytes);
+  }
+}
+
+extern "C" void __fnacc_update_host_desc(void *hostPtr, int64_t elementBytes,
+    int32_t rank, int64_t extent0, int64_t extent1, int64_t extent2) {
+  fnaccEnsureCurrentContext();
+
+  if (!hostPtr) {
+    if (fnaccDebugEnabled())
+      std::fprintf(stderr, "FNACC: update_host_desc ignored null pointer\n");
+    return;
+  }
+
+  std::size_t bytes =
+      fnaccBytesFromDescriptor(elementBytes, rank, extent0, extent1, extent2);
+
+  if (bytes == 0) {
+    if (fnaccDebugEnabled()) {
+      std::fprintf(stderr,
+          "FNACC: update_host_desc ignored zero-size object host=%p\n",
+          hostPtr);
+    }
+    return;
+  }
+
+  auto it = fnaccRegistry.deviceCache.find(hostPtr);
+  if (it == fnaccRegistry.deviceCache.end()) {
+    if (fnaccDebugEnabled()) {
+      std::fprintf(stderr,
+          "FNACC: update_host_desc ignored; no cached allocation for host=%p\n",
+          hostPtr);
+    }
+    return;
+  }
+
+  if (it->second.bytes < bytes) {
+    std::fprintf(stderr,
+        "FNACC error: update_host_desc requested %zu bytes for host=%p, "
+        "but cached allocation has only %zu bytes\n",
+        bytes, hostPtr, it->second.bytes);
+    std::abort();
+  }
+
+  FNACC_CUDA_CHECK(cuMemcpyDtoH(hostPtr, it->second.ptr, bytes));
+
+  if (fnaccDebugEnabled()) {
+    std::fprintf(stderr,
+        "FNACC: update_host_desc host=%p device=0x%llx "
+        "elem_bytes=%lld rank=%d extents=(%lld,%lld,%lld) bytes=%zu\n",
+        hostPtr, static_cast<unsigned long long>(it->second.ptr),
+        static_cast<long long>(elementBytes), rank,
+        static_cast<long long>(extent0), static_cast<long long>(extent1),
+        static_cast<long long>(extent2), bytes);
+  }
+}
+
+extern "C" void __fnacc_release_desc(void *hostPtr) {
+  fnaccEnsureCurrentContext();
+
+  if (!hostPtr) {
+    if (fnaccDebugEnabled())
+      std::fprintf(stderr, "FNACC: release_desc ignored null pointer\n");
+    return;
+  }
+
+  auto it = fnaccRegistry.deviceCache.find(hostPtr);
+  if (it == fnaccRegistry.deviceCache.end()) {
+    if (fnaccDebugEnabled()) {
+      std::fprintf(stderr,
+          "FNACC: release_desc ignored; no cached allocation for host=%p\n",
+          hostPtr);
+    }
+    return;
+  }
+
+  CUdeviceptr devicePtr = it->second.ptr;
+  std::size_t bytes = it->second.bytes;
+
+  FNACC_CUDA_CHECK(cuMemFree(devicePtr));
+  fnaccRegistry.deviceCache.erase(it);
+
+  if (fnaccDebugEnabled()) {
+    std::fprintf(stderr,
+        "FNACC: release_desc host=%p device=0x%llx bytes=%zu\n", hostPtr,
+        static_cast<unsigned long long>(devicePtr), bytes);
+  }
+}
 
 extern "C" void __fnacc_launch_nd_f32(int32_t kernelId, int32_t rank,
     int32_t blockX, int32_t blockY, int32_t blockZ, float *a, float *b,
@@ -1536,4 +1800,12 @@ extern "C" void __fnacc_release_all() {
   }
 
   fnaccRegistry.deviceCache.clear();
+}
+
+extern "C" void __fnacc_register_embedded_kernels(const char *ptxData,
+    std::size_t ptxSize, const char *jsonData, std::size_t jsonSize) {
+  fnaccEmbeddedPtxData = ptxData;
+  fnaccEmbeddedPtxSize = ptxSize;
+  fnaccEmbeddedJsonData = jsonData;
+  fnaccEmbeddedJsonSize = jsonSize;
 }
