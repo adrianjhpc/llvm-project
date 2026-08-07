@@ -1677,7 +1677,16 @@ extern "C" void __fnacc_launch_f32_v1(int32_t kernelId, int32_t rank,
 
   FNACC_CUDA_CHECK(cuCtxSynchronize());
 
-  fnaccCopyBackWriteArray(write, writeDev, numBytes);
+  if (writeDev.target == FNACC_PACK_TARGET_HOST) {
+    fnaccCopyBackWriteArray(write, writeDev, numBytes);
+  } else {
+    if (fnaccDebugEnabled()) {
+      std::fprintf(stderr,
+          "FNACC: skipped automatic copy-back for write slot %d "
+          "because target=device; use !$fnacc update host(...) to copy back\n",
+          writeDev.slot);
+    }
+  }
 
   fnaccReleaseDeviceArg(read0Dev);
 
