@@ -23,14 +23,6 @@ using namespace mlir;
 
 namespace {
 
-static constexpr int32_t kTritonNumWarps = 1;
-static constexpr int32_t kTritonThreadsPerWarp = 32;
-static constexpr int32_t kTritonNumCTAs = 1;
-static constexpr int32_t kTritonNumStages = 3;
-
-static constexpr int32_t kCudaThreadsPerCTA =
-    kTritonNumWarps * kTritonThreadsPerWarp;
-
 // Triton/NVVM-generated PTX currently appends two hidden pointer parameters
 // after the explicit kernel parameters for the FNACC kernels we emit.
 //
@@ -465,11 +457,13 @@ kernelParamSlotsForValue(const fir::fnacc::ElementwiseKernel &k, Value v) {
   return slots;
 }
 
-static void emitJsonDescriptor(fir::fnacc::LaunchOp launchOp,
-                               const fir::fnacc::ElementwiseKernel &k,
-                               int64_t blockX, int64_t blockY, int64_t blockZ,
-                               int32_t kernelId, StringRef kernelName,
-                               llvm::raw_ostream &os, bool &firstKernel) {
+static void emitJsonDescriptor(
+    fir::fnacc::LaunchOp launchOp, const fir::fnacc::ElementwiseKernel &k,
+    int64_t blockX, int64_t blockY, int64_t blockZ, int32_t kernelId,
+    llvm::StringRef kernelName, int32_t tritonNumWarps,
+    int32_t tritonThreadsPerWarp, int32_t tritonNumStages,
+    int32_t cudaThreadsPerCTA, llvm::raw_ostream &os, bool &firstKernel) {
+
   if (!firstKernel)
     os << ",\n";
   firstKernel = false;
@@ -487,11 +481,11 @@ static void emitJsonDescriptor(fir::fnacc::LaunchOp launchOp,
   os << "      \"rank\": " << k.rank << ",\n";
   os << "      \"tile\": [" << blockX << ", " << blockY << ", " << blockZ
      << "],\n";
-  os << "      \"num_warps\": " << kTritonNumWarps << ",\n";
-  os << "      \"threads_per_warp\": " << kTritonThreadsPerWarp << ",\n";
-  os << "      \"num_ctas\": " << kTritonNumCTAs << ",\n";
-  os << "      \"num_stages\": " << kTritonNumStages << ",\n";
-  os << "      \"cuda_threads_per_cta\": " << kCudaThreadsPerCTA << ",\n";
+  os << "      \"num_warps\": " << tritonNumWarps << ",\n";
+  os << "      \"threads_per_warp\": " << tritonThreadsPerWarp << ",\n";
+  os << "      \"num_ctas\": 1,\n";
+  os << "      \"num_stages\": " << tritonNumStages << ",\n";
+  os << "      \"cuda_threads_per_cta\": " << cudaThreadsPerCTA << ",\n";
   os << "      \"triton_hidden_ptr_args\": " << kTritonHiddenPtrArgs << ",\n";
 
   if (k.rank == 2) {
@@ -578,14 +572,41 @@ struct FNACCLowerToTritonPass
     : public fir::fnacc::impl::FNACCLowerToTritonBase<FNACCLowerToTritonPass> {
   FNACCLowerToTritonPass() = default;
 
-  FNACCLowerToTritonPass(llvm::StringRef ttirOutput,
-                         llvm::StringRef jsonOutput) {
+  FNACCLowerToTritonPass(llvm::StringRef ttirOutput, llvm::StringRef jsonOutput,
+                         int32_t numWarps, int32_t threadsPerWarp,
+                         int32_t numStages) {
     this->ttirOutput = ttirOutput.str();
     this->jsonOutput = jsonOutput.str();
+    this->numWarps = numWarps;
+    this->threadsPerWarp = threadsPerWarp;
+    this->numStages = numStages;
   }
 
   void runOnOperation() override {
     ModuleOp module = getOperation();
+
+    int32_t tritonNumWarps = this->numWarps;
+    int32_t tritonThreadsPerWarp = this->threadsPerWarp;
+    int32_t tritonNumStages = this->numStages;
+    int32_t cudaThreadsPerCTA = tritonNumWarps * tritonThreadsPerWarp;
+
+    if (tritonNumWarps <= 0) {
+      module.emitError("FNACC num-warps must be positive");
+      signalPassFailure();
+      return;
+    }
+
+    if (tritonThreadsPerWarp <= 0) {
+      module.emitError("FNACC threads-per-warp must be positive");
+      signalPassFailure();
+      return;
+    }
+
+    if (tritonNumStages <= 0) {
+      module.emitError("FNACC num-stages must be positive");
+      signalPassFailure();
+      return;
+    }
 
     std::string ttirPath = this->ttirOutput;
     std::string jsonPath = this->jsonOutput;
@@ -613,10 +634,10 @@ struct FNACCLowerToTritonPass
     int32_t fallbackId = 0;
 
     ttirOs << "module attributes {"
-           << "\"ttg.num-warps\" = " << kTritonNumWarps << " : i32, "
-           << "\"ttg.num-ctas\" = " << kTritonNumCTAs << " : i32, "
-           << "\"ttg.num-stages\" = " << kTritonNumStages << " : i32, "
-           << "\"ttg.threads-per-warp\" = " << kTritonThreadsPerWarp << " : i32"
+           << "\"ttg.num-warps\" = " << tritonNumWarps << " : i32, "
+           << "\"ttg.num-ctas\" = 1 : i32, "
+           << "\"ttg.num-stages\" = " << tritonNumStages << " : i32, "
+           << "\"ttg.threads-per-warp\" = " << tritonThreadsPerWarp << " : i32"
            << "} {\n";
 
     module.walk([&](fir::fnacc::LaunchOp launchOp) {
@@ -660,7 +681,9 @@ struct FNACCLowerToTritonPass
       }
 
       emitJsonDescriptor(launchOp, k, blockX, blockY, blockZ, kernelId,
-                         kernelName, jsonOs, firstKernel);
+                         kernelName, tritonNumWarps, tritonThreadsPerWarp,
+                         tritonNumStages, cudaThreadsPerCTA, jsonOs,
+                         firstKernel);
 
       ++fallbackId;
     });
@@ -679,8 +702,9 @@ std::unique_ptr<mlir::Pass> fir::fnacc::createFNACCLowerToTritonPass() {
   return std::make_unique<FNACCLowerToTritonPass>();
 }
 
-std::unique_ptr<mlir::Pass>
-fir::fnacc::createFNACCLowerToTritonPass(llvm::StringRef ttirOutput,
-                                         llvm::StringRef jsonOutput) {
-  return std::make_unique<FNACCLowerToTritonPass>(ttirOutput, jsonOutput);
+std::unique_ptr<mlir::Pass> fir::fnacc::createFNACCLowerToTritonPass(
+    llvm::StringRef ttirOutput, llvm::StringRef jsonOutput, int32_t numWarps,
+    int32_t threadsPerWarp, int32_t numStages) {
+  return std::make_unique<FNACCLowerToTritonPass>(
+      ttirOutput, jsonOutput, numWarps, threadsPerWarp, numStages);
 }

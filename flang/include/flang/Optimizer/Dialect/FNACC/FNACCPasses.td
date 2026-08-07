@@ -46,7 +46,6 @@ def FNACCEmitFortranAliases
   ];
 }
 
-
 def FNACCLowerToTriton : Pass<"fnacc-lower-to-triton", "mlir::ModuleOp"> {
   let summary = "Emit Triton textual IR for elementwise fnacc.launch regions";
   let constructor = "fir::fnacc::createFNACCLowerToTritonPass()";
@@ -57,7 +56,16 @@ def FNACCLowerToTriton : Pass<"fnacc-lower-to-triton", "mlir::ModuleOp"> {
            "Path to write generated Triton TTIR">,
     Option<"jsonOutput", "json-output", "std::string",
            "\"fnacc_kernels.json\"",
-           "Path to write generated FNACC kernel descriptor JSON">
+           "Path to write generated FNACC kernel descriptor JSON">,
+    Option<"numWarps", "num-warps", "int32_t",
+           "1",
+           "Number of Triton warps per CTA">,
+    Option<"threadsPerWarp", "threads-per-warp", "int32_t",
+           "32",
+           "Number of CUDA threads per warp">,
+    Option<"numStages", "num-stages", "int32_t",
+           "3",
+           "Number of Triton pipeline stages">
   ];
 
   let dependentDialects = [

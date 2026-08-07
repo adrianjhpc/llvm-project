@@ -23,14 +23,26 @@ struct FNACCPipelineOptions
       llvm::cl::desc("Emit external Fortran ABI aliases for transformed "
                      "top-level procedures"),
       llvm::cl::init(false)};
+  Option<int32_t> numWarps{*this, "num-warps",
+                           llvm::cl::desc("Number of Triton warps per CTA"),
+                           llvm::cl::init(1)};
+
+  Option<int32_t> threadsPerWarp{
+      *this, "threads-per-warp",
+      llvm::cl::desc("Number of CUDA threads per warp"), llvm::cl::init(32)};
+
+  Option<int32_t> numStages{*this, "num-stages",
+                            llvm::cl::desc("Number of Triton pipeline stages"),
+                            llvm::cl::init(3)};
 };
 
 void buildFNACCPipeline(mlir::OpPassManager &pm,
                         const FNACCPipelineOptions &options) {
   pm.addPass(createFNACCAssignKernelIdsPass());
 
-  pm.addPass(
-      createFNACCLowerToTritonPass(options.ttirOutput, options.jsonOutput));
+  pm.addPass(createFNACCLowerToTritonPass(
+      options.ttirOutput, options.jsonOutput, options.numWarps,
+      options.threadsPerWarp, options.numStages));
 
   pm.addPass(createFNACCLowerToRuntimePass());
 
