@@ -528,7 +528,14 @@ if (FLANG_INCLUDE_DOCS)
   add_subdirectory(docs)
 endif()
 
-option(FLANG_FNACC "Build FNACC functionality" OFF)
+option(FLANG_FNACC_RUNTIME "Build the experimental FNACC CUDA runtime" OFF)
+
+# Backwards-compatible spelling for existing build scripts.
+if(DEFINED FLANG_FNACC)
+  set(FLANG_FNACC_RUNTIME ${FLANG_FNACC}
+      CACHE BOOL "Build the experimental FNACC CUDA runtime" FORCE)
+endif()
+
 
 # Custom target to install Flang libraries.
 add_custom_target(flang-libraries)

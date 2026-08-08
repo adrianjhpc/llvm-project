@@ -204,20 +204,6 @@ static Value getRuntimeF32Pointer(OpBuilder &builder, Location loc,
   return fir::ConvertOp::create(builder, loc, f32RefTy, arrayLike);
 }
 
-static void createVoidRuntimeCall(ModuleOp module, OpBuilder &builder,
-                                  Location loc, StringRef runtimeName,
-                                  ValueRange operands) {
-  llvm::SmallVector<Type> argTypes;
-  for (Value operand : operands)
-    argTypes.push_back(operand.getType());
-
-  func::FuncOp callee =
-      getOrCreateRuntimeDecl(module, builder, loc, runtimeName, argTypes);
-
-  func::CallOp::create(builder, loc, callee.getSymName(), TypeRange{},
-                       operands);
-}
-
 static void createRuntimeCall(ModuleOp module, OpBuilder &builder, Location loc,
                               StringRef runtimeName, ValueRange operands) {
   llvm::SmallVector<Type> argTypes;
@@ -232,7 +218,11 @@ static void createRuntimeCall(ModuleOp module, OpBuilder &builder, Location loc,
 }
 
 struct FNACCContiguousArrayDescriptorArgs {
-  llvm::SmallVector<Value, 6> values;
+  // ABI:
+  //   ptr, element_bytes, rank,
+  //   extent0, extent1, extent2,
+  //   byte_stride0, byte_stride1, byte_stride2
+  llvm::SmallVector<Value, 9> values;
 };
 
 static void
@@ -273,6 +263,9 @@ tryCreateContiguousArrayDescriptorArgs(OpBuilder &builder, Location loc,
   desc.values.push_back(elementBytesValue);
   desc.values.push_back(rankValue);
 
+  llvm::SmallVector<Value, 3> extents;
+  llvm::SmallVector<Value, 3> strides;
+
   for (unsigned dim = 0; dim < rank; ++dim) {
     Value dimValue = arith::ConstantIndexOp::create(builder, loc, dim);
 
@@ -281,15 +274,27 @@ tryCreateContiguousArrayDescriptorArgs(OpBuilder &builder, Location loc,
     // fir.box_dims returns:
     //   result #0 = lower bound
     //   result #1 = extent
-    //   result #2 = stride
+    //   result #2 = byte stride
     Value extent = dims->getResult(1);
+    Value byteStride = dims->getResult(2);
 
-    desc.values.push_back(convertToI64(builder, loc, extent));
+    extents.push_back(convertToI64(builder, loc, extent));
+    strides.push_back(convertToI64(builder, loc, byteStride));
   }
 
-  // Pad to three extents.
+  // Pad extents to rank 3.
   for (unsigned dim = rank; dim < 3; ++dim)
-    desc.values.push_back(constantI64(builder, loc, 1));
+    extents.push_back(constantI64(builder, loc, 1));
+
+  // Pad strides to rank 3. Padded dimensions are ignored by the runtime.
+  for (unsigned dim = rank; dim < 3; ++dim)
+    strides.push_back(constantI64(builder, loc, 0));
+
+  for (Value extent : extents)
+    desc.values.push_back(extent);
+
+  for (Value stride : strides)
+    desc.values.push_back(stride);
 
   return desc;
 }
@@ -429,7 +434,12 @@ struct FNACCLowerToRuntimePass
         extentYValue = arith::ConstantIntOp::create(builder, loc, 1, 32);
       }
 
-      Value extentZValue = arith::ConstantIntOp::create(builder, loc, 1, 32);
+      Value extentZValue;
+      if (k.kind == fir::fnacc::ElementwiseKernelKind::MatMul2D) {
+        extentZValue = materializeExtentValue(builder, loc, k.extentZ);
+      } else {
+        extentZValue = arith::ConstantIntOp::create(builder, loc, 1, 32);
+      }
 
       // Use a single rank-independent runtime ABI.
       //
@@ -444,6 +454,13 @@ struct FNACCLowerToRuntimePass
       FloatType f32Ty = builder.getF32Type();
       Type f32RefTy = fir::ReferenceType::get(f32Ty);
 
+      if (k.readArrays.size() != 2) {
+        launchOp.emitError("FNACC runtime lowering currently requires exactly "
+                           "two read arrays");
+        signalPassFailure();
+        return;
+      }
+
       Value read0Ptr = getRuntimeF32Pointer(builder, loc, k.readArrays[0]);
 
       Value read1Ptr;
@@ -456,6 +473,45 @@ struct FNACCLowerToRuntimePass
       Value read2Ptr = read0Ptr;
 
       Value writePtr = getRuntimeF32Pointer(builder, loc, k.writeArray);
+
+      if (k.kind == fir::fnacc::ElementwiseKernelKind::MatMul2D) {
+        StringRef runtimeName = "__fnacc_launch_matmul_f32_v1";
+
+        llvm::SmallVector<Type> argTypes;
+        argTypes.push_back(kernelIdValue.getType());
+        argTypes.push_back(blockXValue.getType());
+        argTypes.push_back(blockYValue.getType());
+        argTypes.push_back(blockZValue.getType());
+        argTypes.push_back(read0Ptr.getType());
+        argTypes.push_back(read1Ptr.getType());
+        argTypes.push_back(writePtr.getType());
+        argTypes.push_back(extentXValue.getType());
+        argTypes.push_back(extentYValue.getType());
+        argTypes.push_back(extentZValue.getType());
+
+        func::FuncOp callee =
+            getOrCreateRuntimeDecl(module, builder, loc, runtimeName, argTypes);
+
+        llvm::SmallVector<Value> operands;
+        operands.push_back(kernelIdValue);
+        operands.push_back(blockXValue);
+        operands.push_back(blockYValue);
+        operands.push_back(blockZValue);
+        operands.push_back(read0Ptr);
+        operands.push_back(read1Ptr);
+        operands.push_back(writePtr);
+        operands.push_back(extentXValue);
+        operands.push_back(extentYValue);
+        operands.push_back(extentZValue);
+
+        func::CallOp::create(builder, loc, callee.getSymName(), TypeRange{},
+                             operands);
+
+        launchOp.erase();
+
+        ++fallbackKernelId;
+        continue;
+      }
 
       unsigned scalarCount = k.scalarRefs.size();
 

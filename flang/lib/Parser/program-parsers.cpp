@@ -139,11 +139,10 @@ TYPE_CONTEXT_PARSER("declaration construct"_en_US,
 
 // A !$FNACC executable directive marks the start of the execution part;
 // the specification part must yield to it cleanly (negation consumes nothing).
-constexpr auto notfnaccDirective{
-    !(skipStuffBeforeStatement >> ("!$FNACC "_sptok || "!DIR$ FNACC "_sptok))};
+constexpr auto notfnaccDirective{!(skipStuffBeforeStatement >>
+    ("!$FNACC "_sptok || "!@FNACC "_sptok || "!DIR$ FNACC "_sptok))};
 
-constexpr auto recoveredDeclarationConstruct{
-    notfnaccDirective >>
+constexpr auto recoveredDeclarationConstruct{notfnaccDirective >>
     recovery(withMessage("expected declaration construct"_err_en_US,
                  declarationConstruct),
         construct<DeclarationConstruct>(declErrorRecovery))};

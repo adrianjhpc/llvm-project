@@ -20,12 +20,24 @@ void fir::fnacc::FNACCDialect::initialize() {
 }
 
 llvm::LogicalResult fir::fnacc::LaunchOp::verify() {
+  llvm::ArrayRef<int64_t> tileSizes = getTileSizes();
+
+  if (tileSizes.size() > 3)
+    return emitOpError("expected at most three tile sizes");
+
+  for (int64_t tile : tileSizes) {
+    if (tile <= 0)
+      return emitOpError("tile sizes must be positive");
+  }
+
   if (getPackVars().size() != getPackTargets().size())
     return emitOpError(
         "expected pack_targets to have exactly one entry per pack var");
 
-  for (int32_t t : getPackTargets())
+  for (int32_t t : getPackTargets()) {
     if (t != 0 && t != 1)
       return emitOpError("pack target must be 0 (host) or 1 (device)");
+  }
+
   return mlir::success();
 }

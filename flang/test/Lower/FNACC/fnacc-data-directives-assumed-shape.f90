@@ -12,8 +12,8 @@ subroutine data_assumed_shape(a, c)
   !$fnacc release all
 end subroutine
 
-! HOST-DAG: func.func private @__fnacc_update_host_desc(!fir.ref<i8>, i64, i32, i64, i64, i64)
-! HOST-DAG: func.func private @__fnacc_update_device_desc(!fir.ref<i8>, i64, i32, i64, i64, i64)
+! HOST-DAG: func.func private @__fnacc_update_host_desc(!fir.ref<i8>, i64, i32, i64, i64, i64, i64, i64, i64)
+! HOST-DAG: func.func private @__fnacc_update_device_desc(!fir.ref<i8>, i64, i32, i64, i64, i64, i64, i64, i64)
 ! HOST-DAG: func.func private @__fnacc_release_desc(!fir.ref<i8>)
 ! HOST-DAG: func.func private @__fnacc_release_all()
 
@@ -21,19 +21,19 @@ end subroutine
 
 ! HOST: fir.box_addr
 ! HOST: fir.convert
-! HOST: call @__fnacc_update_host
+! HOST: call @__fnacc_update_host_desc(
 
 ! HOST: fir.box_addr
 ! HOST: fir.convert
-! HOST: call @__fnacc_update_device
+! HOST: call @__fnacc_update_device_desc(
 
 ! HOST: fir.box_addr
 ! HOST: fir.convert
-! HOST: call @__fnacc_release
+! HOST: call @__fnacc_release_desc(
 
 ! HOST: fir.box_addr
 ! HOST: fir.convert
-! HOST: call @__fnacc_release
+! HOST: call @__fnacc_release_desc(
 
 ! HOST: call @__fnacc_release_all
 

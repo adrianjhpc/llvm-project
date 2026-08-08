@@ -39,7 +39,12 @@ struct ElementwiseExtentSource {
   unsigned dim = 0;
 };
 
-enum class ElementwiseKernelKind { BinaryArrayArray, Saxpy1D, Expr1D };
+enum class ElementwiseKernelKind {
+  BinaryArrayArray,
+  Saxpy1D,
+  Expr1D,
+  MatMul2D
+};
 
 enum class ElementwiseExprKind {
   ArrayLoad,
@@ -73,6 +78,23 @@ struct ElementwiseKernel {
   fir::DoLoopOp outerLoop;
   fir::DoLoopOp innerLoop;
 
+  // For matrix multiplication:
+  //
+  //   do j = ...
+  //     do i = ...
+  //       acc = 0
+  //       do p = ...
+  //         acc = acc + a(i,p) * b(p,j)
+  //       end do
+  //       c(i,j) = acc
+  //     end do
+  //   end do
+  //
+  // outerLoop    = j loop
+  // innerLoop    = i loop
+  // reductionLoop = p loop
+  fir::DoLoopOp reductionLoop;
+
   // Runtime extent sources.
   //
   // For 1-D:
@@ -87,6 +109,9 @@ struct ElementwiseKernel {
 
   mlir::Value innerIndMemref;
   mlir::Value outerIndMemref;
+
+  mlir::Value reductionIndMemref;
+  mlir::Value accumulatorMemref;
 
   llvm::SmallVector<mlir::Value> readArrays;
   mlir::Value writeArray;

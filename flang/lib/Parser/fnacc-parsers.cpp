@@ -8,8 +8,8 @@
 
 namespace Fortran::parser {
 
-constexpr auto startfnaccLine =
-    skipStuffBeforeStatement >> ("!$FNACC "_sptok || "!DIR$ FNACC "_sptok);
+constexpr auto startfnaccLine = skipStuffBeforeStatement >>
+    ("!$FNACC "_sptok || "!@FNACC "_sptok || "!DIR$ FNACC "_sptok);
 
 constexpr auto endfnaccLine = space >> endOfLine;
 

@@ -412,13 +412,8 @@ static bool detectGenericExpr1D(ElementwiseKernel &k,
   if (!expr)
     return false;
 
-  if (k.readArrays.empty()) {
-    reason = "expression tree contains no array loads";
-    return false;
-  }
-
-  if (k.readArrays.size() > 2) {
-    reason = "expression tree currently supports at most two read arrays";
+  if (k.readArrays.size() != 2) {
+    reason = "expression tree currently requires exactly two read arrays";
     return false;
   }
 
@@ -650,18 +645,21 @@ static bool collectArrayAccesses1D(ElementwiseKernel &k, fir::DoLoopOp loop,
     return true;
   }
 
-  // New generic 1-D expression tree.
+  // Generic 1-D expression tree.
   //
-  // This supports forms such as:
+  // For now this generic expression path still requires exactly two read
+  // arrays, for example:
   //
   //   c(i) = alpha * a(i) + beta * b(i)
   //   c(i) = (a(i) + b(i)) * alpha
-  //   c(i) = a(i) + 1.0
+  //
+  // One-read expressions such as c(i) = a(i) + 1.0 require a future ABI update.
   std::string exprReason;
   if (detectGenericExpr1D(k, info, exprReason))
     return true;
 
   reason = "unsupported 1-D elementwise expression; binary failure: ";
+
   reason += binaryReason;
   reason += "; SAXPY failure: ";
   reason += saxpyReason;
@@ -675,73 +673,21 @@ static bool collectArrayAccesses2D(ElementwiseKernel &k,
                                    fir::DoLoopOp innerLoop,
                                    Value innerIndMemref, Value outerIndMemref,
                                    std::string &reason) {
-  Value writeStoredValue;
+  ArrayAccessInfo info;
 
-  Block *body = innerLoop.getBody();
-  if (!body) {
-    reason = "inner loop has no body";
+  llvm::SmallVector<Value> indexMemrefs;
+  indexMemrefs.push_back(innerIndMemref);
+  indexMemrefs.push_back(outerIndMemref);
+
+  if (!collectArrayAccessesFromBody(innerLoop.getBody(), 2, indexMemrefs, info,
+                                    reason))
     return false;
-  }
 
-  for (Operation &op : body->getOperations()) {
-    auto ac = dyn_cast<fir::ArrayCoorOp>(op);
-    if (!ac)
-      continue;
-
-    auto indices = ac.getIndices();
-    if (indices.size() != 2) {
-      reason = "2-D kernel expected array_coor with exactly two indices";
-      return false;
-    }
-
-    // FIR for a(i,j) is array_coor %array %i, %j.
-    if (!indexIsLoadOf(indices[0], innerIndMemref)) {
-      reason = "first 2-D array index is not the inner loop induction variable";
-      return false;
-    }
-
-    if (!indexIsLoadOf(indices[1], outerIndMemref)) {
-      reason =
-          "second 2-D array index is not the outer loop induction variable";
-      return false;
-    }
-
-    Value base = ac.getMemref();
-
-    for (Operation *user : ac.getResult().getUsers()) {
-      if (isa<fir::LoadOp>(user)) {
-        k.readArrays.push_back(base);
-      } else if (auto st = dyn_cast<fir::StoreOp>(user)) {
-        if (k.writeArray) {
-          reason = "kernel has more than one write array";
-          return false;
-        }
-
-        k.writeArray = base;
-        writeStoredValue = st.getValue();
-      } else {
-        reason = "array_coor result has unsupported user";
-        return false;
-      }
-    }
-  }
-
-  if (!k.writeArray) {
-    reason = "kernel has no write array";
+  if (!detectDirectBinaryArrayArray(k, info, reason))
     return false;
-  }
 
-  if (k.readArrays.size() != 2) {
-    reason = "kernel expected exactly two read arrays";
-    return false;
-  }
-
-  k.computeOp = writeStoredValue.getDefiningOp();
-
-  if (!isSupportedElementwiseCompute(k.computeOp)) {
-    reason = "stored value is not a supported binary floating-point op";
-    return false;
-  }
+  k.rank = 2;
+  k.scalarRefs.clear();
 
   if (!allArraysAreF32(k)) {
     reason = "only f32 arrays are currently supported";
@@ -749,6 +695,349 @@ static bool collectArrayAccesses2D(ElementwiseKernel &k,
   }
 
   return true;
+}
+
+static bool isF32Ref(Value v) {
+  auto refTy = dyn_cast<fir::ReferenceType>(v.getType());
+  return refTy && refTy.getEleTy().isF32();
+}
+
+static bool isZeroF32(Value v) {
+  v = stripFirConvert(v);
+
+  auto cst = v.getDefiningOp<arith::ConstantOp>();
+  if (!cst)
+    return false;
+
+  auto floatAttr = dyn_cast<FloatAttr>(cst.getValue());
+  if (!floatAttr)
+    return false;
+
+  if (!floatAttr.getType().isF32())
+    return false;
+
+  return floatAttr.getValue().isZero();
+}
+
+static bool valueIsLoadOfMemref(Value v, Value memref) {
+  v = stripFirConvert(v);
+
+  auto load = v.getDefiningOp<fir::LoadOp>();
+  return load && load.getMemref() == memref;
+}
+
+static bool loadIsArrayAccess(Value v, Value expectedIndex0,
+                              Value expectedIndex1, Value &arrayBase) {
+  v = stripFirConvert(v);
+
+  auto load = v.getDefiningOp<fir::LoadOp>();
+  if (!load)
+    return false;
+
+  Value memref = load.getMemref();
+  auto ac = memref.getDefiningOp<fir::ArrayCoorOp>();
+  if (!ac)
+    return false;
+
+  auto indices = ac.getIndices();
+  if (indices.size() != 2)
+    return false;
+
+  if (!indexIsLoadOf(indices[0], expectedIndex0))
+    return false;
+
+  if (!indexIsLoadOf(indices[1], expectedIndex1))
+    return false;
+
+  arrayBase = ac.getMemref();
+  return true;
+}
+
+static bool findAccumulatorInit(fir::DoLoopOp iLoop, fir::DoLoopOp pLoop,
+                                Value &accMemref, std::string &reason) {
+  Block *body = iLoop.getBody();
+  if (!body) {
+    reason = "matmul i-loop has no body";
+    return false;
+  }
+
+  for (Operation &op : body->getOperations()) {
+    if (&op == pLoop.getOperation())
+      break;
+
+    auto st = dyn_cast<fir::StoreOp>(op);
+    if (!st)
+      continue;
+
+    if (!isZeroF32(st.getValue()))
+      continue;
+
+    if (!isF32Ref(st.getMemref()))
+      continue;
+
+    accMemref = st.getMemref();
+    return true;
+  }
+
+  reason =
+      "matmul did not find accumulator initialisation before reduction loop";
+  return false;
+}
+
+static bool findMatmulReductionBody(fir::DoLoopOp pLoop, Value accMemref,
+                                    Value iMemref, Value jMemref, Value pMemref,
+                                    Value &aArray, Value &bArray,
+                                    Operation *&computeOp,
+                                    std::string &reason) {
+  Block *body = pLoop.getBody();
+  if (!body) {
+    reason = "matmul reduction loop has no body";
+    return false;
+  }
+
+  for (Operation &op : body->getOperations()) {
+    auto st = dyn_cast<fir::StoreOp>(op);
+    if (!st)
+      continue;
+
+    if (st.getMemref() != accMemref)
+      continue;
+
+    Value stored = stripFirConvert(st.getValue());
+    auto add = stored.getDefiningOp<arith::AddFOp>();
+    if (!add) {
+      reason = "matmul accumulator store is not arith.addf";
+      return false;
+    }
+
+    Value lhs = stripFirConvert(add.getLhs());
+    Value rhs = stripFirConvert(add.getRhs());
+
+    Value oldAcc;
+    Value maybeMul;
+
+    if (valueIsLoadOfMemref(lhs, accMemref)) {
+      oldAcc = lhs;
+      maybeMul = rhs;
+    } else if (valueIsLoadOfMemref(rhs, accMemref)) {
+      oldAcc = rhs;
+      maybeMul = lhs;
+    } else {
+      reason = "matmul add does not include previous accumulator value";
+      return false;
+    }
+
+    auto mul = maybeMul.getDefiningOp<arith::MulFOp>();
+    if (!mul) {
+      reason = "matmul accumulator update does not multiply two array loads";
+      return false;
+    }
+
+    Value mulLhs = stripFirConvert(mul.getLhs());
+    Value mulRhs = stripFirConvert(mul.getRhs());
+
+    Value lhsArray;
+    Value rhsArray;
+
+    bool lhsIsA = loadIsArrayAccess(mulLhs, iMemref, pMemref, lhsArray);
+    bool rhsIsB = loadIsArrayAccess(mulRhs, pMemref, jMemref, rhsArray);
+
+    if (lhsIsA && rhsIsB) {
+      aArray = lhsArray;
+      bArray = rhsArray;
+      computeOp = mul.getOperation();
+      return true;
+    }
+
+    bool rhsIsA = loadIsArrayAccess(mulRhs, iMemref, pMemref, rhsArray);
+    bool lhsIsB = loadIsArrayAccess(mulLhs, pMemref, jMemref, lhsArray);
+
+    if (rhsIsA && lhsIsB) {
+      aArray = rhsArray;
+      bArray = lhsArray;
+      computeOp = mul.getOperation();
+      return true;
+    }
+
+    reason = "matmul multiply operands are not A(i,p) and B(p,j)";
+    return false;
+  }
+
+  reason = "matmul reduction loop did not store updated accumulator";
+  return false;
+}
+
+static bool findMatmulFinalStore(fir::DoLoopOp iLoop, fir::DoLoopOp pLoop,
+                                 Value accMemref, Value iMemref, Value jMemref,
+                                 Value &cArray, std::string &reason) {
+  Block *body = iLoop.getBody();
+  if (!body) {
+    reason = "matmul i-loop has no body";
+    return false;
+  }
+
+  bool afterReduction = false;
+
+  for (Operation &op : body->getOperations()) {
+    if (&op == pLoop.getOperation()) {
+      afterReduction = true;
+      continue;
+    }
+
+    if (!afterReduction)
+      continue;
+
+    auto st = dyn_cast<fir::StoreOp>(op);
+    if (!st)
+      continue;
+
+    if (!valueIsLoadOfMemref(st.getValue(), accMemref)) {
+      continue;
+    }
+
+    auto ac = st.getMemref().getDefiningOp<fir::ArrayCoorOp>();
+    if (!ac)
+      continue;
+
+    auto indices = ac.getIndices();
+    if (indices.size() != 2)
+      continue;
+
+    if (!indexIsLoadOf(indices[0], iMemref))
+      continue;
+
+    if (!indexIsLoadOf(indices[1], jMemref))
+      continue;
+
+    cArray = ac.getMemref();
+    return true;
+  }
+
+  reason = "matmul did not find final C(i,j) = acc store";
+  return false;
+}
+
+static ElementwiseRecognitionResult
+recognizeMatMul2D(fir::fnacc::LaunchOp launchOp) {
+  Region &region = launchOp.getRegion();
+  if (region.empty())
+    return fail(launchOp, "launch region is empty");
+
+  Block &launchBlock = region.front();
+
+  fir::DoLoopOp jLoop;
+  for (Operation &op : launchBlock) {
+    if (auto loop = dyn_cast<fir::DoLoopOp>(op)) {
+      if (jLoop)
+        return fail(&op, "matmul expected exactly one outer j loop");
+      jLoop = loop;
+    }
+  }
+
+  if (!jLoop)
+    return fail(launchOp, "matmul found no outer j loop");
+
+  Block *jBody = jLoop.getBody();
+  if (!jBody)
+    return fail(jLoop.getOperation(), "matmul j loop has no body");
+
+  fir::DoLoopOp iLoop;
+  for (Operation &op : jBody->getOperations()) {
+    if (auto loop = dyn_cast<fir::DoLoopOp>(op)) {
+      if (iLoop)
+        return fail(&op, "matmul expected exactly one i loop inside j loop");
+      iLoop = loop;
+    }
+  }
+
+  if (!iLoop)
+    return fail(jLoop.getOperation(), "matmul found no i loop");
+
+  Block *iBody = iLoop.getBody();
+  if (!iBody)
+    return fail(iLoop.getOperation(), "matmul i loop has no body");
+
+  fir::DoLoopOp pLoop;
+  for (Operation &op : iBody->getOperations()) {
+    if (auto loop = dyn_cast<fir::DoLoopOp>(op)) {
+      if (pLoop)
+        return fail(&op, "matmul expected exactly one reduction p loop");
+      pLoop = loop;
+    }
+  }
+
+  if (!pLoop)
+    return fail(iLoop.getOperation(), "matmul found no reduction p loop");
+
+  std::string loopReason;
+  if (!verifyLoopLowerBoundAndStep(jLoop, "matmul j", loopReason))
+    return fail(jLoop.getOperation(), loopReason);
+
+  if (!verifyLoopLowerBoundAndStep(iLoop, "matmul i", loopReason))
+    return fail(iLoop.getOperation(), loopReason);
+
+  if (!verifyLoopLowerBoundAndStep(pLoop, "matmul p", loopReason))
+    return fail(pLoop.getOperation(), loopReason);
+
+  Value jMemref = findInductionMemref(jLoop);
+  Value iMemref = findInductionMemref(iLoop);
+  Value pMemref = findInductionMemref(pLoop);
+
+  if (!jMemref)
+    return fail(jLoop.getOperation(), "could not find j induction variable");
+
+  if (!iMemref)
+    return fail(iLoop.getOperation(), "could not find i induction variable");
+
+  if (!pMemref)
+    return fail(pLoop.getOperation(), "could not find p induction variable");
+
+  Value accMemref;
+  std::string reason;
+
+  if (!findAccumulatorInit(iLoop, pLoop, accMemref, reason))
+    return fail(iLoop.getOperation(), reason);
+
+  Value aArray;
+  Value bArray;
+  Operation *computeOp = nullptr;
+
+  if (!findMatmulReductionBody(pLoop, accMemref, iMemref, jMemref, pMemref,
+                               aArray, bArray, computeOp, reason))
+    return fail(pLoop.getOperation(), reason);
+
+  Value cArray;
+
+  if (!findMatmulFinalStore(iLoop, pLoop, accMemref, iMemref, jMemref, cArray,
+                            reason))
+    return fail(iLoop.getOperation(), reason);
+
+  ElementwiseKernel k;
+  k.kind = ElementwiseKernelKind::MatMul2D;
+  k.rank = 2;
+
+  k.outerLoop = jLoop;
+  k.innerLoop = iLoop;
+  k.reductionLoop = pLoop;
+
+  k.outerIndMemref = jMemref;
+  k.innerIndMemref = iMemref;
+  k.reductionIndMemref = pMemref;
+  k.accumulatorMemref = accMemref;
+
+  k.extentY = getLoopExtentSource(jLoop); // m
+  k.extentX = getLoopExtentSource(iLoop); // n
+  k.extentZ = getLoopExtentSource(pLoop); // k
+
+  k.readArrays.push_back(aArray);
+  k.readArrays.push_back(bArray);
+  k.writeArray = cArray;
+  k.computeOp = computeOp;
+
+  if (!allArraysAreF32(k))
+    return fail(launchOp, "matmul currently supports only f32 arrays");
+
+  return ElementwiseRecognitionResult::success(std::move(k));
 }
 
 static ElementwiseRecognitionResult recognize1D(fir::fnacc::LaunchOp launchOp) {
@@ -884,6 +1173,11 @@ bool isSupportedElementwiseCompute(Operation *op) {
 
 ElementwiseRecognitionResult
 recognizeElementwiseKernel(fir::fnacc::LaunchOp launchOp) {
+  // Try matmul first because it is also a 2-D nest.
+  auto rMatmul = recognizeMatMul2D(launchOp);
+  if (rMatmul.succeeded())
+    return rMatmul;
+
   // Try 2-D first because a 2-D launch also has one top-level loop.
   auto r2 = recognize2D(launchOp);
   if (r2.succeeded())
@@ -894,6 +1188,8 @@ recognizeElementwiseKernel(fir::fnacc::LaunchOp launchOp) {
     return r1;
 
   std::string reason = "not a supported 1-D or 2-D elementwise kernel; ";
+  reason += "matmul failure: ";
+  reason += rMatmul.getFailure().reason;
   reason += "2-D failure: ";
   reason += r2.getFailure().reason;
   reason += "; 1-D failure: ";

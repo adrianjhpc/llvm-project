@@ -1,9 +1,12 @@
+#include "flang/Optimizer/Dialect/FIROps.h"
 #include "flang/Optimizer/Dialect/FNACC/FNACCDialect.h"
 #include "flang/Optimizer/Dialect/FNACC/FNACCPasses.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/IRMapping.h"
 #include "mlir/Transforms/RegionUtils.h"
+#include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/SetVector.h"
 
 namespace fir::fnacc {
 #define GEN_PASS_DEF_FNACCOUTLINEKERNELS
@@ -57,11 +60,19 @@ private:
     auto kernelFunc =
         builder.create<func::FuncOp>(loc, StringRef(kernelName), funcType);
     kernelFunc.setPrivate();
-    symbolTable.insert(kernelFunc);
 
     // 3. Move the region body into the new function
     Region &kernelRegion = kernelFunc.getBody();
     kernelRegion.takeBody(launchOp.getRegion());
+
+    // The launch region was terminated with fir.end. A func.func body must
+    // terminate with func.return, so rewrite any fir.end terminators.
+    for (auto endOp :
+         llvm::make_early_inc_range(kernelFunc.getOps<fir::FirEndOp>())) {
+      builder.setInsertionPoint(endOp);
+      func::ReturnOp::create(builder, endOp.getLoc());
+      endOp.erase();
+    }
 
     // 4. Map captured values to new block arguments
     Block &entryBlock = kernelRegion.front();

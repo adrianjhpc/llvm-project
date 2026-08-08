@@ -52,10 +52,10 @@ constexpr auto executableConstruct{first(
     construct<ExecutableConstruct>(indirect(openmpMisplacedEndDirective)),
     construct<ExecutableConstruct>(indirect(openmpInvalidDirective)),
     construct<ExecutableConstruct>(indirect(Parser<OpenACCConstruct>{})),
-    construct<ExecutableConstruct>(indirect(compilerDirective)),
     construct<ExecutableConstruct>(indirect(Parser<FnACCConstruct>{})),
     construct<ExecutableConstruct>(
         indirect(Parser<FnACCStandaloneConstruct>{})),
+    construct<ExecutableConstruct>(indirect(compilerDirective)),
     construct<ExecutableConstruct>(indirect(Parser<CUFKernelDoConstruct>{})))};
 
 // R510 execution-part-construct ->
@@ -102,7 +102,8 @@ TYPE_CONTEXT_PARSER("execution part"_en_US,
 //        nullify-stmt | open-stmt | pointer-assignment-stmt | print-stmt |
 //        read-stmt | return-stmt | rewind-stmt | stop-stmt | sync-all-stmt |
 //        sync-images-stmt | sync-memory-stmt | sync-team-stmt | unlock-stmt |
-//        wait-stmt | where-stmt | write-stmt | computed-goto-stmt | forall-stmt
+//        wait-stmt | where-stmt | write-stmt | computed-goto-stmt |
+//        forall-stmt
 // R1159 continue-stmt -> CONTINUE
 // R1163 fail-image-stmt -> FAIL IMAGE
 TYPE_PARSER(first(construct<ActionStmt>(indirect(Parser<AllocateStmt>{})),
@@ -185,11 +186,12 @@ TYPE_PARSER(construct<BlockStmt>(maybe(name / ":") / "BLOCK"))
 //         [[declaration-construct]... specification-construct]
 // C1107 prohibits COMMON, EQUIVALENCE, INTENT, NAMELIST, OPTIONAL, VALUE,
 // and statement function definitions.  C1108 prohibits SAVE /common/.
-// C1570 indirectly prohibits ENTRY.  These constraints are best enforced later.
-// The odd grammar rule above would have the effect of forcing any
+// C1570 indirectly prohibits ENTRY.  These constraints are best enforced
+// later. The odd grammar rule above would have the effect of forcing any
 // trailing FORMAT and DATA statements after the last specification-construct
 // to be recognized as part of the block-construct's block part rather than
-// its block-specification-part, a distinction without any apparent difference.
+// its block-specification-part, a distinction without any apparent
+// difference.
 TYPE_PARSER(construct<BlockSpecificationPart>(specificationPart))
 
 // R1110 end-block-stmt -> END BLOCK [block-construct-name]
@@ -252,7 +254,8 @@ TYPE_PARSER(parenthesized(construct<ConcurrentHeader>(
     maybe("," >> scalarLogicalExpr))))
 
 // R1126 concurrent-control ->
-//         index-name = concurrent-limit : concurrent-limit [: concurrent-step]
+//         index-name = concurrent-limit : concurrent-limit [:
+//         concurrent-step]
 // R1127 concurrent-limit -> scalar-int-expr
 // R1128 concurrent-step -> scalar-int-expr
 TYPE_PARSER(construct<ConcurrentControl>(name / "=", scalarIntExpr / ":",

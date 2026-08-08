@@ -8,9 +8,9 @@ find_library(CUDA_DRIVER_LIBRARY cuda
 
 if(NOT CUDA_DRIVER_INCLUDE_DIR OR NOT CUDA_DRIVER_LIBRARY)
   message(FATAL_ERROR
-    "FLANG_FNACC is ON, but the CUDA driver "
+    "FLANG_FNACC_RUNTIME is ON, but the CUDA driver "
     "headers/library were not found. Set CUDA_DRIVER_INCLUDE_DIR and "
-    "CUDA_DRIVER_LIBRARY, or disable FLANG_FNACC.")
+    "CUDA_DRIVER_LIBRARY, or disable FLANG_FNACC_RUNTIME.")
 endif()
 
 add_flang_library(FortranFNACCRuntime
