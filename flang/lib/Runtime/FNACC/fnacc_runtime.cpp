@@ -6,6 +6,7 @@
 #include <cstring>
 
 #include <fstream>
+#include <limits>
 #include <sstream>
 #include <string>
 #include <unordered_map>
@@ -34,7 +35,7 @@ static void fnaccCudaCheck(
 #define FNACC_CUDA_CHECK(expr) \
   do { \
     fnaccCudaCheck((expr), #expr, __FILE__, __LINE__); \
-  } while (false);
+  } while (false)
 
 static constexpr const char *FNACC_RUNTIME_BUILD_ID =
     "FNACC_RUNTIME_BUILD_ID_matmul_cdiv_grid_v2";
@@ -48,6 +49,53 @@ static std::size_t fnaccCheckedMul(
   }
 
   return a * b;
+}
+
+static void fnaccConfigureDynamicSharedMemory(
+    CUfunction fn, int32_t kernelId, unsigned dynamicSharedBytes) {
+  if (dynamicSharedBytes == 0)
+    return;
+
+  // 48 KiB is usually available without opt-in on many NVIDIA GPUs.
+  // Above that, opt in if the device/function supports it.
+  if (dynamicSharedBytes > 49152) {
+    CUresult result =
+        cuFuncSetAttribute(fn, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+            static_cast<int>(dynamicSharedBytes));
+
+    if (result != CUDA_SUCCESS) {
+      const char *name = nullptr;
+      const char *desc = nullptr;
+      cuGetErrorName(result, &name);
+      cuGetErrorString(result, &desc);
+
+      std::fprintf(stderr,
+          "FNACC error: could not set dynamic shared memory size for kernel "
+          "id %d to %u bytes: %s: %s\n",
+          kernelId, dynamicSharedBytes, name ? name : "<unknown>",
+          desc ? desc : "<no description>");
+      std::abort();
+    }
+  }
+}
+
+static unsigned fnaccGetEnvUnsignedOrDefault(
+    const char *name, unsigned fallback) {
+  const char *value = std::getenv(name);
+  if (!value || value[0] == '\0')
+    return fallback;
+
+  char *end = nullptr;
+  unsigned long parsed = std::strtoul(value, &end, 10);
+
+  if (end == value || *end != '\0' || parsed == 0 ||
+      parsed >
+          static_cast<unsigned long>(std::numeric_limits<unsigned>::max())) {
+    std::fprintf(stderr, "FNACC error: invalid %s value '%s'\n", name, value);
+    std::abort();
+  }
+
+  return static_cast<unsigned>(parsed);
 }
 
 static std::size_t fnaccCheckedBytes2D(
@@ -389,9 +437,13 @@ static std::vector<FNACCPackEntry> jsonParsePackEntries(
 
 static std::size_t findEnclosingObjectStart(
     const std::string &json, std::size_t pos) {
-  while (pos > 0) {
+  while (true) {
     if (json[pos] == '{')
       return pos;
+
+    if (pos == 0)
+      break;
+
     --pos;
   }
 
@@ -527,6 +579,65 @@ static bool fnaccHasEmbeddedPtx() {
 
 static bool fnaccHasEmbeddedJson() {
   return fnaccEmbeddedJsonData && fnaccEmbeddedJsonSize > 0;
+}
+
+static unsigned fnaccMatmulDynamicSharedBytes(const FNACCKernelDesc *desc,
+    int32_t blockX, int32_t blockY, int32_t blockK) {
+  // Explicit override for experiments/debugging.
+  //
+  // Example:
+  //   FNACC_MATMUL_SHARED_BYTES=49152
+  if (const char *value = std::getenv("FNACC_MATMUL_SHARED_BYTES")) {
+    if (value[0] != '\0')
+      return fnaccGetEnvUnsignedOrDefault("FNACC_MATMUL_SHARED_BYTES", 49152);
+  }
+
+  int32_t stages = 1;
+  if (desc && desc->numStages > 0)
+    stages = desc->numStages;
+
+  // Conservative estimate for A and B staged tiles:
+  //
+  //   A tile: blockX x blockK
+  //   B tile: blockK x blockY
+  //
+  // For tile=(16,16,32):
+  //   one stage = (16*32 + 32*16) * 4 = 4096 bytes
+  //   three stages = 12288 bytes
+  //
+  // In practice Triton lowering may require padding/alignment, so keep a
+  // conservative minimum.
+  std::size_t aElems = fnaccCheckedMul(static_cast<std::size_t>(blockX),
+      static_cast<std::size_t>(blockK),
+      "matmul dynamic shared A tile elements");
+  std::size_t bElems = fnaccCheckedMul(static_cast<std::size_t>(blockK),
+      static_cast<std::size_t>(blockY),
+      "matmul dynamic shared B tile elements");
+
+  std::size_t elems =
+      fnaccCheckedMul(aElems + bElems, static_cast<std::size_t>(stages),
+          "matmul dynamic shared staged tile elements");
+
+  std::size_t bytes =
+      fnaccCheckedMul(elems, sizeof(float), "matmul dynamic shared bytes");
+
+  // Align to 256 bytes.
+  bytes = (bytes + 255) & ~static_cast<std::size_t>(255);
+
+  // Conservative prototype minimum. This should cover the current 16x16x32
+  // matmul tile and common Triton padding.
+  if (bytes < 16384)
+    bytes = 16384;
+
+  if (bytes > static_cast<std::size_t>(std::numeric_limits<unsigned>::max())) {
+    std::fprintf(stderr,
+        "FNACC error: matmul dynamic shared memory requirement too large: "
+        "%zu bytes\n",
+        bytes);
+    std::abort();
+  }
+
+  return static_cast<unsigned>(bytes);
 }
 
 static std::string fnaccReadTextFile(const char *path) {
@@ -686,6 +797,8 @@ static void fnaccCleanup() {
   }
 
   fnaccRegistry.deviceCache.clear();
+  fnaccRegistry.functionCache.clear();
+  fnaccRegistry.kernels.clear();
 
   if (fnaccRegistry.module) {
     cuModuleUnload(fnaccRegistry.module);
@@ -714,15 +827,15 @@ static void fnaccEnsureInitialized() {
   FNACC_CUDA_CHECK(cuInit(0));
 
   int ordinal = fnaccGetCudaDeviceOrdinal();
-  CUdevice device = 0;
-  FNACC_CUDA_CHECK(cuDeviceGet(&device, ordinal));
-  FNACC_CUDA_CHECK(
-      cuDevicePrimaryCtxRetain(&fnaccRegistry.context, fnaccRegistry.device));
+
+  FNACC_CUDA_CHECK(cuDeviceGet(&fnaccRegistry.device, ordinal));
 
   if (fnaccDebugEnabled())
     std::fprintf(stderr, "FNACC: using CUDA device ordinal %d\n", ordinal);
 
-  FNACC_CUDA_CHECK(cuDevicePrimaryCtxRetain(&fnaccRegistry.context, device));
+  FNACC_CUDA_CHECK(
+      cuDevicePrimaryCtxRetain(&fnaccRegistry.context, fnaccRegistry.device));
+
   FNACC_CUDA_CHECK(cuCtxSetCurrent(fnaccRegistry.context));
 
   FNACC_CUDA_CHECK(cuModuleLoadDataEx(
@@ -1194,7 +1307,8 @@ static std::size_t fnaccBytesFromDescriptor(int64_t elementBytes, int32_t rank,
   std::size_t elements =
       fnaccElementCountFromExtents(rank, extent0, extent1, extent2);
 
-  return elements * static_cast<std::size_t>(elementBytes);
+  return fnaccCheckedMul(
+      elements, static_cast<std::size_t>(elementBytes), "descriptor bytes");
 }
 
 static FNACCDeviceAllocation &fnaccGetOrCreateCachedAllocation(void *hostPtr,
@@ -1812,15 +1926,15 @@ extern "C" void __fnacc_launch_f32_v1(int32_t kernelId, int32_t rank,
 
   if (!desc) {
     std::fprintf(stderr,
-        "FNACC error: no JSON descriptor for matmul kernel id %d\n", kernelId);
+        "FNACC error: no JSON descriptor for generic f32 kernel id %d\n",
+        kernelId);
     std::abort();
   }
 
-  if (desc->kind != "matmul2d") {
+  if (desc->kind == "matmul2d") {
     std::fprintf(stderr,
-        "FNACC error: runtime matmul launcher called for kernel id %d "
-        "but JSON kind is '%s'\n",
-        kernelId, desc->kind.c_str());
+        "FNACC error: generic f32 launcher called for matmul kernel id %d\n",
+        kernelId);
     std::abort();
   }
 
@@ -1958,6 +2072,8 @@ extern "C" void __fnacc_launch_matmul_f32_v1(int32_t kernelId, int32_t blockX,
     int32_t m, int32_t k) {
   fnaccEnsureCurrentContext();
 
+  fnaccValidateHostLaunchAgainstDesc(kernelId, 2, blockX, blockY, blockK);
+
   if (!a || !b || !c) {
     std::fprintf(stderr,
         "FNACC error: null host pointer in __fnacc_launch_matmul_f32_v1: "
@@ -1998,6 +2114,25 @@ extern "C" void __fnacc_launch_matmul_f32_v1(int32_t kernelId, int32_t blockX,
 
   unsigned cudaBlockX = fnaccCudaThreadsPerCTA(kernelId);
 
+  const FNACCKernelDesc *desc = fnaccLookupKernelDesc(kernelId);
+
+  if (!desc) {
+    std::fprintf(stderr,
+        "FNACC error: no JSON descriptor for matmul kernel id %d\n", kernelId);
+    std::abort();
+  }
+
+  if (desc->kind != "matmul2d") {
+    std::fprintf(stderr,
+        "FNACC error: matmul launcher called for kernel id %d "
+        "but JSON kind is '%s'\n",
+        kernelId, desc->kind.c_str());
+    std::abort();
+  }
+
+  unsigned dynamicSharedBytes =
+      fnaccMatmulDynamicSharedBytes(desc, blockX, blockY, blockK);
+
   std::size_t bytesA =
       fnaccCheckedBytes2D(n, k, sizeof(float), "matmul A bytes");
   std::size_t bytesB =
@@ -2005,7 +2140,13 @@ extern "C" void __fnacc_launch_matmul_f32_v1(int32_t kernelId, int32_t blockX,
   std::size_t bytesC =
       fnaccCheckedBytes2D(n, m, sizeof(float), "matmul C bytes");
 
-  const FNACCKernelDesc *desc = fnaccLookupKernelDesc(kernelId);
+  if (desc->kind != "matmul2d") {
+    std::fprintf(stderr,
+        "FNACC error: matmul launcher called for kernel id %d "
+        "but JSON kind is '%s'\n",
+        kernelId, desc->kind.c_str());
+    std::abort();
+  }
 
   int32_t aTarget = fnaccPackTargetForSlot(desc, 0);
   int32_t bTarget = fnaccPackTargetForSlot(desc, 1);
@@ -2022,10 +2163,6 @@ extern "C" void __fnacc_launch_matmul_f32_v1(int32_t kernelId, int32_t blockX,
   fnaccValidateSupportedHiddenPtrArgCount(kernelId);
   FNACCHiddenTritonArgs hidden;
 
-  // Must match TTIR/PTX signature:
-  //
-  //   %a, %b, %c, %n, %m, %k, hidden0, hidden1
-  //
   void *args[] = {
       &dA,
       &dB,
@@ -2041,12 +2178,14 @@ extern "C" void __fnacc_launch_matmul_f32_v1(int32_t kernelId, int32_t blockX,
     std::fprintf(stderr,
         "FNACC: launch matmul kernel id=%d "
         "grid=(%u,%u,%u) grid_policy=cdiv tile=(%d,%d,%d) "
-        "cuda_block=(%u,1,1) n=%d m=%d k=%d "
+        "cuda_block=(%u,1,1) dynamic_shared_bytes=%u "
+        "n=%d m=%d k=%d "
         "bytesA=%zu bytesB=%zu bytesC=%zu "
         "targets=(%s,%s,%s)\n",
-        kernelId, gridX, gridY, gridZ, blockX, blockY, blockK, cudaBlockX, n, m,
-        k, bytesA, bytesB, bytesC, fnaccPackTargetName(aTarget),
-        fnaccPackTargetName(bTarget), fnaccPackTargetName(cTarget));
+        kernelId, gridX, gridY, gridZ, blockX, blockY, blockK, cudaBlockX,
+        dynamicSharedBytes, n, m, k, bytesA, bytesB, bytesC,
+        fnaccPackTargetName(aTarget), fnaccPackTargetName(bTarget),
+        fnaccPackTargetName(cTarget));
 
     std::fprintf(stderr,
         "FNACC: matmul args: "
@@ -2062,31 +2201,10 @@ extern "C" void __fnacc_launch_matmul_f32_v1(int32_t kernelId, int32_t blockX,
   }
 
   fnaccValidateCudaBlockSize(fn, kernelId, cudaBlockX);
+  fnaccConfigureDynamicSharedMemory(fn, kernelId, dynamicSharedBytes);
 
-  FNACC_CUDA_CHECK(cuLaunchKernel(
-      fn, gridX, gridY, gridZ, cudaBlockX, 1, 1, 0, nullptr, args, nullptr));
-
-  FNACC_CUDA_CHECK(cuCtxSynchronize());
-
-  if (cDev.target == FNACC_PACK_TARGET_HOST) {
-    fnaccCopyBackWriteArray(c, cDev, bytesC);
-  } else {
-    if (fnaccDebugEnabled()) {
-      std::fprintf(stderr,
-          "FNACC: skipped automatic copy-back for matmul write slot %d "
-          "because target=device; use !$fnacc update host(...) to copy back\n",
-          cDev.slot);
-    }
-  }
-
-  fnaccReleaseDeviceArg(aDev);
-  fnaccReleaseDeviceArg(bDev);
-  fnaccReleaseDeviceArg(cDev);
-
-  fnaccValidateCudaBlockSize(fn, kernelId, cudaBlockX);
-
-  FNACC_CUDA_CHECK(cuLaunchKernel(
-      fn, gridX, gridY, gridZ, cudaBlockX, 1, 1, 0, nullptr, args, nullptr));
+  FNACC_CUDA_CHECK(cuLaunchKernel(fn, gridX, gridY, gridZ, cudaBlockX, 1, 1,
+      dynamicSharedBytes, nullptr, args, nullptr));
 
   FNACC_CUDA_CHECK(cuCtxSynchronize());
 

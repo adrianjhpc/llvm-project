@@ -877,18 +877,46 @@ struct FNACCLowerToTritonPass
     // simple elementwise kernels are forced to one warp until the Triton
     // lowering pipeline is made version-robust for multi-warp elementwise
     // kernels.
-    bool hasElementwiseLaunch = false;
+    bool hasSimpleElementwiseLaunch = false;
+    bool hasMatmulLaunch = false;
+
     module.walk([&](fir::fnacc::LaunchOp launchOp) {
       auto result = fir::fnacc::recognizeElementwiseKernel(launchOp);
-      if (result.succeeded())
-        hasElementwiseLaunch = true;
+
+      if (result.failed())
+        return;
+
+      const fir::fnacc::ElementwiseKernel &k = result.getKernel();
+
+      switch (k.kind) {
+      case fir::fnacc::ElementwiseKernelKind::BinaryArrayArray:
+      case fir::fnacc::ElementwiseKernelKind::Saxpy1D:
+      case fir::fnacc::ElementwiseKernelKind::Expr1D:
+        hasSimpleElementwiseLaunch = true;
+        break;
+
+      case fir::fnacc::ElementwiseKernelKind::MatMul2D:
+        hasMatmulLaunch = true;
+        break;
+      }
     });
 
-    if (hasElementwiseLaunch && tritonNumWarps != 1) {
-      module.emitWarning()
-          << "FNACC simple elementwise kernels currently use the single-warp "
-             "Triton lowering path; using num-warps=1 instead of requested "
-          << tritonNumWarps;
+    if (hasSimpleElementwiseLaunch && tritonNumWarps != 1) {
+      if (hasMatmulLaunch) {
+        module.emitWarning()
+            << "FNACC module contains both simple elementwise and matmul "
+               "kernels. "
+               "TTIR currently has one module-wide num-warps setting, so "
+               "simple "
+               "elementwise lowering forces num-warps=1 for the whole module. "
+               "Consider compiling matmul kernels separately.";
+      } else {
+        module.emitWarning()
+            << "FNACC simple elementwise kernels currently use the single-warp "
+               "Triton lowering path; using num-warps=1 instead of requested "
+            << tritonNumWarps;
+      }
+
       tritonNumWarps = 1;
     }
 
