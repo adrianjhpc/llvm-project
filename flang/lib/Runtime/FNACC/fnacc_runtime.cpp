@@ -13,7 +13,88 @@
 
 namespace {
 
-static constexpr const char *FNACC_RUNTIME_BUILD_ID = "FNACC_RUNTIME_BUILD_ID_matmul_cdiv_grid_v2";
+static void fnaccCudaCheck(
+    CUresult result, const char *expr, const char *file, int line) {
+  if (result == CUDA_SUCCESS)
+    return;
+
+  const char *name = nullptr;
+  const char *desc = nullptr;
+
+  cuGetErrorName(result, &name);
+  cuGetErrorString(result, &desc);
+
+  std::fprintf(stderr,
+      "FNACC CUDA driver error at %s:%d while executing %s: %s: %s\n", file,
+      line, expr, name ? name : "<unknown>", desc ? desc : "<no description>");
+
+  std::abort();
+}
+
+#define FNACC_CUDA_CHECK(expr) \
+  do { \
+    fnaccCudaCheck((expr), #expr, __FILE__, __LINE__); \
+  } while (false);
+
+static constexpr const char *FNACC_RUNTIME_BUILD_ID =
+    "FNACC_RUNTIME_BUILD_ID_matmul_cdiv_grid_v2";
+
+static std::size_t fnaccCheckedMul(
+    std::size_t a, std::size_t b, const char *what) {
+  if (a != 0 && b > static_cast<std::size_t>(-1) / a) {
+    std::fprintf(
+        stderr, "FNACC error: size overflow while computing %s\n", what);
+    std::abort();
+  }
+
+  return a * b;
+}
+
+static std::size_t fnaccCheckedBytes2D(
+    int32_t dim0, int32_t dim1, std::size_t elemBytes, const char *what) {
+  if (dim0 < 0 || dim1 < 0) {
+    std::fprintf(stderr,
+        "FNACC error: negative dimension while computing %s: (%d,%d)\n", what,
+        dim0, dim1);
+    std::abort();
+  }
+
+  std::size_t elements = fnaccCheckedMul(
+      static_cast<std::size_t>(dim0), static_cast<std::size_t>(dim1), what);
+
+  return fnaccCheckedMul(elements, elemBytes, what);
+}
+
+static void fnaccValidateCudaBlockSize(
+    CUfunction fn, int32_t kernelId, unsigned cudaBlockX) {
+  int maxThreadsPerBlock = 0;
+  FNACC_CUDA_CHECK(cuFuncGetAttribute(
+      &maxThreadsPerBlock, CU_FUNC_ATTRIBUTE_MAX_THREADS_PER_BLOCK, fn));
+
+  if (cudaBlockX > static_cast<unsigned>(maxThreadsPerBlock)) {
+    std::fprintf(stderr,
+        "FNACC error: kernel id %d requested CUDA block size %u, "
+        "but function max_threads_per_block is %d\n",
+        kernelId, cudaBlockX, maxThreadsPerBlock);
+    std::abort();
+  }
+}
+
+static int fnaccGetCudaDeviceOrdinal() {
+  const char *value = std::getenv("FNACC_CUDA_DEVICE");
+  if (!value || value[0] == '\0')
+    return 0;
+
+  char *end = nullptr;
+  long parsed = std::strtol(value, &end, 10);
+  if (end == value || *end != '\0' || parsed < 0) {
+    std::fprintf(
+        stderr, "FNACC error: invalid FNACC_CUDA_DEVICE value '%s'\n", value);
+    std::abort();
+  }
+
+  return static_cast<int>(parsed);
+}
 
 // -------------------------------------------------------------------------- //
 // Tiny dependency-free JSON helpers
@@ -306,46 +387,58 @@ static std::vector<FNACCPackEntry> jsonParsePackEntries(
   return entries;
 }
 
-static std::size_t findKernelObjectEnd(
+static std::size_t findEnclosingObjectStart(
+    const std::string &json, std::size_t pos) {
+  while (pos > 0) {
+    if (json[pos] == '{')
+      return pos;
+    --pos;
+  }
+
+  return std::string::npos;
+}
+
+static std::size_t findJsonObjectEnd(
     const std::string &json, std::size_t objectStart) {
-  std::size_t nextKernelId = json.find("\n      \"id\"", objectStart + 1);
-  if (nextKernelId != std::string::npos)
-    return nextKernelId;
+  bool inString = false;
+  bool escaped = false;
+  int depth = 0;
 
-  std::size_t kernelsEnd = json.find("\n  ]", objectStart);
-  if (kernelsEnd != std::string::npos)
-    return kernelsEnd;
+  for (std::size_t i = objectStart; i < json.size(); ++i) {
+    char c = json[i];
 
-  return json.size();
+    if (escaped) {
+      escaped = false;
+      continue;
+    }
+
+    if (c == '\\' && inString) {
+      escaped = true;
+      continue;
+    }
+
+    if (c == '"') {
+      inString = !inString;
+      continue;
+    }
+
+    if (inString)
+      continue;
+
+    if (c == '{') {
+      ++depth;
+      continue;
+    }
+
+    if (c == '}') {
+      --depth;
+      if (depth == 0)
+        return i + 1;
+    }
+  }
+
+  return std::string::npos;
 }
-
-[[noreturn]] static void fnaccFatal(const char *message) {
-  std::fprintf(stderr, "FNACC error: %s\n", message);
-  std::abort();
-}
-
-static void fnaccCudaCheck(
-    CUresult result, const char *expr, const char *file, int line) {
-  if (result == CUDA_SUCCESS)
-    return;
-
-  const char *name = nullptr;
-  const char *desc = nullptr;
-
-  cuGetErrorName(result, &name);
-  cuGetErrorString(result, &desc);
-
-  std::fprintf(stderr,
-      "FNACC CUDA driver error at %s:%d while executing %s: %s: %s\n", file,
-      line, expr, name ? name : "<unknown>", desc ? desc : "<no description>");
-
-  std::abort();
-}
-
-#define FNACC_CUDA_CHECK(expr) \
-  do { \
-    fnaccCudaCheck((expr), #expr, __FILE__, __LINE__); \
-  } while (false)
 
 struct FNACCHiddenTritonArgs {
   // Triton/NVVM-generated PTX currently appends two hidden pointer parameters
@@ -397,6 +490,7 @@ struct FNACCDeviceAllocation {
 struct FNACCKernelRegistry {
   bool initialized = false;
 
+  CUdevice device = 0;
   CUcontext context = nullptr;
   CUmodule module = nullptr;
 
@@ -501,15 +595,6 @@ static std::string fnaccGetJsonText() {
   return fnaccReadTextFile(fallback);
 }
 
-static const char *fnaccGetEnvOrDefault(
-    const char *envName, const char *fallback) {
-  const char *value = std::getenv(envName);
-  if (value && value[0] != '\0')
-    return value;
-
-  return fallback;
-}
-
 static std::unordered_map<int32_t, FNACCKernelDesc>
 fnaccParseKernelDescsFromJson(const std::string &json) {
   std::unordered_map<int32_t, FNACCKernelDesc> result;
@@ -521,8 +606,19 @@ fnaccParseKernelDescsFromJson(const std::string &json) {
     if (idKey == std::string::npos)
       break;
 
-    std::size_t objectEnd = findKernelObjectEnd(json, idKey);
-    std::string objectText = json.substr(idKey, objectEnd - idKey);
+    std::size_t objectStart = findEnclosingObjectStart(json, idKey);
+    if (objectStart == std::string::npos) {
+      pos = idKey + 4;
+      continue;
+    }
+
+    std::size_t objectEnd = findJsonObjectEnd(json, objectStart);
+    if (objectEnd == std::string::npos) {
+      std::fprintf(stderr, "FNACC error: malformed kernel JSON object\n");
+      std::abort();
+    }
+
+    std::string objectText = json.substr(objectStart, objectEnd - objectStart);
 
     FNACCKernelDesc desc;
 
@@ -577,6 +673,33 @@ fnaccParseKernelDescsFromJson(const std::string &json) {
   return result;
 }
 
+static void fnaccCleanup() {
+  if (!fnaccRegistry.initialized)
+    return;
+
+  if (fnaccRegistry.context)
+    cuCtxSetCurrent(fnaccRegistry.context);
+
+  for (auto &entry : fnaccRegistry.deviceCache) {
+    if (entry.second.ptr)
+      cuMemFree(entry.second.ptr);
+  }
+
+  fnaccRegistry.deviceCache.clear();
+
+  if (fnaccRegistry.module) {
+    cuModuleUnload(fnaccRegistry.module);
+    fnaccRegistry.module = nullptr;
+  }
+
+  if (fnaccRegistry.context) {
+    cuDevicePrimaryCtxRelease(fnaccRegistry.device);
+    fnaccRegistry.context = nullptr;
+  }
+
+  fnaccRegistry.initialized = false;
+}
+
 static void fnaccEnsureInitialized() {
   if (fnaccRegistry.initialized)
     return;
@@ -590,8 +713,14 @@ static void fnaccEnsureInitialized() {
 
   FNACC_CUDA_CHECK(cuInit(0));
 
+  int ordinal = fnaccGetCudaDeviceOrdinal();
   CUdevice device = 0;
-  FNACC_CUDA_CHECK(cuDeviceGet(&device, 0));
+  FNACC_CUDA_CHECK(cuDeviceGet(&device, ordinal));
+  FNACC_CUDA_CHECK(
+      cuDevicePrimaryCtxRetain(&fnaccRegistry.context, fnaccRegistry.device));
+
+  if (fnaccDebugEnabled())
+    std::fprintf(stderr, "FNACC: using CUDA device ordinal %d\n", ordinal);
 
   FNACC_CUDA_CHECK(cuDevicePrimaryCtxRetain(&fnaccRegistry.context, device));
   FNACC_CUDA_CHECK(cuCtxSetCurrent(fnaccRegistry.context));
@@ -639,6 +768,7 @@ static void fnaccEnsureInitialized() {
   }
 
   fnaccRegistry.initialized = true;
+  std::atexit(fnaccCleanup);
 }
 
 static void fnaccEnsureCurrentContext() {
@@ -745,11 +875,9 @@ static FNACCDeviceArg fnaccGetCachedDeviceBuffer(void *hostPtr,
   auto it = fnaccRegistry.deviceCache.find(hostPtr);
 
   bool needAllocate = false;
-  bool cacheMiss = false;
 
   if (it == fnaccRegistry.deviceCache.end()) {
     needAllocate = true;
-    cacheMiss = true;
   } else if (it->second.bytes != bytes) {
     if (fnaccDebugEnabled()) {
       std::fprintf(stderr,
@@ -761,7 +889,6 @@ static FNACCDeviceArg fnaccGetCachedDeviceBuffer(void *hostPtr,
     FNACC_CUDA_CHECK(cuMemFree(it->second.ptr));
     fnaccRegistry.deviceCache.erase(it);
     needAllocate = true;
-    cacheMiss = true;
   }
 
   if (needAllocate) {
@@ -1331,6 +1458,8 @@ extern "C" void __fnacc_launch_nd_f32(int32_t kernelId, int32_t rank,
       std::fflush(stderr);
     }
 
+    fnaccValidateCudaBlockSize(fn, kernelId, cudaBlockX);
+
     FNACC_CUDA_CHECK(cuLaunchKernel(
         fn, gridX, 1, 1, cudaBlockX, 1, 1, 0, nullptr, args, nullptr));
     if (fnaccDebugEnabled()) {
@@ -1370,6 +1499,8 @@ extern "C" void __fnacc_launch_nd_f32(int32_t kernelId, int32_t rank,
       std::fprintf(stderr, "FNACC: about to cuLaunchKernel rank2\n");
       std::fflush(stderr);
     }
+
+    fnaccValidateCudaBlockSize(fn, kernelId, cudaBlockX);
 
     FNACC_CUDA_CHECK(cuLaunchKernel(
         fn, gridX, gridY, 1, cudaBlockX, 1, 1, 0, nullptr, args, nullptr));
@@ -1500,6 +1631,8 @@ extern "C" void __fnacc_launch_nd_f32_s1(int32_t kernelId, int32_t rank,
     std::fflush(stderr);
   }
 
+  fnaccValidateCudaBlockSize(fn, kernelId, cudaBlockX);
+
   FNACC_CUDA_CHECK(cuLaunchKernel(
       fn, gridX, 1, 1, cudaBlockX, 1, 1, 0, nullptr, args, nullptr));
 
@@ -1601,6 +1734,8 @@ extern "C" void __fnacc_launch_nd_f32_s2(int32_t kernelId, int32_t rank,
     std::fflush(stderr);
   }
 
+  fnaccValidateCudaBlockSize(fn, kernelId, cudaBlockX);
+
   FNACC_CUDA_CHECK(cuLaunchKernel(
       fn, gridX, 1, 1, cudaBlockX, 1, 1, 0, nullptr, args, nullptr));
 
@@ -1674,6 +1809,20 @@ extern "C" void __fnacc_launch_f32_v1(int32_t kernelId, int32_t rank,
   std::size_t numBytes = elemCount * sizeof(float);
 
   const FNACCKernelDesc *desc = fnaccLookupKernelDesc(kernelId);
+
+  if (!desc) {
+    std::fprintf(stderr,
+        "FNACC error: no JSON descriptor for matmul kernel id %d\n", kernelId);
+    std::abort();
+  }
+
+  if (desc->kind != "matmul2d") {
+    std::fprintf(stderr,
+        "FNACC error: runtime matmul launcher called for kernel id %d "
+        "but JSON kind is '%s'\n",
+        kernelId, desc->kind.c_str());
+    std::abort();
+  }
 
   // Current JSON parameter order is:
   //   slot 0 = read0
@@ -1775,6 +1924,8 @@ extern "C" void __fnacc_launch_f32_v1(int32_t kernelId, int32_t rank,
         blockZ, cudaBlockX, extentX, extentY, extentZ, numBytes);
   }
 
+  fnaccValidateCudaBlockSize(fn, kernelId, cudaBlockX);
+
   FNACC_CUDA_CHECK(cuLaunchKernel(
       fn, gridX, gridY, 1, cudaBlockX, 1, 1, 0, nullptr, args, nullptr));
 
@@ -1848,11 +1999,11 @@ extern "C" void __fnacc_launch_matmul_f32_v1(int32_t kernelId, int32_t blockX,
   unsigned cudaBlockX = fnaccCudaThreadsPerCTA(kernelId);
 
   std::size_t bytesA =
-      static_cast<std::size_t>(n) * static_cast<std::size_t>(k) * sizeof(float);
+      fnaccCheckedBytes2D(n, k, sizeof(float), "matmul A bytes");
   std::size_t bytesB =
-      static_cast<std::size_t>(k) * static_cast<std::size_t>(m) * sizeof(float);
+      fnaccCheckedBytes2D(k, m, sizeof(float), "matmul B bytes");
   std::size_t bytesC =
-      static_cast<std::size_t>(n) * static_cast<std::size_t>(m) * sizeof(float);
+      fnaccCheckedBytes2D(n, m, sizeof(float), "matmul C bytes");
 
   const FNACCKernelDesc *desc = fnaccLookupKernelDesc(kernelId);
 
@@ -1886,47 +2037,73 @@ extern "C" void __fnacc_launch_matmul_f32_v1(int32_t kernelId, int32_t blockX,
       &hidden.hidden1,
   };
 
-  std::fprintf(stderr,
-      "FNACC: launch matmul kernel id=%d "
-      "grid=(%u,%u,%u) grid_policy=cdiv tile=(%d,%d,%d) "
-      "cuda_block=(%u,1,1) n=%d m=%d k=%d "
-      "bytesA=%zu bytesB=%zu bytesC=%zu "
-      "targets=(%s,%s,%s)\n",
-      kernelId, gridX, gridY, gridZ, blockX, blockY, blockK, cudaBlockX, n, m,
-      k, bytesA, bytesB, bytesC, fnaccPackTargetName(aTarget),
-      fnaccPackTargetName(bTarget), fnaccPackTargetName(cTarget));
-
-  std::fprintf(stderr,
-      "FNACC: matmul args: "
-      "dA=0x%llx dB=0x%llx dC=0x%llx "
-      "n=%d m=%d k=%d hidden0=0x%llx hidden1=0x%llx "
-      "args={%p,%p,%p,%p,%p,%p,%p,%p}\n",
-      static_cast<unsigned long long>(dA), static_cast<unsigned long long>(dB),
-      static_cast<unsigned long long>(dC), n, m, k,
-      static_cast<unsigned long long>(hidden.hidden0),
-      static_cast<unsigned long long>(hidden.hidden1), args[0], args[1],
-      args[2], args[3], args[4], args[5], args[6], args[7]);
-}
-
-FNACC_CUDA_CHECK(cuLaunchKernel(
-    fn, gridX, gridY, gridZ, cudaBlockX, 1, 1, 0, nullptr, args, nullptr));
-
-FNACC_CUDA_CHECK(cuCtxSynchronize());
-
-if (cDev.target == FNACC_PACK_TARGET_HOST) {
-  fnaccCopyBackWriteArray(c, cDev, bytesC);
-} else {
   if (fnaccDebugEnabled()) {
     std::fprintf(stderr,
-        "FNACC: skipped automatic copy-back for matmul write slot %d "
-        "because target=device; use !$fnacc update host(...) to copy back\n",
-        cDev.slot);
-  }
-}
+        "FNACC: launch matmul kernel id=%d "
+        "grid=(%u,%u,%u) grid_policy=cdiv tile=(%d,%d,%d) "
+        "cuda_block=(%u,1,1) n=%d m=%d k=%d "
+        "bytesA=%zu bytesB=%zu bytesC=%zu "
+        "targets=(%s,%s,%s)\n",
+        kernelId, gridX, gridY, gridZ, blockX, blockY, blockK, cudaBlockX, n, m,
+        k, bytesA, bytesB, bytesC, fnaccPackTargetName(aTarget),
+        fnaccPackTargetName(bTarget), fnaccPackTargetName(cTarget));
 
-fnaccReleaseDeviceArg(aDev);
-fnaccReleaseDeviceArg(bDev);
-fnaccReleaseDeviceArg(cDev);
+    std::fprintf(stderr,
+        "FNACC: matmul args: "
+        "dA=0x%llx dB=0x%llx dC=0x%llx "
+        "n=%d m=%d k=%d hidden0=0x%llx hidden1=0x%llx "
+        "args={%p,%p,%p,%p,%p,%p,%p,%p}\n",
+        static_cast<unsigned long long>(dA),
+        static_cast<unsigned long long>(dB),
+        static_cast<unsigned long long>(dC), n, m, k,
+        static_cast<unsigned long long>(hidden.hidden0),
+        static_cast<unsigned long long>(hidden.hidden1), args[0], args[1],
+        args[2], args[3], args[4], args[5], args[6], args[7]);
+  }
+
+  fnaccValidateCudaBlockSize(fn, kernelId, cudaBlockX);
+
+  FNACC_CUDA_CHECK(cuLaunchKernel(
+      fn, gridX, gridY, gridZ, cudaBlockX, 1, 1, 0, nullptr, args, nullptr));
+
+  FNACC_CUDA_CHECK(cuCtxSynchronize());
+
+  if (cDev.target == FNACC_PACK_TARGET_HOST) {
+    fnaccCopyBackWriteArray(c, cDev, bytesC);
+  } else {
+    if (fnaccDebugEnabled()) {
+      std::fprintf(stderr,
+          "FNACC: skipped automatic copy-back for matmul write slot %d "
+          "because target=device; use !$fnacc update host(...) to copy back\n",
+          cDev.slot);
+    }
+  }
+
+  fnaccReleaseDeviceArg(aDev);
+  fnaccReleaseDeviceArg(bDev);
+  fnaccReleaseDeviceArg(cDev);
+
+  fnaccValidateCudaBlockSize(fn, kernelId, cudaBlockX);
+
+  FNACC_CUDA_CHECK(cuLaunchKernel(
+      fn, gridX, gridY, gridZ, cudaBlockX, 1, 1, 0, nullptr, args, nullptr));
+
+  FNACC_CUDA_CHECK(cuCtxSynchronize());
+
+  if (cDev.target == FNACC_PACK_TARGET_HOST) {
+    fnaccCopyBackWriteArray(c, cDev, bytesC);
+  } else {
+    if (fnaccDebugEnabled()) {
+      std::fprintf(stderr,
+          "FNACC: skipped automatic copy-back for matmul write slot %d "
+          "because target=device; use !$fnacc update host(...) to copy back\n",
+          cDev.slot);
+    }
+  }
+
+  fnaccReleaseDeviceArg(aDev);
+  fnaccReleaseDeviceArg(bDev);
+  fnaccReleaseDeviceArg(cDev);
 }
 
 // Memory management functions to help with cached data and data lifetimes
