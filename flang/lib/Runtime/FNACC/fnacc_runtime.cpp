@@ -13,6 +13,8 @@
 
 namespace {
 
+static constexpr const char *FNACC_RUNTIME_BUILD_ID = "FNACC_RUNTIME_BUILD_ID_matmul_cdiv_grid_v2";
+
 // -------------------------------------------------------------------------- //
 // Tiny dependency-free JSON helpers
 // -------------------------------------------------------------------------- //
@@ -579,6 +581,11 @@ static void fnaccEnsureInitialized() {
   if (fnaccRegistry.initialized)
     return;
 
+  if (fnaccDebugEnabled()) {
+    std::fprintf(
+        stderr, "FNACC: runtime build id: %s\n", FNACC_RUNTIME_BUILD_ID);
+  }
+
   std::string ptx = fnaccGetPtxText();
 
   FNACC_CUDA_CHECK(cuInit(0));
@@ -945,6 +952,14 @@ static void fnaccValidateHostLaunchAgainstDesc(int32_t kernelId, int32_t rank,
 }
 
 static unsigned fnaccCdiv(int32_t x, int32_t y) {
+  if (y <= 0) {
+    std::fprintf(stderr, "FNACC error: cdiv divisor is non-positive: %d\n", y);
+    std::abort();
+  }
+
+  if (x <= 0)
+    return 0;
+
   return static_cast<unsigned>((x + y - 1) / y);
 }
 
@@ -1618,7 +1633,7 @@ extern "C" void __fnacc_launch_nd_f32_s2(int32_t kernelId, int32_t rank,
 // The runtime validates JSON schema version and hidden-argument count so that
 // compiler/runtime drift fails explicitly rather than launching with a wrong
 // CUDA argument layout.
-xtern "C" void __fnacc_launch_f32_v1(int32_t kernelId, int32_t rank,
+extern "C" void __fnacc_launch_f32_v1(int32_t kernelId, int32_t rank,
     int32_t blockX, int32_t blockY, int32_t blockZ, int32_t numReadArrays,
     int32_t numScalars, float *read0, float *read1, float *read2, float *write,
     float scalar0, float scalar1, float scalar2, int32_t extentX,
@@ -1788,27 +1803,9 @@ xtern "C" void __fnacc_launch_f32_v1(int32_t kernelId, int32_t rank,
 }
 
 extern "C" void __fnacc_launch_matmul_f32_v1(int32_t kernelId, int32_t blockX,
-    int32_t blockY, int32_t blockZ, float *a, float *b, float *c,
-    int32_t extentX, int32_t extentY, int32_t extentK) {
+    int32_t blockY, int32_t blockK, float *a, float *b, float *c, int32_t n,
+    int32_t m, int32_t k) {
   fnaccEnsureCurrentContext();
-
-  // extentX = n
-  // extentY = m
-  // extentK = k
-  //
-  // A shape: n x k
-  // B shape: k x m
-  // C shape: n x m
-
-  fnaccValidateHostLaunchAgainstDesc(
-      kernelId, /*rank=*/2, blockX, blockY, blockZ);
-
-  if (blockX <= 0 || blockY <= 0 || blockZ <= 0) {
-    std::fprintf(stderr,
-        "FNACC error: invalid matmul tile/block shape (%d,%d,%d)\n", blockX,
-        blockY, blockZ);
-    std::abort();
-  }
 
   if (!a || !b || !c) {
     std::fprintf(stderr,
@@ -1818,99 +1815,118 @@ extern "C" void __fnacc_launch_matmul_f32_v1(int32_t kernelId, int32_t blockX,
     std::abort();
   }
 
-  if (extentX <= 0 || extentY <= 0 || extentK <= 0) {
+  if (n <= 0 || m <= 0 || k <= 0) {
     if (fnaccDebugEnabled()) {
       std::fprintf(stderr,
-          "FNACC: non-positive matmul extent n=%d m=%d k=%d; skipping launch\n",
-          extentX, extentY, extentK);
+          "FNACC: skipping matmul with non-positive extent n=%d m=%d k=%d\n", n,
+          m, k);
     }
     return;
+  }
+
+  if (blockX <= 0 || blockY <= 0 || blockK <= 0) {
+    std::fprintf(stderr, "FNACC error: invalid matmul tile shape (%d,%d,%d)\n",
+        blockX, blockY, blockK);
+    std::abort();
   }
 
   CUfunction fn = getKernelFunction(kernelId);
   fnaccDebugFunctionAttributes(fn, kernelId);
 
+  unsigned gridX = fnaccCdiv(n, blockX);
+  unsigned gridY = fnaccCdiv(m, blockY);
+  unsigned gridZ = 1;
+
+  if (fnaccDebugEnabled()) {
+    std::fprintf(stderr,
+        "FNACC: matmul grid debug: "
+        "n=%d m=%d blockX=%d blockY=%d "
+        "gridX=%u gridY=%u gridZ=%u\n",
+        n, m, blockX, blockY, gridX, gridY, gridZ);
+  }
+
+  unsigned cudaBlockX = fnaccCudaThreadsPerCTA(kernelId);
+
+  std::size_t bytesA =
+      static_cast<std::size_t>(n) * static_cast<std::size_t>(k) * sizeof(float);
+  std::size_t bytesB =
+      static_cast<std::size_t>(k) * static_cast<std::size_t>(m) * sizeof(float);
+  std::size_t bytesC =
+      static_cast<std::size_t>(n) * static_cast<std::size_t>(m) * sizeof(float);
+
   const FNACCKernelDesc *desc = fnaccLookupKernelDesc(kernelId);
 
-  int32_t aSlot = 0;
-  int32_t bSlot = 1;
-  int32_t cSlot = 2;
+  int32_t aTarget = fnaccPackTargetForSlot(desc, 0);
+  int32_t bTarget = fnaccPackTargetForSlot(desc, 1);
+  int32_t cTarget = fnaccPackTargetForSlot(desc, 2);
 
-  int32_t aTarget = fnaccPackTargetForSlot(desc, aSlot);
-  int32_t bTarget = fnaccPackTargetForSlot(desc, bSlot);
-  int32_t cTarget = fnaccPackTargetForSlot(desc, cSlot);
-
-  std::size_t bytesA = static_cast<std::size_t>(extentX) *
-      static_cast<std::size_t>(extentK) * sizeof(float);
-
-  std::size_t bytesB = static_cast<std::size_t>(extentK) *
-      static_cast<std::size_t>(extentY) * sizeof(float);
-
-  std::size_t bytesC = static_cast<std::size_t>(extentX) *
-      static_cast<std::size_t>(extentY) * sizeof(float);
-
-  FNACCDeviceArg aDev = fnaccPrepareReadArray(a, bytesA, aTarget, aSlot);
-
-  FNACCDeviceArg bDev = fnaccPrepareReadArray(b, bytesB, bTarget, bSlot);
-
-  FNACCDeviceArg cDev = fnaccPrepareWriteArray(c, bytesC, cTarget, cSlot);
+  FNACCDeviceArg aDev = fnaccPrepareReadArray(a, bytesA, aTarget, 0);
+  FNACCDeviceArg bDev = fnaccPrepareReadArray(b, bytesB, bTarget, 1);
+  FNACCDeviceArg cDev = fnaccPrepareWriteArray(c, bytesC, cTarget, 2);
 
   CUdeviceptr dA = aDev.ptr;
   CUdeviceptr dB = bDev.ptr;
   CUdeviceptr dC = cDev.ptr;
 
-  // The current matmul TTIR is scalar-per-program: one Triton program computes
-  // one C(i,j). Therefore the launch grid is n x m, not a tiled cdiv grid.
-  //
-  // blockX/blockY are still passed through metadata for compatibility, but this
-  // scalar lowering does not use them.
-  unsigned gridX = static_cast<unsigned>(extentX);
-  unsigned gridY = static_cast<unsigned>(extentY);
-  unsigned cudaBlockX = fnaccCudaThreadsPerCTA(kernelId);
-
   fnaccValidateSupportedHiddenPtrArgCount(kernelId);
   FNACCHiddenTritonArgs hidden;
 
+  // Must match TTIR/PTX signature:
+  //
+  //   %a, %b, %c, %n, %m, %k, hidden0, hidden1
+  //
   void *args[] = {
       &dA,
       &dB,
       &dC,
-      &extentX,
-      &extentY,
-      &extentK,
+      &n,
+      &m,
+      &k,
       &hidden.hidden0,
       &hidden.hidden1,
   };
 
+  std::fprintf(stderr,
+      "FNACC: launch matmul kernel id=%d "
+      "grid=(%u,%u,%u) grid_policy=cdiv tile=(%d,%d,%d) "
+      "cuda_block=(%u,1,1) n=%d m=%d k=%d "
+      "bytesA=%zu bytesB=%zu bytesC=%zu "
+      "targets=(%s,%s,%s)\n",
+      kernelId, gridX, gridY, gridZ, blockX, blockY, blockK, cudaBlockX, n, m,
+      k, bytesA, bytesB, bytesC, fnaccPackTargetName(aTarget),
+      fnaccPackTargetName(bTarget), fnaccPackTargetName(cTarget));
+
+  std::fprintf(stderr,
+      "FNACC: matmul args: "
+      "dA=0x%llx dB=0x%llx dC=0x%llx "
+      "n=%d m=%d k=%d hidden0=0x%llx hidden1=0x%llx "
+      "args={%p,%p,%p,%p,%p,%p,%p,%p}\n",
+      static_cast<unsigned long long>(dA), static_cast<unsigned long long>(dB),
+      static_cast<unsigned long long>(dC), n, m, k,
+      static_cast<unsigned long long>(hidden.hidden0),
+      static_cast<unsigned long long>(hidden.hidden1), args[0], args[1],
+      args[2], args[3], args[4], args[5], args[6], args[7]);
+}
+
+FNACC_CUDA_CHECK(cuLaunchKernel(
+    fn, gridX, gridY, gridZ, cudaBlockX, 1, 1, 0, nullptr, args, nullptr));
+
+FNACC_CUDA_CHECK(cuCtxSynchronize());
+
+if (cDev.target == FNACC_PACK_TARGET_HOST) {
+  fnaccCopyBackWriteArray(c, cDev, bytesC);
+} else {
   if (fnaccDebugEnabled()) {
     std::fprintf(stderr,
-        "FNACC: launch matmul kernel id=%d "
-        "grid=(%u,%u,1) tile=(%d,%d,%d) cuda_block=(%u,1,1) "
-        "n=%d m=%d k=%d bytesA=%zu bytesB=%zu bytesC=%zu "
-        "targets=(%s,%s,%s)\n",
-        kernelId, gridX, gridY, blockX, blockY, blockZ, cudaBlockX, extentX,
-        extentY, extentK, bytesA, bytesB, bytesC, fnaccPackTargetName(aTarget),
-        fnaccPackTargetName(bTarget), fnaccPackTargetName(cTarget));
+        "FNACC: skipped automatic copy-back for matmul write slot %d "
+        "because target=device; use !$fnacc update host(...) to copy back\n",
+        cDev.slot);
   }
+}
 
-  FNACC_CUDA_CHECK(cuLaunchKernel(
-      fn, gridX, gridY, 1, cudaBlockX, 1, 1, 0, nullptr, args, nullptr));
-
-  FNACC_CUDA_CHECK(cuCtxSynchronize());
-
-  if (cDev.target == FNACC_PACK_TARGET_HOST) {
-    fnaccCopyBackWriteArray(c, cDev, bytesC);
-  } else {
-    if (fnaccDebugEnabled()) {
-      std::fprintf(stderr,
-          "FNACC: skipped automatic matmul copy-back for C because "
-          "target=device; use !$fnacc update host(c)\n");
-    }
-  }
-
-  fnaccReleaseDeviceArg(aDev);
-  fnaccReleaseDeviceArg(bDev);
-  fnaccReleaseDeviceArg(cDev);
+fnaccReleaseDeviceArg(aDev);
+fnaccReleaseDeviceArg(bDev);
+fnaccReleaseDeviceArg(cDev);
 }
 
 // Memory management functions to help with cached data and data lifetimes
