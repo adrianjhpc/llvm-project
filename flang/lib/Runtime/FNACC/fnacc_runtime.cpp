@@ -7,6 +7,7 @@
 
 #include <fstream>
 #include <limits>
+#include <optional>
 #include <sstream>
 #include <string>
 #include <unordered_map>
@@ -942,17 +943,52 @@ static void fnaccValidateSupportedHiddenPtrArgCount(int32_t kernelId) {
   std::abort();
 }
 
-static int32_t fnaccPackTargetForSlot(
+static std::optional<int32_t> fnaccExplicitPackTargetForSlot(
     const FNACCKernelDesc *desc, int32_t slot) {
   if (!desc)
-    return FNACC_PACK_TARGET_HOST;
+    return std::nullopt;
 
   for (const FNACCPackEntry &entry : desc->pack) {
     if (entry.kernelArgSlot == slot)
       return entry.target;
   }
 
+  return std::nullopt;
+}
+
+static bool fnaccHostPointerIsPresentOnDevice(void *hostPtr) {
+  if (!hostPtr)
+    return false;
+
+  return fnaccRegistry.deviceCache.find(hostPtr) !=
+      fnaccRegistry.deviceCache.end();
+}
+
+static int32_t fnaccEffectivePackTargetForSlot(
+    const FNACCKernelDesc *desc, int32_t slot, void *hostPtr) {
+  if (auto explicitTarget = fnaccExplicitPackTargetForSlot(desc, slot))
+    return *explicitTarget;
+
+  // Present-if-cached default:
+  //
+  // If the user has already created a persistent device allocation with
+  // enter data/update device/pack(...:device), then later launches can omit
+  // pack(...:device). We use the cached device allocation automatically.
+  if (fnaccHostPointerIsPresentOnDevice(hostPtr))
+    return FNACC_PACK_TARGET_DEVICE;
+
   return FNACC_PACK_TARGET_HOST;
+}
+
+static const char *fnaccPackTargetSourceName(
+    const FNACCKernelDesc *desc, int32_t slot, void *hostPtr) {
+  if (fnaccExplicitPackTargetForSlot(desc, slot))
+    return "explicit";
+
+  if (fnaccHostPointerIsPresentOnDevice(hostPtr))
+    return "present";
+
+  return "default-host";
 }
 
 static const char *fnaccPackTargetName(int32_t target) {
@@ -2155,20 +2191,33 @@ extern "C" void __fnacc_launch_f32_v1(int32_t kernelId, int32_t rank,
   int32_t read2Slot = 2;
   int32_t writeSlot = numReadArrays;
 
-  int32_t read0Target = fnaccPackTargetForSlot(desc, read0Slot);
-  int32_t read1Target = fnaccPackTargetForSlot(desc, read1Slot);
-  int32_t read2Target = fnaccPackTargetForSlot(desc, read2Slot);
-  int32_t writeTarget = fnaccPackTargetForSlot(desc, writeSlot);
+  int32_t read0Target = fnaccEffectivePackTargetForSlot(desc, read0Slot, read0);
+
+  int32_t read1Target = numReadArrays >= 2
+      ? fnaccEffectivePackTargetForSlot(desc, read1Slot, read1)
+      : FNACC_PACK_TARGET_HOST;
+
+  int32_t read2Target = numReadArrays >= 3
+      ? fnaccEffectivePackTargetForSlot(desc, read2Slot, read2)
+      : FNACC_PACK_TARGET_HOST;
+
+  int32_t writeTarget = fnaccEffectivePackTargetForSlot(desc, writeSlot, write);
 
   if (fnaccDebugEnabled()) {
     std::fprintf(stderr,
         "FNACC: pack targets for kernel id %d: "
-        "read0(slot %d)=%s read1(slot %d)=%s "
-        "read2(slot %d)=%s write(slot %d)=%s\n",
-        kernelId, read0Slot, fnaccPackTargetName(read0Target), read1Slot,
-        fnaccPackTargetName(read1Target), read2Slot,
-        fnaccPackTargetName(read2Target), writeSlot,
-        fnaccPackTargetName(writeTarget));
+        "read0(slot %d)=%s/%s read1(slot %d)=%s/%s "
+        "read2(slot %d)=%s/%s write(slot %d)=%s/%s\n",
+        kernelId, read0Slot, fnaccPackTargetName(read0Target),
+        fnaccPackTargetSourceName(desc, read0Slot, read0), read1Slot,
+        fnaccPackTargetName(read1Target),
+        numReadArrays >= 2 ? fnaccPackTargetSourceName(desc, read1Slot, read1)
+                           : "unused",
+        read2Slot, fnaccPackTargetName(read2Target),
+        numReadArrays >= 3 ? fnaccPackTargetSourceName(desc, read2Slot, read2)
+                           : "unused",
+        writeSlot, fnaccPackTargetName(writeTarget),
+        fnaccPackTargetSourceName(desc, writeSlot, write));
   }
 
   FNACCDeviceArg read0Dev =
@@ -2378,10 +2427,17 @@ extern "C" void __fnacc_launch_f64_v1(int32_t kernelId, int32_t rank,
   int32_t read2Slot = 2;
   int32_t writeSlot = numReadArrays;
 
-  int32_t read0Target = fnaccPackTargetForSlot(desc, read0Slot);
-  int32_t read1Target = fnaccPackTargetForSlot(desc, read1Slot);
-  int32_t read2Target = fnaccPackTargetForSlot(desc, read2Slot);
-  int32_t writeTarget = fnaccPackTargetForSlot(desc, writeSlot);
+  int32_t read0Target = fnaccEffectivePackTargetForSlot(desc, read0Slot, read0);
+
+  int32_t read1Target = numReadArrays >= 2
+      ? fnaccEffectivePackTargetForSlot(desc, read1Slot, read1)
+      : FNACC_PACK_TARGET_HOST;
+
+  int32_t read2Target = numReadArrays >= 3
+      ? fnaccEffectivePackTargetForSlot(desc, read2Slot, read2)
+      : FNACC_PACK_TARGET_HOST;
+
+  int32_t writeTarget = fnaccEffectivePackTargetForSlot(desc, writeSlot, write);
 
   FNACCDeviceArg read0Dev =
       fnaccPrepareReadBuffer(read0, numBytes, read0Target, read0Slot);
@@ -2557,9 +2613,9 @@ extern "C" void __fnacc_launch_matmul_f32_v1(int32_t kernelId, int32_t blockX,
   std::size_t bytesC =
       fnaccCheckedBytes2D(n, m, sizeof(float), "matmul C bytes");
 
-  int32_t aTarget = fnaccPackTargetForSlot(desc, 0);
-  int32_t bTarget = fnaccPackTargetForSlot(desc, 1);
-  int32_t cTarget = fnaccPackTargetForSlot(desc, 2);
+  int32_t aTarget = fnaccEffectivePackTargetForSlot(desc, 0, a);
+  int32_t bTarget = fnaccEffectivePackTargetForSlot(desc, 1, b);
+  int32_t cTarget = fnaccEffectivePackTargetForSlot(desc, 2, c);
 
   FNACCDeviceArg aDev = fnaccPrepareReadBuffer(a, bytesA, aTarget, 0);
   FNACCDeviceArg bDev = fnaccPrepareReadBuffer(b, bytesB, bTarget, 1);
@@ -2698,9 +2754,9 @@ extern "C" void __fnacc_launch_matmul_f64_v1(int32_t kernelId, int32_t blockX,
   std::size_t bytesC =
       fnaccCheckedBytes2D(n, m, sizeof(double), "f64 matmul C bytes");
 
-  int32_t aTarget = fnaccPackTargetForSlot(desc, 0);
-  int32_t bTarget = fnaccPackTargetForSlot(desc, 1);
-  int32_t cTarget = fnaccPackTargetForSlot(desc, 2);
+  int32_t aTarget = fnaccEffectivePackTargetForSlot(desc, 0, a);
+  int32_t bTarget = fnaccEffectivePackTargetForSlot(desc, 1, b);
+  int32_t cTarget = fnaccEffectivePackTargetForSlot(desc, 2, c);
 
   FNACCDeviceArg aDev = fnaccPrepareReadBuffer(a, bytesA, aTarget, 0);
   FNACCDeviceArg bDev = fnaccPrepareReadBuffer(b, bytesB, bTarget, 1);
