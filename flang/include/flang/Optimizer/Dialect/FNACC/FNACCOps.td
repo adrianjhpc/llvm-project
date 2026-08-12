@@ -59,5 +59,28 @@ def FNACC_ReleaseAllOp : FNACC_Op<"release_all", []> {
   let assemblyFormat = "attr-dict";
 }
 
+def FNACC_CopyinOp : FNACC_Op<"copyin", []> {
+  let summary = "Begin FNACC device lifetime and copy host data to device";
+  let arguments = (ins AnyType:$var);
+  let assemblyFormat = "$var attr-dict `:` type($var)";
+}
+
+def FNACC_CreateOp : FNACC_Op<"create", []> {
+  let summary = "Begin FNACC device lifetime without copying host data";
+  let arguments = (ins AnyType:$var);
+  let assemblyFormat = "$var attr-dict `:` type($var)";
+}
+
+def FNACC_CopyoutOp : FNACC_Op<"copyout", []> {
+  let summary = "Copy FNACC cached device data back to host";
+  let arguments = (ins AnyType:$var);
+  let assemblyFormat = "$var attr-dict `:` type($var)";
+}
+
+def FNACC_DeleteOp : FNACC_Op<"delete", []> {
+  let summary = "Release one FNACC cached device allocation";
+  let arguments = (ins AnyType:$var);
+  let assemblyFormat = "$var attr-dict `:` type($var)";
+}
 
 #endif // FORTRAN_OPTIMIZER_DIALECT_FNACC_OPS

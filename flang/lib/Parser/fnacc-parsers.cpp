@@ -52,8 +52,36 @@ TYPE_PARSER(construct<FnACCReleaseAllDirective>(
     ("RELEASE"_tok >> "ALL"_tok >> pure(true)) ||
     ("RELEASE_ALL"_tok >> pure(true))))
 
+TYPE_PARSER(construct<FnACCCopyinClause>(
+    "COPYIN"_tok >> parenthesized(nonemptyList(name))))
+
+TYPE_PARSER(construct<FnACCCreateClause>(
+    "CREATE"_tok >> parenthesized(nonemptyList(name))))
+
+TYPE_PARSER(construct<FnACCCopyoutClause>(
+    "COPYOUT"_tok >> parenthesized(nonemptyList(name))))
+
+TYPE_PARSER(construct<FnACCDeleteClause>(
+    "DELETE"_tok >> parenthesized(nonemptyList(name))))
+
+TYPE_PARSER(construct<FnACCEnterDataClause>(Parser<FnACCCopyinClause>{}) ||
+    construct<FnACCEnterDataClause>(Parser<FnACCCreateClause>{}))
+
+TYPE_PARSER(construct<FnACCExitDataClause>(Parser<FnACCCopyoutClause>{}) ||
+    construct<FnACCExitDataClause>(Parser<FnACCDeleteClause>{}))
+
+TYPE_PARSER(construct<FnACCEnterDataDirective>(
+    "ENTER"_tok >> "DATA"_tok >> many(Parser<FnACCEnterDataClause>{})))
+
+TYPE_PARSER(construct<FnACCExitDataDirective>(
+    "EXIT"_tok >> "DATA"_tok >> many(Parser<FnACCExitDataClause>{})))
+
 TYPE_PARSER(construct<FnACCStandaloneConstruct>(startfnaccLine >>
-                Parser<FnACCUpdateHostDirective>{} / endOfLine) ||
+                Parser<FnACCEnterDataDirective>{} / endOfLine) ||
+    construct<FnACCStandaloneConstruct>(
+        startfnaccLine >> Parser<FnACCExitDataDirective>{} / endOfLine) ||
+    construct<FnACCStandaloneConstruct>(
+        startfnaccLine >> Parser<FnACCUpdateHostDirective>{} / endOfLine) ||
     construct<FnACCStandaloneConstruct>(
         startfnaccLine >> Parser<FnACCUpdateDeviceDirective>{} / endOfLine) ||
     construct<FnACCStandaloneConstruct>(

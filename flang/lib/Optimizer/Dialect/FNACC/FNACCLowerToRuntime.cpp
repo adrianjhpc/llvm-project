@@ -502,49 +502,22 @@ tryCreateByteSizedRuntimeArgs(OpBuilder &builder, Location loc, Value var) {
   return args;
 }
 
-static void lowerFNACCDataOpsToRuntime(ModuleOp module, OpBuilder &builder) {
-  llvm::SmallVector<fir::fnacc::UpdateHostOp> updateHostOps;
-  llvm::SmallVector<fir::fnacc::UpdateDeviceOp> updateDeviceOps;
-  llvm::SmallVector<fir::fnacc::ReleaseOp> releaseOps;
-  llvm::SmallVector<fir::fnacc::ReleaseAllOp> releaseAllOps;
+static LogicalResult lowerFNACCDataOpsToRuntime(ModuleOp module,
+                                                OpBuilder &builder) {
+  llvm::SmallVector<Operation *> dataOps;
 
-  module.walk(
-      [&](fir::fnacc::UpdateHostOp op) { updateHostOps.push_back(op); });
-  module.walk(
-      [&](fir::fnacc::UpdateDeviceOp op) { updateDeviceOps.push_back(op); });
-  module.walk([&](fir::fnacc::ReleaseOp op) { releaseOps.push_back(op); });
-  module.walk(
-      [&](fir::fnacc::ReleaseAllOp op) { releaseAllOps.push_back(op); });
-
-  for (fir::fnacc::UpdateHostOp op : updateHostOps) {
-    Location loc = op.getLoc();
-    builder.setInsertionPoint(op);
-
-    Value var = op.getVar();
-
-    if (auto desc = tryCreateContiguousArrayDescriptorArgs(builder, loc, var)) {
-      createDescriptorRuntimeCall(module, builder, loc,
-                                  "__fnacc_update_host_desc", *desc);
-    } else if (auto bytes = tryCreateByteSizedRuntimeArgs(builder, loc, var)) {
-      createRuntimeCall(module, builder, loc, "__fnacc_update_host_bytes",
-                        bytes->values);
-    } else {
-      op.emitWarning()
-          << "FNACC update host could not determine object size; falling "
-             "back to existing-allocation raw pointer update";
-      Value ptr = convertToOpaqueRuntimePtr(builder, loc, var);
-      createRuntimeCall(module, builder, loc, "__fnacc_update_host",
-                        ValueRange{ptr});
+  module.walk([&](Operation *op) {
+    if (isa<fir::fnacc::UpdateHostOp, fir::fnacc::UpdateDeviceOp,
+            fir::fnacc::ReleaseOp, fir::fnacc::ReleaseAllOp,
+            fir::fnacc::CopyinOp, fir::fnacc::CreateOp, fir::fnacc::CopyoutOp,
+            fir::fnacc::DeleteOp>(op)) {
+      dataOps.push_back(op);
     }
+  });
 
-    op.erase();
-  }
-
-  for (fir::fnacc::UpdateDeviceOp op : updateDeviceOps) {
-    Location loc = op.getLoc();
+  auto lowerCopyToDevice = [&](Operation *op, Value var) -> LogicalResult {
+    Location loc = op->getLoc();
     builder.setInsertionPoint(op);
-
-    Value var = op.getVar();
 
     if (auto desc = tryCreateContiguousArrayDescriptorArgs(builder, loc, var)) {
       createDescriptorRuntimeCall(module, builder, loc,
@@ -553,45 +526,140 @@ static void lowerFNACCDataOpsToRuntime(ModuleOp module, OpBuilder &builder) {
       createRuntimeCall(module, builder, loc, "__fnacc_update_device_bytes",
                         bytes->values);
     } else {
-      op.emitWarning()
-          << "FNACC update device could not determine object size; falling "
-             "back to existing-allocation raw pointer update";
+      op->emitWarning()
+          << "FNACC update/copyin device could not determine object size; "
+             "falling back to existing-allocation raw pointer update";
       Value ptr = convertToOpaqueRuntimePtr(builder, loc, var);
       createRuntimeCall(module, builder, loc, "__fnacc_update_device",
                         ValueRange{ptr});
     }
 
-    op.erase();
-  }
+    op->erase();
+    return success();
+  };
 
-  for (fir::fnacc::ReleaseOp op : releaseOps) {
-    Location loc = op.getLoc();
+  auto lowerCreate = [&](Operation *op, Value var) -> LogicalResult {
+    Location loc = op->getLoc();
     builder.setInsertionPoint(op);
 
-    for (Value var : op.getVars()) {
-      Value ptr = convertToOpaqueRuntimePtr(builder, loc, var);
-
-      if (isa<fir::BoxType>(var.getType())) {
-        createRuntimeCall(module, builder, loc, "__fnacc_release_desc",
-                          ValueRange{ptr});
-      } else {
-        createRuntimeCall(module, builder, loc, "__fnacc_release",
-                          ValueRange{ptr});
-      }
+    if (auto desc = tryCreateContiguousArrayDescriptorArgs(builder, loc, var)) {
+      createDescriptorRuntimeCall(module, builder, loc, "__fnacc_create_desc",
+                                  *desc);
+    } else if (auto bytes = tryCreateByteSizedRuntimeArgs(builder, loc, var)) {
+      createRuntimeCall(module, builder, loc, "__fnacc_create_bytes",
+                        bytes->values);
+    } else {
+      op->emitError()
+          << "FNACC create could not determine object size; create requires "
+             "a sized scalar, explicit-shape array, or descriptor";
+      return failure();
     }
 
-    op.erase();
-  }
+    op->erase();
+    return success();
+  };
 
-  for (fir::fnacc::ReleaseAllOp op : releaseAllOps) {
-    Location loc = op.getLoc();
+  auto lowerCopyToHost = [&](Operation *op, Value var) -> LogicalResult {
+    Location loc = op->getLoc();
     builder.setInsertionPoint(op);
 
-    createRuntimeCall(module, builder, loc, "__fnacc_release_all",
-                      ValueRange{});
+    if (auto desc = tryCreateContiguousArrayDescriptorArgs(builder, loc, var)) {
+      createDescriptorRuntimeCall(module, builder, loc,
+                                  "__fnacc_update_host_desc", *desc);
+    } else if (auto bytes = tryCreateByteSizedRuntimeArgs(builder, loc, var)) {
+      createRuntimeCall(module, builder, loc, "__fnacc_update_host_bytes",
+                        bytes->values);
+    } else {
+      op->emitWarning()
+          << "FNACC update/copyout host could not determine object size; "
+             "falling back to existing-allocation raw pointer update";
+      Value ptr = convertToOpaqueRuntimePtr(builder, loc, var);
+      createRuntimeCall(module, builder, loc, "__fnacc_update_host",
+                        ValueRange{ptr});
+    }
 
-    op.erase();
+    op->erase();
+    return success();
+  };
+
+  auto lowerReleaseOne = [&](Operation *op, Value var) -> LogicalResult {
+    Location loc = op->getLoc();
+    builder.setInsertionPoint(op);
+
+    Value ptr = convertToOpaqueRuntimePtr(builder, loc, var);
+
+    if (isa<fir::BoxType>(var.getType())) {
+      createRuntimeCall(module, builder, loc, "__fnacc_release_desc",
+                        ValueRange{ptr});
+    } else {
+      createRuntimeCall(module, builder, loc, "__fnacc_release",
+                        ValueRange{ptr});
+    }
+
+    return success();
+  };
+
+  for (Operation *op : dataOps) {
+    if (auto updateHost = dyn_cast<fir::fnacc::UpdateHostOp>(op)) {
+      if (failed(lowerCopyToHost(op, updateHost.getVar())))
+        return failure();
+      continue;
+    }
+
+    if (auto updateDevice = dyn_cast<fir::fnacc::UpdateDeviceOp>(op)) {
+      if (failed(lowerCopyToDevice(op, updateDevice.getVar())))
+        return failure();
+      continue;
+    }
+
+    if (auto copyin = dyn_cast<fir::fnacc::CopyinOp>(op)) {
+      if (failed(lowerCopyToDevice(op, copyin.getVar())))
+        return failure();
+      continue;
+    }
+
+    if (auto create = dyn_cast<fir::fnacc::CreateOp>(op)) {
+      if (failed(lowerCreate(op, create.getVar())))
+        return failure();
+      continue;
+    }
+
+    if (auto copyout = dyn_cast<fir::fnacc::CopyoutOp>(op)) {
+      if (failed(lowerCopyToHost(op, copyout.getVar())))
+        return failure();
+      continue;
+    }
+
+    if (auto del = dyn_cast<fir::fnacc::DeleteOp>(op)) {
+      if (failed(lowerReleaseOne(op, del.getVar())))
+        return failure();
+      op->erase();
+      continue;
+    }
+
+    if (auto release = dyn_cast<fir::fnacc::ReleaseOp>(op)) {
+      for (Value var : release.getVars()) {
+        if (failed(lowerReleaseOne(op, var)))
+          return failure();
+      }
+
+      op->erase();
+      continue;
+    }
+
+    if (auto releaseAll = dyn_cast<fir::fnacc::ReleaseAllOp>(op)) {
+      Location loc = releaseAll.getLoc();
+      builder.setInsertionPoint(releaseAll);
+
+      createRuntimeCall(module, builder, loc, "__fnacc_release_all",
+                        ValueRange{});
+
+      op->erase();
+      continue;
+    }
   }
+
+  return success();
 }
 
 struct FNACCLowerToRuntimePass
@@ -817,7 +885,10 @@ struct FNACCLowerToRuntimePass
 
       ++fallbackKernelId;
     }
-    lowerFNACCDataOpsToRuntime(module, builder);
+    if (failed(lowerFNACCDataOpsToRuntime(module, builder))) {
+      signalPassFailure();
+      return;
+    }
   }
 };
 

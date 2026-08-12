@@ -1360,6 +1360,81 @@ static FNACCDeviceAllocation &fnaccGetOrCreateCachedAllocation(void *hostPtr,
   return inserted.first->second;
 }
 
+extern "C" void __fnacc_create_bytes(void *hostPtr, int64_t bytesValue) {
+  fnaccEnsureCurrentContext();
+
+  if (!hostPtr) {
+    if (fnaccDebugEnabled())
+      std::fprintf(stderr, "FNACC: create_bytes ignored null pointer\n");
+    return;
+  }
+
+  if (bytesValue < 0) {
+    std::fprintf(stderr,
+        "FNACC error: create_bytes received negative byte count %lld\n",
+        static_cast<long long>(bytesValue));
+    std::abort();
+  }
+
+  std::size_t bytes = static_cast<std::size_t>(bytesValue);
+
+  if (bytes == 0) {
+    if (fnaccDebugEnabled()) {
+      std::fprintf(stderr,
+          "FNACC: create_bytes ignored zero-size object host=%p\n", hostPtr);
+    }
+    return;
+  }
+
+  FNACCDeviceAllocation &allocation = fnaccGetOrCreateCachedAllocation(hostPtr,
+      bytes, /*copyHostToDeviceOnCreateOrResize=*/false, "create_bytes");
+
+  if (fnaccDebugEnabled()) {
+    std::fprintf(stderr,
+        "FNACC: create_bytes host=%p device=0x%llx bytes=%zu\n", hostPtr,
+        static_cast<unsigned long long>(allocation.ptr), bytes);
+  }
+}
+
+extern "C" void __fnacc_create_desc(void *hostPtr, int64_t elementBytes,
+    int32_t rank, int64_t extent0, int64_t extent1, int64_t extent2,
+    int64_t stride0, int64_t stride1, int64_t stride2) {
+  fnaccEnsureCurrentContext();
+
+  if (!hostPtr) {
+    if (fnaccDebugEnabled())
+      std::fprintf(stderr, "FNACC: create_desc ignored null pointer\n");
+    return;
+  }
+
+  fnaccValidateContiguousDescriptor("__fnacc_create_desc", elementBytes, rank,
+      extent0, extent1, extent2, stride0, stride1, stride2);
+
+  std::size_t bytes =
+      fnaccBytesFromDescriptor(elementBytes, rank, extent0, extent1, extent2);
+
+  if (bytes == 0) {
+    if (fnaccDebugEnabled()) {
+      std::fprintf(stderr,
+          "FNACC: create_desc ignored zero-size object host=%p\n", hostPtr);
+    }
+    return;
+  }
+
+  FNACCDeviceAllocation &allocation = fnaccGetOrCreateCachedAllocation(hostPtr,
+      bytes, /*copyHostToDeviceOnCreateOrResize=*/false, "create_desc");
+
+  if (fnaccDebugEnabled()) {
+    std::fprintf(stderr,
+        "FNACC: create_desc host=%p device=0x%llx "
+        "elem_bytes=%lld rank=%d extents=(%lld,%lld,%lld) bytes=%zu\n",
+        hostPtr, static_cast<unsigned long long>(allocation.ptr),
+        static_cast<long long>(elementBytes), rank,
+        static_cast<long long>(extent0), static_cast<long long>(extent1),
+        static_cast<long long>(extent2), bytes);
+  }
+}
+
 extern "C" void __fnacc_update_device_bytes(void *hostPtr, int64_t bytesValue) {
   fnaccEnsureCurrentContext();
 

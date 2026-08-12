@@ -2141,6 +2141,30 @@ public:
   // !$fnacc release all
   void Post(const parser::FnACCReleaseAllDirective &) {}
 
+  void Post(const parser::FnACCCopyinClause &clause) {
+    auto &names{const_cast<std::list<parser::Name> &>(clause.v)};
+    for (parser::Name &name : names)
+      ResolveFNACCName(name, "ENTER DATA COPYIN clause");
+  }
+
+  void Post(const parser::FnACCCreateClause &clause) {
+    auto &names{const_cast<std::list<parser::Name> &>(clause.v)};
+    for (parser::Name &name : names)
+      ResolveFNACCName(name, "ENTER DATA CREATE clause");
+  }
+
+  void Post(const parser::FnACCCopyoutClause &clause) {
+    auto &names{const_cast<std::list<parser::Name> &>(clause.v)};
+    for (parser::Name &name : names)
+      ResolveFNACCName(name, "EXIT DATA COPYOUT clause");
+  }
+
+  void Post(const parser::FnACCDeleteClause &clause) {
+    auto &names{const_cast<std::list<parser::Name> &>(clause.v)};
+    for (parser::Name &name : names)
+      ResolveFNACCName(name, "EXIT DATA DELETE clause");
+  }
+
 private:
   void ResolveFNACCName(parser::Name &name, const char *context) {
     if (name.symbol)

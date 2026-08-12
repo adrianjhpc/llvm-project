@@ -2884,6 +2884,49 @@ public:
     Walk(x.u);
     Put("\n");
   }
+  void Unparse(const FnACCCopyinClause &x) {
+    Word("COPYIN");
+    Put("(");
+    Walk(x.v, ", ");
+    Put(")");
+  }
+  void Unparse(const FnACCCreateClause &x) {
+    Word("CREATE");
+    Put("(");
+    Walk(x.v, ", ");
+    Put(")");
+  }
+  void Unparse(const FnACCCopyoutClause &x) {
+    Word("COPYOUT");
+    Put("(");
+    Walk(x.v, ", ");
+    Put(")");
+  }
+  void Unparse(const FnACCDeleteClause &x) {
+    Word("DELETE");
+    Put("(");
+    Walk(x.v, ", ");
+    Put(")");
+  }
+  void Unparse(const FnACCEnterDataClause &x) { Walk(x.u); }
+  void Unparse(const FnACCExitDataClause &x) { Walk(x.u); }
+  void Unparse(const FnACCEnterDataDirective &x) {
+    Word("ENTER DATA");
+    const auto &clauses{std::get<0>(x.t)};
+    if (!clauses.empty()) {
+      Put(" ");
+      Walk(clauses, " ");
+    }
+  }
+
+  void Unparse(const FnACCExitDataDirective &x) {
+    Word("EXIT DATA");
+    const auto &clauses{std::get<0>(x.t)};
+    if (!clauses.empty()) {
+      Put(" ");
+      Walk(clauses, " ");
+    }
+  }
 
   void Unparse(const BasedPointer &x) {
     Put('('), Walk(std::get<0>(x.t)), Put(","), Walk(std::get<1>(x.t));
