@@ -720,10 +720,8 @@ static bool collectArrayAccesses1D(ElementwiseKernel &k, fir::DoLoopOp loop,
     return true;
   }
 
-  // Generic 1-D expression tree.
-  //
-  // For now this generic expression path still requires exactly two read
-  // arrays, for example:
+  // Generic 1-D expression tree. Supports one to three read arrays and up to
+  // three scalar captures.
   //
   //   c(i) = alpha * a(i) + beta * b(i)
   //   c(i) = (a(i) + b(i)) * alpha
@@ -790,12 +788,27 @@ static bool collectArrayAccesses2D(ElementwiseKernel &k,
   return false;
 }
 
-static bool isF32Ref(Value v) {
+static fir::fnacc::ElementType getRealRefElementType(Value v) {
   auto refTy = dyn_cast<fir::ReferenceType>(v.getType());
-  return refTy && refTy.getEleTy().isF32();
+  if (!refTy)
+    return fir::fnacc::ElementType::Unknown;
+
+  Type eleTy = refTy.getEleTy();
+
+  if (eleTy.isF32())
+    return fir::fnacc::ElementType::F32;
+
+  if (eleTy.isF64())
+    return fir::fnacc::ElementType::F64;
+
+  return fir::fnacc::ElementType::Unknown;
 }
 
-static bool isZeroF32(Value v) {
+static bool isRealRef(Value v) {
+  return getRealRefElementType(v) != fir::fnacc::ElementType::Unknown;
+}
+
+static bool isZeroReal(Value v) {
   v = stripFirConvert(v);
 
   auto cst = v.getDefiningOp<arith::ConstantOp>();
@@ -806,7 +819,7 @@ static bool isZeroF32(Value v) {
   if (!floatAttr)
     return false;
 
-  if (!floatAttr.getType().isF32())
+  if (!floatAttr.getType().isF32() && !floatAttr.getType().isF64())
     return false;
 
   return floatAttr.getValue().isZero();
@@ -862,10 +875,10 @@ static bool findAccumulatorInit(fir::DoLoopOp iLoop, fir::DoLoopOp pLoop,
     if (!st)
       continue;
 
-    if (!isZeroF32(st.getValue()))
+    if (!isZeroReal(st.getValue()))
       continue;
 
-    if (!isF32Ref(st.getMemref()))
+    if (!isRealRef(st.getMemref()))
       continue;
 
     accMemref = st.getMemref();
@@ -1129,6 +1142,11 @@ recognizeMatMul2D(fir::fnacc::LaunchOp launchOp) {
 
   if (!inferAndCheckElementType(k, reason))
     return fail(iLoop.getOperation(), reason);
+
+  if (getRealRefElementType(accMemref) != k.elementType) {
+    return fail(iLoop.getOperation(),
+                "matmul accumulator type does not match array element type");
+  }
 
   return ElementwiseRecognitionResult::success(std::move(k));
 }

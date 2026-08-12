@@ -316,6 +316,192 @@ tryCreateContiguousArrayDescriptorArgs(OpBuilder &builder, Location loc,
   return desc;
 }
 
+struct FNACCByteSizedArgs {
+  // ABI:
+  //   ptr, bytes
+  llvm::SmallVector<Value, 2> values;
+};
+
+static Value stripFirConvert(Value value) {
+  while (auto convert = value.getDefiningOp<fir::ConvertOp>())
+    value = convert.getValue();
+  return value;
+}
+
+static std::optional<Type> getReferencedObjectType(Value value) {
+  Type type = value.getType();
+
+  if (auto refTy = dyn_cast<fir::ReferenceType>(type))
+    return refTy.getEleTy();
+
+  if (auto heapTy = dyn_cast<fir::HeapType>(type))
+    return heapTy.getEleTy();
+
+  if (auto ptrTy = dyn_cast<fir::PointerType>(type))
+    return ptrTy.getEleTy();
+
+  return std::nullopt;
+}
+
+static bool isSupportedScalarByteSizedType(Type type) {
+  return type.isF32() || type.isF64() || type.isInteger(8) ||
+         type.isInteger(16) || type.isInteger(32) || type.isInteger(64);
+}
+
+static std::optional<int64_t> getScalarOrElementByteSize(Type type) {
+  if (type.isF32())
+    return 4;
+
+  if (type.isF64())
+    return 8;
+
+  if (auto intTy = dyn_cast<IntegerType>(type)) {
+    unsigned width = intTy.getWidth();
+    if (width % 8 == 0)
+      return width / 8;
+  }
+
+  return std::nullopt;
+}
+
+static std::optional<llvm::SmallVector<Value, 3>>
+tryGetExtentsFromShapeValue(Value shapeValue) {
+  if (!shapeValue)
+    return std::nullopt;
+
+  shapeValue = stripFirConvert(shapeValue);
+
+  if (auto shapeOp = shapeValue.getDefiningOp<fir::ShapeOp>()) {
+    llvm::SmallVector<Value, 3> extents;
+    for (Value extent : shapeOp.getExtents())
+      extents.push_back(extent);
+    return extents;
+  }
+
+  if (auto shapeShiftOp = shapeValue.getDefiningOp<fir::ShapeShiftOp>()) {
+    llvm::SmallVector<Value, 3> extents;
+    for (Value extent : shapeShiftOp.getExtents())
+      extents.push_back(extent);
+    return extents;
+  }
+
+  return std::nullopt;
+}
+
+static std::optional<llvm::SmallVector<Value, 3>>
+tryGetDeclareShapeExtents(Value value) {
+  value = stripFirConvert(value);
+
+  if (auto declareOp = value.getDefiningOp<fir::DeclareOp>()) {
+    Value shape = declareOp.getShape();
+    if (!shape)
+      return std::nullopt;
+
+    return tryGetExtentsFromShapeValue(shape);
+  }
+
+  return std::nullopt;
+}
+
+static std::optional<llvm::SmallVector<Value, 3>>
+tryCreateStaticSequenceExtents(OpBuilder &builder, Location loc,
+                               fir::SequenceType seqTy) {
+  llvm::SmallVector<Value, 3> extents;
+
+  for (int64_t extent : seqTy.getShape()) {
+    if (extent == fir::SequenceType::getUnknownExtent())
+      return std::nullopt;
+
+    extents.push_back(constantI64(builder, loc, extent));
+  }
+
+  return extents;
+}
+
+static std::optional<FNACCByteSizedArgs>
+tryCreateByteSizedRuntimeArgs(OpBuilder &builder, Location loc, Value var) {
+  Value value = stripFirConvert(var);
+  Value baseAddress = value;
+
+  // If this is a fir.declare result, use the declared memref as the base
+  // pointer, and use its shape operand to recover explicit-shape extents.
+  llvm::SmallVector<Value, 3> declareExtents;
+  bool hasDeclareExtents = false;
+
+  if (auto declareOp = value.getDefiningOp<fir::DeclareOp>()) {
+    baseAddress = declareOp.getMemref();
+
+    if (auto extents = tryGetDeclareShapeExtents(value)) {
+      declareExtents = *extents;
+      hasDeclareExtents = true;
+    }
+  }
+
+  std::optional<Type> objectType = getReferencedObjectType(baseAddress);
+  if (!objectType)
+    return std::nullopt;
+
+  FNACCByteSizedArgs args;
+
+  Value ptr = convertToOpaqueRuntimePtr(builder, loc, baseAddress);
+
+  // Scalar case.
+  if (!isa<fir::SequenceType>(*objectType)) {
+    if (!isSupportedScalarByteSizedType(*objectType))
+      return std::nullopt;
+
+    std::optional<int64_t> bytes = getScalarOrElementByteSize(*objectType);
+    if (!bytes)
+      return std::nullopt;
+
+    args.values.push_back(ptr);
+    args.values.push_back(constantI64(builder, loc, *bytes));
+    return args;
+  }
+
+  // Array case.
+  auto seqTy = dyn_cast<fir::SequenceType>(*objectType);
+  if (!seqTy)
+    return std::nullopt;
+
+  unsigned rank = seqTy.getDimension();
+  if (rank < 1 || rank > 3)
+    return std::nullopt;
+
+  std::optional<int64_t> elementBytes =
+      getScalarOrElementByteSize(seqTy.getEleTy());
+  if (!elementBytes)
+    return std::nullopt;
+
+  llvm::SmallVector<Value, 3> extents;
+
+  if (hasDeclareExtents) {
+    extents = declareExtents;
+  } else if (auto staticExtents =
+                 tryCreateStaticSequenceExtents(builder, loc, seqTy)) {
+    extents = *staticExtents;
+  } else {
+    // Dynamic explicit-shape arrays usually require fir.declare shape
+    // information. If it was not available, this helper cannot safely size
+    // the object.
+    return std::nullopt;
+  }
+
+  if (extents.size() != rank)
+    return std::nullopt;
+
+  Value bytesValue = constantI64(builder, loc, *elementBytes);
+
+  for (Value extent : extents) {
+    Value extentI64 = convertToI64(builder, loc, extent);
+    bytesValue = arith::MulIOp::create(builder, loc, bytesValue, extentI64);
+  }
+
+  args.values.push_back(ptr);
+  args.values.push_back(bytesValue);
+  return args;
+}
+
 static void lowerFNACCDataOpsToRuntime(ModuleOp module, OpBuilder &builder) {
   llvm::SmallVector<fir::fnacc::UpdateHostOp> updateHostOps;
   llvm::SmallVector<fir::fnacc::UpdateDeviceOp> updateDeviceOps;
@@ -339,7 +525,13 @@ static void lowerFNACCDataOpsToRuntime(ModuleOp module, OpBuilder &builder) {
     if (auto desc = tryCreateContiguousArrayDescriptorArgs(builder, loc, var)) {
       createDescriptorRuntimeCall(module, builder, loc,
                                   "__fnacc_update_host_desc", *desc);
+    } else if (auto bytes = tryCreateByteSizedRuntimeArgs(builder, loc, var)) {
+      createRuntimeCall(module, builder, loc, "__fnacc_update_host_bytes",
+                        bytes->values);
     } else {
+      op.emitWarning()
+          << "FNACC update host could not determine object size; falling "
+             "back to existing-allocation raw pointer update";
       Value ptr = convertToOpaqueRuntimePtr(builder, loc, var);
       createRuntimeCall(module, builder, loc, "__fnacc_update_host",
                         ValueRange{ptr});
@@ -357,7 +549,13 @@ static void lowerFNACCDataOpsToRuntime(ModuleOp module, OpBuilder &builder) {
     if (auto desc = tryCreateContiguousArrayDescriptorArgs(builder, loc, var)) {
       createDescriptorRuntimeCall(module, builder, loc,
                                   "__fnacc_update_device_desc", *desc);
+    } else if (auto bytes = tryCreateByteSizedRuntimeArgs(builder, loc, var)) {
+      createRuntimeCall(module, builder, loc, "__fnacc_update_device_bytes",
+                        bytes->values);
     } else {
+      op.emitWarning()
+          << "FNACC update device could not determine object size; falling "
+             "back to existing-allocation raw pointer update";
       Value ptr = convertToOpaqueRuntimePtr(builder, loc, var);
       createRuntimeCall(module, builder, loc, "__fnacc_update_device",
                         ValueRange{ptr});

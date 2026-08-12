@@ -1360,6 +1360,100 @@ static FNACCDeviceAllocation &fnaccGetOrCreateCachedAllocation(void *hostPtr,
   return inserted.first->second;
 }
 
+extern "C" void __fnacc_update_device_bytes(void *hostPtr, int64_t bytesValue) {
+  fnaccEnsureCurrentContext();
+
+  if (!hostPtr) {
+    if (fnaccDebugEnabled())
+      std::fprintf(stderr, "FNACC: update_device_bytes ignored null pointer\n");
+    return;
+  }
+
+  if (bytesValue < 0) {
+    std::fprintf(stderr,
+        "FNACC error: update_device_bytes received negative byte count %lld\n",
+        static_cast<long long>(bytesValue));
+    std::abort();
+  }
+
+  std::size_t bytes = static_cast<std::size_t>(bytesValue);
+
+  if (bytes == 0) {
+    if (fnaccDebugEnabled()) {
+      std::fprintf(stderr,
+          "FNACC: update_device_bytes ignored zero-size object host=%p\n",
+          hostPtr);
+    }
+    return;
+  }
+
+  FNACCDeviceAllocation &allocation = fnaccGetOrCreateCachedAllocation(hostPtr,
+      bytes, /*copyHostToDeviceOnCreateOrResize=*/false, "update_device_bytes");
+
+  FNACC_CUDA_CHECK(cuMemcpyHtoD(allocation.ptr, hostPtr, bytes));
+
+  if (fnaccDebugEnabled()) {
+    std::fprintf(stderr,
+        "FNACC: update_device_bytes host=%p device=0x%llx bytes=%zu\n", hostPtr,
+        static_cast<unsigned long long>(allocation.ptr), bytes);
+  }
+}
+
+extern "C" void __fnacc_update_host_bytes(void *hostPtr, int64_t bytesValue) {
+  fnaccEnsureCurrentContext();
+
+  if (!hostPtr) {
+    if (fnaccDebugEnabled())
+      std::fprintf(stderr, "FNACC: update_host_bytes ignored null pointer\n");
+    return;
+  }
+
+  if (bytesValue < 0) {
+    std::fprintf(stderr,
+        "FNACC error: update_host_bytes received negative byte count %lld\n",
+        static_cast<long long>(bytesValue));
+    std::abort();
+  }
+
+  std::size_t bytes = static_cast<std::size_t>(bytesValue);
+
+  if (bytes == 0) {
+    if (fnaccDebugEnabled()) {
+      std::fprintf(stderr,
+          "FNACC: update_host_bytes ignored zero-size object host=%p\n",
+          hostPtr);
+    }
+    return;
+  }
+
+  auto it = fnaccRegistry.deviceCache.find(hostPtr);
+  if (it == fnaccRegistry.deviceCache.end()) {
+    if (fnaccDebugEnabled()) {
+      std::fprintf(stderr,
+          "FNACC: update_host_bytes ignored; no cached allocation for "
+          "host=%p bytes=%zu\n",
+          hostPtr, bytes);
+    }
+    return;
+  }
+
+  if (it->second.bytes < bytes) {
+    std::fprintf(stderr,
+        "FNACC error: update_host_bytes requested %zu bytes for host=%p, "
+        "but cached allocation has only %zu bytes\n",
+        bytes, hostPtr, it->second.bytes);
+    std::abort();
+  }
+
+  FNACC_CUDA_CHECK(cuMemcpyDtoH(hostPtr, it->second.ptr, bytes));
+
+  if (fnaccDebugEnabled()) {
+    std::fprintf(stderr,
+        "FNACC: update_host_bytes host=%p device=0x%llx bytes=%zu\n", hostPtr,
+        static_cast<unsigned long long>(it->second.ptr), bytes);
+  }
+}
+
 extern "C" void __fnacc_update_device_desc(void *hostPtr, int64_t elementBytes,
     int32_t rank, int64_t extent0, int64_t extent1, int64_t extent2,
     int64_t stride0, int64_t stride1, int64_t stride2) {
@@ -2279,7 +2373,7 @@ extern "C" void __fnacc_launch_f64_v1(int32_t kernelId, int32_t rank,
 
   if (fnaccDebugEnabled()) {
     std::fprintf(stderr,
-        "FNACC: launch generic f32 kernel id=%d rank=%d "
+        "FNACC: launch generic f64 kernel id=%d rank=%d "
         "reads=%d scalars=%d grid=(%u,%u,1) tile=(%d,%d,%d) "
         "cuda_block=(%u,1,1) extent=(%d,%d,%d) bytes=%zu\n",
         kernelId, rank, numReadArrays, numScalars, gridX, gridY, blockX, blockY,
@@ -2454,6 +2548,150 @@ extern "C" void __fnacc_launch_matmul_f32_v1(int32_t kernelId, int32_t blockX,
     if (fnaccDebugEnabled()) {
       std::fprintf(stderr,
           "FNACC: skipped automatic copy-back for matmul write slot %d "
+          "because target=device; use !$fnacc update host(...) to copy back\n",
+          cDev.slot);
+    }
+  }
+
+  fnaccReleaseDeviceArg(aDev);
+  fnaccReleaseDeviceArg(bDev);
+  fnaccReleaseDeviceArg(cDev);
+}
+
+extern "C" void __fnacc_launch_matmul_f64_v1(int32_t kernelId, int32_t blockX,
+    int32_t blockY, int32_t blockK, double *a, double *b, double *c, int32_t n,
+    int32_t m, int32_t k) {
+  fnaccEnsureCurrentContext();
+
+  fnaccValidateHostLaunchAgainstDesc(kernelId, 2, blockX, blockY, blockK);
+
+  if (!a || !b || !c) {
+    std::fprintf(stderr,
+        "FNACC error: null host pointer in __fnacc_launch_matmul_f64_v1: "
+        "a=%p b=%p c=%p\n",
+        static_cast<void *>(a), static_cast<void *>(b), static_cast<void *>(c));
+    std::abort();
+  }
+
+  if (n <= 0 || m <= 0 || k <= 0) {
+    if (fnaccDebugEnabled()) {
+      std::fprintf(stderr,
+          "FNACC: skipping f64 matmul with non-positive extent "
+          "n=%d m=%d k=%d\n",
+          n, m, k);
+    }
+    return;
+  }
+
+  if (blockX <= 0 || blockY <= 0 || blockK <= 0) {
+    std::fprintf(stderr,
+        "FNACC error: invalid f64 matmul tile shape (%d,%d,%d)\n", blockX,
+        blockY, blockK);
+    std::abort();
+  }
+
+  CUfunction fn = getKernelFunction(kernelId);
+  fnaccDebugFunctionAttributes(fn, kernelId);
+
+  unsigned gridX = fnaccCdiv(n, blockX);
+  unsigned gridY = fnaccCdiv(m, blockY);
+  unsigned gridZ = 1;
+
+  unsigned cudaBlockX = fnaccCudaThreadsPerCTA(kernelId);
+
+  const FNACCKernelDesc *desc = fnaccLookupKernelDesc(kernelId);
+
+  if (!desc) {
+    std::fprintf(stderr,
+        "FNACC error: no JSON descriptor for f64 matmul kernel id %d\n",
+        kernelId);
+    std::abort();
+  }
+
+  if (desc->kind != "matmul2d") {
+    std::fprintf(stderr,
+        "FNACC error: f64 matmul launcher called for kernel id %d "
+        "but JSON kind is '%s'\n",
+        kernelId, desc->kind.c_str());
+    std::abort();
+  }
+
+  std::size_t bytesA =
+      fnaccCheckedBytes2D(n, k, sizeof(double), "f64 matmul A bytes");
+  std::size_t bytesB =
+      fnaccCheckedBytes2D(k, m, sizeof(double), "f64 matmul B bytes");
+  std::size_t bytesC =
+      fnaccCheckedBytes2D(n, m, sizeof(double), "f64 matmul C bytes");
+
+  int32_t aTarget = fnaccPackTargetForSlot(desc, 0);
+  int32_t bTarget = fnaccPackTargetForSlot(desc, 1);
+  int32_t cTarget = fnaccPackTargetForSlot(desc, 2);
+
+  FNACCDeviceArg aDev = fnaccPrepareReadBuffer(a, bytesA, aTarget, 0);
+  FNACCDeviceArg bDev = fnaccPrepareReadBuffer(b, bytesB, bTarget, 1);
+  FNACCDeviceArg cDev = fnaccPrepareWriteBuffer(c, bytesC, cTarget, 2);
+
+  CUdeviceptr dA = aDev.ptr;
+  CUdeviceptr dB = bDev.ptr;
+  CUdeviceptr dC = cDev.ptr;
+
+  fnaccValidateSupportedHiddenPtrArgCount(kernelId);
+  FNACCHiddenTritonArgs hidden;
+
+  void *args[] = {
+      &dA,
+      &dB,
+      &dC,
+      &n,
+      &m,
+      &k,
+      &hidden.hidden0,
+      &hidden.hidden1,
+  };
+
+  // The f64 fallback TTIR path does not use Triton dot or dynamic shared
+  // memory.
+  unsigned dynamicSharedBytes = 0;
+
+  if (fnaccDebugEnabled()) {
+    std::fprintf(stderr,
+        "FNACC: launch f64 matmul kernel id=%d "
+        "grid=(%u,%u,%u) tile=(%d,%d,%d) "
+        "cuda_block=(%u,1,1) dynamic_shared_bytes=%u "
+        "n=%d m=%d k=%d "
+        "bytesA=%zu bytesB=%zu bytesC=%zu "
+        "targets=(%s,%s,%s)\n",
+        kernelId, gridX, gridY, gridZ, blockX, blockY, blockK, cudaBlockX,
+        dynamicSharedBytes, n, m, k, bytesA, bytesB, bytesC,
+        fnaccPackTargetName(aTarget), fnaccPackTargetName(bTarget),
+        fnaccPackTargetName(cTarget));
+
+    std::fprintf(stderr,
+        "FNACC: f64 matmul args: "
+        "dA=0x%llx dB=0x%llx dC=0x%llx "
+        "n=%d m=%d k=%d hidden0=0x%llx hidden1=0x%llx "
+        "args={%p,%p,%p,%p,%p,%p,%p,%p}\n",
+        static_cast<unsigned long long>(dA),
+        static_cast<unsigned long long>(dB),
+        static_cast<unsigned long long>(dC), n, m, k,
+        static_cast<unsigned long long>(hidden.hidden0),
+        static_cast<unsigned long long>(hidden.hidden1), args[0], args[1],
+        args[2], args[3], args[4], args[5], args[6], args[7]);
+  }
+
+  fnaccValidateCudaBlockSize(fn, kernelId, cudaBlockX);
+
+  FNACC_CUDA_CHECK(cuLaunchKernel(fn, gridX, gridY, gridZ, cudaBlockX, 1, 1,
+      dynamicSharedBytes, nullptr, args, nullptr));
+
+  FNACC_CUDA_CHECK(cuCtxSynchronize());
+
+  if (cDev.target == FNACC_PACK_TARGET_HOST) {
+    fnaccCopyBackWriteBuffer(c, cDev, bytesC);
+  } else {
+    if (fnaccDebugEnabled()) {
+      std::fprintf(stderr,
+          "FNACC: skipped automatic copy-back for f64 matmul write slot %d "
           "because target=device; use !$fnacc update host(...) to copy back\n",
           cDev.slot);
     }

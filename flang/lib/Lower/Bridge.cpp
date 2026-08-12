@@ -3692,8 +3692,9 @@ private:
           clause.u);
     }
 
-    auto launchOp = fir::fnacc::LaunchOp::create(*builder, loc, tileSizes,
-                                                 packVars, packTargets);
+    auto launchOp = fir::fnacc::LaunchOp::create(
+        *builder, loc, builder->getDenseI64ArrayAttr(tileSizes), packVars,
+        builder->getDenseI32ArrayAttr(packTargets));
 
     // 4. New block inside the region
     builder->createBlock(&launchOp.getRegion());
@@ -3734,7 +3735,6 @@ private:
         Fortran::common::visitors{
             [&](const Fortran::parser::FnACCUpdateHostDirective &dir) {
               const auto &names{std::get<0>(dir.t)};
-                  
 
               for (const Fortran::parser::Name &name : names) {
                 mlir::Value value = getValueForName(name);
