@@ -60,8 +60,8 @@ module {
 // CHECK-SAME: %[[NREAD]], %[[NSCALAR]]
 
 // TTIR: tt.func @fnacc_kernel_0
-// TTIR-SAME: %a: !tt.ptr<f32>
-// TTIR-SAME: %b: !tt.ptr<f32>
+// TTIR-SAME: %read0: !tt.ptr<f32>
+// TTIR-SAME: %read1: !tt.ptr<f32>
 // TTIR-SAME: %c: !tt.ptr<f32>
 // TTIR-SAME: %scalar0: f32
 // TTIR-SAME: %scalar1: f32

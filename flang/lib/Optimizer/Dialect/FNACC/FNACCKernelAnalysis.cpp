@@ -398,11 +398,11 @@ recognizeExpr1D(Value v, const ArrayAccessInfo &info, ElementwiseKernel &k,
   return expr;
 }
 
-static bool detectGenericExpr1D(ElementwiseKernel &k,
-                                const ArrayAccessInfo &info,
-                                std::string &reason) {
-  k.kind = ElementwiseKernelKind::Expr1D;
-  k.rank = 1;
+static bool detectGenericExpr(ElementwiseKernel &k, const ArrayAccessInfo &info,
+                              int rank, std::string &reason) {
+  k.kind =
+      rank == 1 ? ElementwiseKernelKind::Expr1D : ElementwiseKernelKind::Expr2D;
+  k.rank = rank;
   k.writeArray = info.writeArray;
   k.readArrays.clear();
   k.scalarRefs.clear();
@@ -412,13 +412,13 @@ static bool detectGenericExpr1D(ElementwiseKernel &k,
   if (!expr)
     return false;
 
-  if (k.readArrays.size() != 2) {
-    reason = "expression tree currently requires exactly two read arrays";
+  if (k.readArrays.empty() || k.readArrays.size() > 3) {
+    reason = "expression tree supports one to three read arrays";
     return false;
   }
 
-  if (k.scalarRefs.size() > 2) {
-    reason = "expression tree currently supports at most two scalar f32 values";
+  if (k.scalarRefs.size() > 3) {
+    reason = "expression tree supports at most three scalar f32 values";
     return false;
   }
 
@@ -435,7 +435,9 @@ static bool detectGenericExpr1D(ElementwiseKernel &k,
 static bool collectArrayAccessesFromBody(Block *body, unsigned expectedRank,
                                          ArrayRef<Value> expectedIndexMemrefs,
                                          ArrayAccessInfo &info,
-                                         std::string &reason) {
+                                         std::string &reason,
+                                         unsigned minReads = 1,
+                                         unsigned maxReads = 3) {
   if (!body) {
     reason = "loop has no body";
     return false;
@@ -485,8 +487,9 @@ static bool collectArrayAccessesFromBody(Block *body, unsigned expectedRank,
     return false;
   }
 
-  if (info.readArrays.size() != 2 || info.readValues.size() != 2) {
-    reason = "kernel expected exactly two read arrays";
+  if (info.readArrays.size() < minReads || info.readArrays.size() > maxReads ||
+      info.readValues.size() < minReads || info.readValues.size() > maxReads) {
+    reason = "kernel has unsupported number of read arrays";
     return false;
   }
 
@@ -606,7 +609,7 @@ static bool collectArrayAccesses1D(ElementwiseKernel &k, fir::DoLoopOp loop,
   llvm::SmallVector<Value> indexMemrefs;
   indexMemrefs.push_back(indMemref);
 
-  if (!collectArrayAccessesFromBody(body, 1, indexMemrefs, info, reason))
+  if (!collectArrayAccessesFromBody(body, 1, indexMemrefs, info, reason, 1, 3))
     return false;
 
   if (!info.writeArray) {
@@ -614,8 +617,8 @@ static bool collectArrayAccesses1D(ElementwiseKernel &k, fir::DoLoopOp loop,
     return false;
   }
 
-  if (info.readArrays.size() != 2) {
-    reason = "kernel expected exactly two read arrays";
+  if (info.readArrays.empty() || info.readArrays.size() > 3) {
+    reason = "kernel expected one to three read arrays";
     return false;
   }
 
@@ -655,7 +658,7 @@ static bool collectArrayAccesses1D(ElementwiseKernel &k, fir::DoLoopOp loop,
   //
   // One-read expressions such as c(i) = a(i) + 1.0 require a future ABI update.
   std::string exprReason;
-  if (detectGenericExpr1D(k, info, exprReason))
+  if (detectGenericExpr(k, info, 1, exprReason))
     return true;
 
   reason = "unsupported 1-D elementwise expression; binary failure: ";
@@ -680,21 +683,41 @@ static bool collectArrayAccesses2D(ElementwiseKernel &k,
   indexMemrefs.push_back(outerIndMemref);
 
   if (!collectArrayAccessesFromBody(innerLoop.getBody(), 2, indexMemrefs, info,
-                                    reason))
+                                    reason, 1, 3))
     return false;
 
-  if (!detectDirectBinaryArrayArray(k, info, reason))
-    return false;
+  // Existing direct binary 2-D form:
+  //
+  //   c(i,j) = a(i,j) op b(i,j)
+  std::string binaryReason;
+  if (info.readArrays.size() == 2 &&
+      detectDirectBinaryArrayArray(k, info, binaryReason)) {
+    k.rank = 2;
+    k.scalarRefs.clear();
 
-  k.rank = 2;
-  k.scalarRefs.clear();
+    if (!allArraysAreF32(k)) {
+      reason = "only f32 arrays are currently supported";
+      return false;
+    }
 
-  if (!allArraysAreF32(k)) {
-    reason = "only f32 arrays are currently supported";
-    return false;
+    return true;
   }
 
-  return true;
+  // New generic 2-D expression form:
+  //
+  //   c(i,j) = alpha * a(i,j) + beta * b(i,j)
+  //   c(i,j) = a(i,j) + b(i,j) + d(i,j)
+  //   c(i,j) = a(i,j) + 1.0
+  std::string exprReason;
+  if (detectGenericExpr(k, info, 2, exprReason))
+    return true;
+
+  reason = "unsupported 2-D expression; binary failure: ";
+  reason += binaryReason;
+  reason += "; expression-tree failure: ";
+  reason += exprReason;
+
+  return false;
 }
 
 static bool isF32Ref(Value v) {

@@ -25,7 +25,10 @@ end subroutine
 ! HOST-DAG: func.func private @__fnacc_launch_matmul_f32_v1
 
 ! HOST-LABEL: func.func @_QPmatmul_2d_fnacc_kernel
-! HOST: call @__fnacc_launch_matmul_f32_v1
+! HOST-DAG: %[[BX:.*]] = arith.constant 16 : i32
+! HOST-DAG: %[[BY:.*]] = arith.constant 16 : i32
+! HOST-DAG: %[[BK:.*]] = arith.constant 32 : i32
+! HOST: call @__fnacc_launch_matmul_f32_v1(%{{.*}}, %[[BX]], %[[BY]], %[[BK]],
 ! HOST-NOT: fnacc.launch
 
 ! TTIR-LABEL: tt.func @fnacc_kernel_0

@@ -213,8 +213,10 @@ static std::string emitExpr1D(const fir::fnacc::ElementwiseKernel &k,
       return "%read0v";
     if (index == 1)
       return "%read1v";
+    if (index == 2)
+      return "%read2v";
 
-    llvm_unreachable("only two read arrays are currently supported");
+    llvm_unreachable("only three read arrays are currently supported");
   }
 
   case fir::fnacc::ElementwiseExprKind::ScalarLoad: {
@@ -282,8 +284,15 @@ static void emitTritonExpr1D(const fir::fnacc::ElementwiseKernel &k,
   assert(k.readArrays.size() == 2 &&
          "Expr1D TTIR emission currently requires exactly two read arrays");
 
-  os << "tt.func @" << kernelName
-     << "(%a: !tt.ptr<f32>, %b: !tt.ptr<f32>, %c: !tt.ptr<f32>";
+  os << "tt.func @" << kernelName << "(";
+
+  for (unsigned i = 0; i < k.readArrays.size(); ++i) {
+    if (i != 0)
+      os << ", ";
+    os << "%read" << i << ": !tt.ptr<f32>";
+  }
+
+  os << ", %c: !tt.ptr<f32>";
 
   for (unsigned i = 0; i < k.scalarRefs.size(); ++i)
     os << ", %scalar" << i << ": f32";
@@ -314,12 +323,14 @@ static void emitTritonExpr1D(const fir::fnacc::ElementwiseKernel &k,
        << "x!tt.ptr<f32>>\n";
   };
 
-  // For now the generic expression ABI still supports up to two read arrays.
-  if (!k.readArrays.empty())
-    loadArr("%a", "%read0v");
+  if (k.readArrays.size() >= 1)
+    loadArr("%read0", "%read0v");
 
   if (k.readArrays.size() >= 2)
-    loadArr("%b", "%read1v");
+    loadArr("%read1", "%read1v");
+
+  if (k.readArrays.size() >= 3)
+    loadArr("%read2", "%read2v");
 
   ExprTritonEmitterState state;
   state.block = block;
@@ -414,6 +425,102 @@ static void emitTriton2D(const fir::fnacc::ElementwiseKernel &k, int64_t blockX,
      << "x!tt.ptr<f32>>, tensor<" << block << "xi32>\n";
 
   os << "  tt.store %co, %rval, %mask : tensor<" << block << "x!tt.ptr<f32>>\n";
+
+  os << "  tt.return\n";
+  os << "}\n\n";
+}
+
+static void emitTritonExpr2D(const fir::fnacc::ElementwiseKernel &k,
+                             int64_t blockX, int64_t blockY,
+                             StringRef kernelName, llvm::raw_ostream &os) {
+  assert(k.expression && "Expr2D kernel has no expression tree");
+  assert(!k.readArrays.empty() && k.readArrays.size() <= 3 &&
+         "Expr2D requires one to three read arrays");
+
+  int64_t block = blockX * blockY;
+
+  os << "tt.func @" << kernelName << "(";
+
+  for (unsigned i = 0; i < k.readArrays.size(); ++i) {
+    if (i != 0)
+      os << ", ";
+    os << "%read" << i << ": !tt.ptr<f32>";
+  }
+
+  os << ", %c: !tt.ptr<f32>";
+
+  for (unsigned i = 0; i < k.scalarRefs.size(); ++i)
+    os << ", %scalar" << i << ": f32";
+
+  os << ", %n: i32, %m: i32) attributes {noinline = false} {\n";
+
+  os << "  %pid_x = tt.get_program_id x : i32\n";
+  os << "  %pid_y = tt.get_program_id y : i32\n";
+
+  os << "  %bx = arith.constant " << blockX << " : i32\n";
+  os << "  %by = arith.constant " << blockY << " : i32\n";
+
+  os << "  %base_x = arith.muli %pid_x, %bx : i32\n";
+  os << "  %base_y = arith.muli %pid_y, %by : i32\n";
+
+  os << "  %r = tt.make_range {start = 0 : i32, end = " << block
+     << " : i32} : tensor<" << block << "xi32>\n";
+
+  os << "  %bx_s = tt.splat %bx : i32 -> tensor<" << block << "xi32>\n";
+  os << "  %local_i = arith.remui %r, %bx_s : tensor<" << block << "xi32>\n";
+  os << "  %local_j = arith.divui %r, %bx_s : tensor<" << block << "xi32>\n";
+
+  os << "  %base_x_s = tt.splat %base_x : i32 -> tensor<" << block << "xi32>\n";
+  os << "  %base_y_s = tt.splat %base_y : i32 -> tensor<" << block << "xi32>\n";
+
+  os << "  %ix = arith.addi %base_x_s, %local_i : tensor<" << block
+     << "xi32>\n";
+  os << "  %jy = arith.addi %base_y_s, %local_j : tensor<" << block
+     << "xi32>\n";
+
+  os << "  %n_s = tt.splat %n : i32 -> tensor<" << block << "xi32>\n";
+  os << "  %m_s = tt.splat %m : i32 -> tensor<" << block << "xi32>\n";
+
+  os << "  %mask_x = arith.cmpi slt, %ix, %n_s : tensor<" << block << "xi32>\n";
+  os << "  %mask_y = arith.cmpi slt, %jy, %m_s : tensor<" << block << "xi32>\n";
+  os << "  %mask = arith.andi %mask_x, %mask_y : tensor<" << block << "xi1>\n";
+
+  os << "  %jy_n = arith.muli %jy, %n_s : tensor<" << block << "xi32>\n";
+  os << "  %offs = arith.addi %ix, %jy_n : tensor<" << block << "xi32>\n";
+
+  auto loadArr = [&](StringRef ptr, StringRef dst) {
+    os << "  " << dst << "p = tt.splat " << ptr << " : !tt.ptr<f32> -> tensor<"
+       << block << "x!tt.ptr<f32>>\n";
+
+    os << "  " << dst << "o = tt.addptr " << dst << "p, %offs : tensor<"
+       << block << "x!tt.ptr<f32>>, tensor<" << block << "xi32>\n";
+
+    os << "  " << dst << " = tt.load " << dst << "o, %mask : tensor<" << block
+       << "x!tt.ptr<f32>>\n";
+  };
+
+  if (k.readArrays.size() >= 1)
+    loadArr("%read0", "%read0v");
+  if (k.readArrays.size() >= 2)
+    loadArr("%read1", "%read1v");
+  if (k.readArrays.size() >= 3)
+    loadArr("%read2", "%read2v");
+
+  ExprTritonEmitterState state;
+  state.block = block;
+  state.scalarSplatEmitted.resize(k.scalarRefs.size(), false);
+  state.scalarSplatNames.resize(k.scalarRefs.size());
+
+  std::string result = emitExpr1D(k, *k.expression, state, os);
+
+  os << "  %cp = tt.splat %c : !tt.ptr<f32> -> tensor<" << block
+     << "x!tt.ptr<f32>>\n";
+
+  os << "  %co = tt.addptr %cp, %offs : tensor<" << block
+     << "x!tt.ptr<f32>>, tensor<" << block << "xi32>\n";
+
+  os << "  tt.store %co, " << result << ", %mask : tensor<" << block
+     << "x!tt.ptr<f32>>\n";
 
   os << "  tt.return\n";
   os << "}\n\n";
@@ -618,9 +725,8 @@ static void emitTritonMatMul2D(const fir::fnacc::ElementwiseKernel &k,
 
   // Accumulate using dot.
   //
-  // Depending on your Triton version, this may need slight syntax adjustment.
   os << "    %acc_next = tt.dot %a_tile, %b_tile, %acc_body "
-        "{inputPrecision = 1 : i32} : tensor<"
+        "{inputPrecision = 0 : i32} : tensor<"
      << blockM << "x" << blockK << "xf32> * tensor<" << blockK << "x" << blockN
      << "xf32> -> tensor<" << blockM << "x" << blockN << "xf32>\n";
 
@@ -738,6 +844,8 @@ static void emitJsonDescriptor(
     kindName = "saxpy1d";
   else if (k.kind == fir::fnacc::ElementwiseKernelKind::Expr1D)
     kindName = "expr1d";
+  else if (k.kind == fir::fnacc::ElementwiseKernelKind::Expr2D)
+    kindName = "expr2d";
   else if (k.kind == fir::fnacc::ElementwiseKernelKind::MatMul2D)
     kindName = "matmul2d";
 
@@ -756,7 +864,8 @@ static void emitJsonDescriptor(
   os << "      \"triton_hidden_ptr_args\": " << kTritonHiddenPtrArgs << ",\n";
 
   if (k.kind == fir::fnacc::ElementwiseKernelKind::MatMul2D) {
-    os << "      \"grid\": [\"extent_x\", \"extent_y\", \"1\"],\n";
+    os << "      \"grid\": [\"cdiv(extent_x, tile_x)\", "
+       << "\"cdiv(extent_y, tile_y)\", \"1\"],\n";
   } else if (k.rank == 2) {
     os << "      \"grid\": [\"cdiv(extent_x, tile_x)\", "
        << "\"cdiv(extent_y, tile_y)\", \"1\"],\n";
@@ -765,14 +874,24 @@ static void emitJsonDescriptor(
   }
 
   os << "      \"params\": [\n";
-  os << "        {\"slot\": 0, \"role\": \"read\",     \"name\": \"read0\",    "
-        "\"type\": \"ptr<f32>\"},\n";
-  os << "        {\"slot\": 1, \"role\": \"read\",     \"name\": \"read1\",    "
-        "\"type\": \"ptr<f32>\"},\n";
-  os << "        {\"slot\": 2, \"role\": \"write\",    \"name\": \"write\",    "
-        "\"type\": \"ptr<f32>\"}";
 
-  unsigned nextSlot = 3;
+  unsigned nextSlot = 0;
+
+  for (unsigned i = 0; i < k.readArrays.size(); ++i) {
+    if (i != 0)
+      os << ",\n";
+
+    os << "        {\"slot\": " << nextSlot++
+       << ", \"role\": \"read\",     \"name\": \"read" << i
+       << "\",    \"type\": \"ptr<f32>\"}";
+  }
+
+  if (!k.readArrays.empty())
+    os << ",\n";
+
+  os << "        {\"slot\": " << nextSlot++
+     << ", \"role\": \"write\",    \"name\": \"write\",    "
+     << "\"type\": \"ptr<f32>\"}";
 
   for (unsigned i = 0; i < k.scalarRefs.size(); ++i) {
     os << ",\n";
@@ -892,6 +1011,7 @@ struct FNACCLowerToTritonPass
       case fir::fnacc::ElementwiseKernelKind::BinaryArrayArray:
       case fir::fnacc::ElementwiseKernelKind::Saxpy1D:
       case fir::fnacc::ElementwiseKernelKind::Expr1D:
+      case fir::fnacc::ElementwiseKernelKind::Expr2D:
         hasSimpleElementwiseLaunch = true;
         break;
 
@@ -1001,6 +1121,9 @@ struct FNACCLowerToTritonPass
         if (k.kind == fir::fnacc::ElementwiseKernelKind::MatMul2D) {
           blockZ = tiles.size() >= 3 ? tiles[2] : 32;
           emitTritonMatMul2D(k, blockX, blockY, blockZ, kernelName, ttirOs);
+        } else if (k.kind == fir::fnacc::ElementwiseKernelKind::Expr2D) {
+          blockZ = 1;
+          emitTritonExpr2D(k, blockX, blockY, kernelName, ttirOs);
         } else {
           blockZ = 1;
           emitTriton2D(k, blockX, blockY, kernelName, ttirOs);

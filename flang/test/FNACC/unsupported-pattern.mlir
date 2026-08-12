@@ -4,12 +4,13 @@
 // RUN:   %s -o /dev/null 2>&1 | FileCheck %s
 
 module {
-  func.func @unsupported_three_reads(
+  func.func @unsupported_four_reads(
       %nref: !fir.ref<i32>,
       %i: !fir.ref<i32>,
       %a: !fir.ref<!fir.array<?xf32>>,
       %b: !fir.ref<!fir.array<?xf32>>,
       %d: !fir.ref<!fir.array<?xf32>>,
+      %e: !fir.ref<!fir.array<?xf32>>,
       %c: !fir.ref<!fir.array<?xf32>>) {
     %c1_i32 = arith.constant 1 : i32
     %n = fir.load %nref : !fir.ref<i32>
@@ -35,12 +36,18 @@ module {
         %dp = fir.array_coor %d(%shape) %idx2 : (!fir.ref<!fir.array<?xf32>>, !fir.shape<1>, i64) -> !fir.ref<f32>
         %dv = fir.load %dp : !fir.ref<f32>
 
-        %tmp = arith.addf %av, %bv : f32
-        %r = arith.addf %tmp, %dv : f32
-
         %i3 = fir.load %i : !fir.ref<i32>
         %idx3 = fir.convert %i3 : (i32) -> i64
-        %cp = fir.array_coor %c(%shape) %idx3 : (!fir.ref<!fir.array<?xf32>>, !fir.shape<1>, i64) -> !fir.ref<f32>
+        %ep = fir.array_coor %e(%shape) %idx3 : (!fir.ref<!fir.array<?xf32>>, !fir.shape<1>, i64) -> !fir.ref<f32>
+        %ev = fir.load %ep : !fir.ref<f32>
+
+        %tmp0 = arith.addf %av, %bv : f32
+        %tmp1 = arith.addf %tmp0, %dv : f32
+        %r = arith.addf %tmp1, %ev : f32
+
+        %i4 = fir.load %i : !fir.ref<i32>
+        %idx4 = fir.convert %i4 : (i32) -> i64
+        %cp = fir.array_coor %c(%shape) %idx4 : (!fir.ref<!fir.array<?xf32>>, !fir.shape<1>, i64) -> !fir.ref<f32>
         fir.store %r to %cp : !fir.ref<f32>
       }
 
@@ -52,5 +59,5 @@ module {
 }
 
 // CHECK: warning: FNACC runtime lowering skipped launch:
-// CHECK-SAME: kernel expected exactly two read arrays
+// CHECK-SAME: unsupported number of read arrays
 

@@ -43,6 +43,7 @@ enum class ElementwiseKernelKind {
   BinaryArrayArray,
   Saxpy1D,
   Expr1D,
+  Expr2D,
   MatMul2D
 };
 

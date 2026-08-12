@@ -79,7 +79,7 @@ static void fnaccConfigureDynamicSharedMemory(
   }
 }
 
-static unsigned fnaccGetEnvUnsignedOrDefault(
+static unsigned fnaccGetEnvUnsignedAllowZero(
     const char *name, unsigned fallback) {
   const char *value = std::getenv(name);
   if (!value || value[0] == '\0')
@@ -88,7 +88,7 @@ static unsigned fnaccGetEnvUnsignedOrDefault(
   char *end = nullptr;
   unsigned long parsed = std::strtoul(value, &end, 10);
 
-  if (end == value || *end != '\0' || parsed == 0 ||
+  if (end == value || *end != '\0' ||
       parsed >
           static_cast<unsigned long>(std::numeric_limits<unsigned>::max())) {
     std::fprintf(stderr, "FNACC error: invalid %s value '%s'\n", name, value);
@@ -581,65 +581,6 @@ static bool fnaccHasEmbeddedJson() {
   return fnaccEmbeddedJsonData && fnaccEmbeddedJsonSize > 0;
 }
 
-static unsigned fnaccMatmulDynamicSharedBytes(const FNACCKernelDesc *desc,
-    int32_t blockX, int32_t blockY, int32_t blockK) {
-  // Explicit override for experiments/debugging.
-  //
-  // Example:
-  //   FNACC_MATMUL_SHARED_BYTES=49152
-  if (const char *value = std::getenv("FNACC_MATMUL_SHARED_BYTES")) {
-    if (value[0] != '\0')
-      return fnaccGetEnvUnsignedOrDefault("FNACC_MATMUL_SHARED_BYTES", 49152);
-  }
-
-  int32_t stages = 1;
-  if (desc && desc->numStages > 0)
-    stages = desc->numStages;
-
-  // Conservative estimate for A and B staged tiles:
-  //
-  //   A tile: blockX x blockK
-  //   B tile: blockK x blockY
-  //
-  // For tile=(16,16,32):
-  //   one stage = (16*32 + 32*16) * 4 = 4096 bytes
-  //   three stages = 12288 bytes
-  //
-  // In practice Triton lowering may require padding/alignment, so keep a
-  // conservative minimum.
-  std::size_t aElems = fnaccCheckedMul(static_cast<std::size_t>(blockX),
-      static_cast<std::size_t>(blockK),
-      "matmul dynamic shared A tile elements");
-  std::size_t bElems = fnaccCheckedMul(static_cast<std::size_t>(blockK),
-      static_cast<std::size_t>(blockY),
-      "matmul dynamic shared B tile elements");
-
-  std::size_t elems =
-      fnaccCheckedMul(aElems + bElems, static_cast<std::size_t>(stages),
-          "matmul dynamic shared staged tile elements");
-
-  std::size_t bytes =
-      fnaccCheckedMul(elems, sizeof(float), "matmul dynamic shared bytes");
-
-  // Align to 256 bytes.
-  bytes = (bytes + 255) & ~static_cast<std::size_t>(255);
-
-  // Conservative prototype minimum. This should cover the current 16x16x32
-  // matmul tile and common Triton padding.
-  if (bytes < 16384)
-    bytes = 16384;
-
-  if (bytes > static_cast<std::size_t>(std::numeric_limits<unsigned>::max())) {
-    std::fprintf(stderr,
-        "FNACC error: matmul dynamic shared memory requirement too large: "
-        "%zu bytes\n",
-        bytes);
-    std::abort();
-  }
-
-  return static_cast<unsigned>(bytes);
-}
-
 static std::string fnaccReadTextFile(const char *path) {
   std::ifstream file(path, std::ios::in | std::ios::binary);
   if (!file) {
@@ -811,6 +752,70 @@ static void fnaccCleanup() {
   }
 
   fnaccRegistry.initialized = false;
+}
+
+static unsigned fnaccMatmulDynamicSharedBytes(const FNACCKernelDesc *desc,
+    int32_t blockX, int32_t blockY, int32_t blockK) {
+  int32_t stages = 1;
+  if (desc && desc->numStages > 0)
+    stages = desc->numStages;
+
+  std::size_t aElems = fnaccCheckedMul(static_cast<std::size_t>(blockX),
+      static_cast<std::size_t>(blockK),
+      "matmul dynamic shared A tile elements");
+
+  std::size_t bElems = fnaccCheckedMul(static_cast<std::size_t>(blockK),
+      static_cast<std::size_t>(blockY),
+      "matmul dynamic shared B tile elements");
+
+  std::size_t elems =
+      fnaccCheckedMul(aElems + bElems, static_cast<std::size_t>(stages),
+          "matmul dynamic shared staged tile elements");
+
+  std::size_t bytes =
+      fnaccCheckedMul(elems, sizeof(float), "matmul dynamic shared bytes");
+
+  // Align to 256 bytes.
+  bytes = (bytes + 255) & ~static_cast<std::size_t>(255);
+
+  // Triton may require padding/alignment beyond the simple A/B tile estimate.
+  // Keep the conservative prototype minimum for now.
+  if (bytes < 16384)
+    bytes = 16384;
+
+  if (bytes > static_cast<std::size_t>(std::numeric_limits<unsigned>::max())) {
+    std::fprintf(stderr,
+        "FNACC error: matmul dynamic shared memory requirement too large: "
+        "%zu bytes\n",
+        bytes);
+    std::abort();
+  }
+
+  unsigned requiredBytes = static_cast<unsigned>(bytes);
+
+  // Optional override for experiments, but do not allow values below the
+  // computed requirement. A too-small dynamic shared memory size can cause
+  // illegal GPU memory accesses.
+  if (const char *value = std::getenv("FNACC_MATMUL_SHARED_BYTES")) {
+    if (value[0] != '\0') {
+      unsigned requested = fnaccGetEnvUnsignedAllowZero(
+          "FNACC_MATMUL_SHARED_BYTES", requiredBytes);
+
+      if (requested < requiredBytes) {
+        std::fprintf(stderr,
+            "FNACC error: FNACC_MATMUL_SHARED_BYTES=%u is smaller than the "
+            "computed required minimum %u bytes for tile=(%d,%d,%d), "
+            "num_stages=%d. Refusing to launch because this can cause "
+            "CUDA_ERROR_ILLEGAL_ADDRESS.\n",
+            requested, requiredBytes, blockX, blockY, blockK, stages);
+        std::abort();
+      }
+
+      return requested;
+    }
+  }
+
+  return requiredBytes;
 }
 
 static void fnaccEnsureInitialized() {
@@ -1891,10 +1896,10 @@ extern "C" void __fnacc_launch_f32_v1(int32_t kernelId, int32_t rank,
 
   fnaccValidateHostLaunchAgainstDesc(kernelId, rank, blockX, blockY, blockZ);
 
-  if (numReadArrays != 2) {
+  if (numReadArrays < 1 || numReadArrays > 3) {
     std::fprintf(stderr,
-        "FNACC error: __fnacc_launch_f32_v1 currently requires exactly "
-        "two read arrays; got numReadArrays=%d for kernel id %d\n",
+        "FNACC error: __fnacc_launch_f32_v1 requires one to three read arrays; "
+        "got numReadArrays=%d for kernel id %d\n",
         numReadArrays, kernelId);
     std::abort();
   }
@@ -1906,8 +1911,39 @@ extern "C" void __fnacc_launch_f32_v1(int32_t kernelId, int32_t rank,
     std::abort();
   }
 
-  fnaccValidateCommonLaunchInputs("__fnacc_launch_f32_v1", rank, blockX, blockY,
-      blockZ, read0, read1, write, extentX, extentY, extentZ);
+  if (rank < 1 || rank > 3) {
+    std::fprintf(stderr,
+        "FNACC error: unsupported rank %d in __fnacc_launch_f32_v1\n", rank);
+    std::abort();
+  }
+
+  if (blockX <= 0 || blockY <= 0 || blockZ <= 0) {
+    std::fprintf(stderr,
+        "FNACC error: invalid tile/block shape (%d,%d,%d) in "
+        "__fnacc_launch_f32_v1\n",
+        blockX, blockY, blockZ);
+    std::abort();
+  }
+
+  if (!read0 || !write) {
+    std::fprintf(stderr,
+        "FNACC error: null required pointer in __fnacc_launch_f32_v1: "
+        "read0=%p write=%p\n",
+        static_cast<void *>(read0), static_cast<void *>(write));
+    std::abort();
+  }
+
+  if (numReadArrays >= 2 && !read1) {
+    std::fprintf(
+        stderr, "FNACC error: null read1 pointer in __fnacc_launch_f32_v1\n");
+    std::abort();
+  }
+
+  if (numReadArrays >= 3 && !read2) {
+    std::fprintf(
+        stderr, "FNACC error: null read2 pointer in __fnacc_launch_f32_v1\n");
+    std::abort();
+  }
 
   if (extentX <= 0 || extentY <= 0 || extentZ <= 0)
     return;
@@ -2139,14 +2175,6 @@ extern "C" void __fnacc_launch_matmul_f32_v1(int32_t kernelId, int32_t blockX,
       fnaccCheckedBytes2D(k, m, sizeof(float), "matmul B bytes");
   std::size_t bytesC =
       fnaccCheckedBytes2D(n, m, sizeof(float), "matmul C bytes");
-
-  if (desc->kind != "matmul2d") {
-    std::fprintf(stderr,
-        "FNACC error: matmul launcher called for kernel id %d "
-        "but JSON kind is '%s'\n",
-        kernelId, desc->kind.c_str());
-    std::abort();
-  }
 
   int32_t aTarget = fnaccPackTargetForSlot(desc, 0);
   int32_t bTarget = fnaccPackTargetForSlot(desc, 1);

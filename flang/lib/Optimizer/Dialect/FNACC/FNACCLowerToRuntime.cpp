@@ -34,28 +34,32 @@ struct BlockShape {
   int32_t z = 1;
 };
 
-static BlockShape getBlockShape(fir::fnacc::LaunchOp launchOp) {
+static BlockShape getBlockShape(fir::fnacc::LaunchOp launchOp,
+                                const fir::fnacc::ElementwiseKernel &k) {
   BlockShape shape;
 
   llvm::ArrayRef<int64_t> tiles = launchOp.getTileSizes();
 
-  if (tiles.empty()) {
-    shape.rank = 1;
-    shape.x = 1024;
-    shape.y = 1;
+  if (k.kind == fir::fnacc::ElementwiseKernelKind::MatMul2D) {
+    shape.rank = 2;
+    shape.x = tiles.size() >= 1 ? static_cast<int32_t>(tiles[0]) : 16;
+    shape.y = tiles.size() >= 2 ? static_cast<int32_t>(tiles[1]) : 16;
+    shape.z = tiles.size() >= 3 ? static_cast<int32_t>(tiles[2]) : 32;
+    return shape;
+  }
+
+  if (k.rank == 2) {
+    shape.rank = 2;
+    shape.x = tiles.size() >= 1 ? static_cast<int32_t>(tiles[0]) : 16;
+    shape.y = tiles.size() >= 2 ? static_cast<int32_t>(tiles[1]) : 16;
     shape.z = 1;
     return shape;
   }
 
-  shape.rank = static_cast<int32_t>(tiles.size());
-
-  if (tiles.size() >= 1)
-    shape.x = static_cast<int32_t>(tiles[0]);
-  if (tiles.size() >= 2)
-    shape.y = static_cast<int32_t>(tiles[1]);
-  if (tiles.size() >= 3)
-    shape.z = static_cast<int32_t>(tiles[2]);
-
+  shape.rank = 1;
+  shape.x = tiles.size() >= 1 ? static_cast<int32_t>(tiles[0]) : 1024;
+  shape.y = 1;
+  shape.z = 1;
   return shape;
 }
 
@@ -405,7 +409,7 @@ struct FNACCLowerToRuntimePass
       const fir::fnacc::ElementwiseKernel &k = result.getKernel();
 
       Location loc = launchOp.getLoc();
-      BlockShape blockShape = getBlockShape(launchOp);
+      BlockShape blockShape = getBlockShape(launchOp, k);
 
       builder.setInsertionPoint(launchOp);
 
@@ -454,23 +458,23 @@ struct FNACCLowerToRuntimePass
       FloatType f32Ty = builder.getF32Type();
       Type f32RefTy = fir::ReferenceType::get(f32Ty);
 
-      if (k.readArrays.size() != 2) {
-        launchOp.emitError("FNACC runtime lowering currently requires exactly "
-                           "two read arrays");
+      if (k.readArrays.empty() || k.readArrays.size() > 3) {
+        launchOp.emitError(
+            "FNACC runtime lowering currently requires one to three "
+            "read arrays");
         signalPassFailure();
         return;
       }
 
       Value read0Ptr = getRuntimeF32Pointer(builder, loc, k.readArrays[0]);
 
-      Value read1Ptr;
-      if (k.readArrays.size() >= 2) {
+      Value read1Ptr = read0Ptr;
+      if (k.readArrays.size() >= 2)
         read1Ptr = getRuntimeF32Pointer(builder, loc, k.readArrays[1]);
-      } else {
-        read1Ptr = read0Ptr;
-      }
 
       Value read2Ptr = read0Ptr;
+      if (k.readArrays.size() >= 3)
+        read2Ptr = getRuntimeF32Pointer(builder, loc, k.readArrays[2]);
 
       Value writePtr = getRuntimeF32Pointer(builder, loc, k.writeArray);
 
