@@ -213,37 +213,105 @@ static bool indexIsLoadOf(Value v, Value expectedMemref) {
   }
 }
 
-static bool isF32ArrayLike(Value v) {
+static std::optional<Value> getScalarRealRefFromValue(Value v) {
+  v = stripFirConvert(v);
+
+  auto load = v.getDefiningOp<fir::LoadOp>();
+  if (!load)
+    return std::nullopt;
+
+  Value memref = load.getMemref();
+
+  // If this is a load from an array_coor, it is an array element load, not
+  // a scalar capture.
+  if (memref.getDefiningOp<fir::ArrayCoorOp>())
+    return std::nullopt;
+
+  auto refTy = dyn_cast<fir::ReferenceType>(memref.getType());
+  if (!refTy)
+    return std::nullopt;
+
+  Type eleTy = refTy.getEleTy();
+
+  if (!eleTy.isF32() && !eleTy.isF64())
+    return std::nullopt;
+
+  return memref;
+}
+
+static fir::fnacc::ElementType getScalarRealRefElementType(Value memref) {
+  auto refTy = dyn_cast<fir::ReferenceType>(memref.getType());
+  if (!refTy)
+    return fir::fnacc::ElementType::Unknown;
+
+  Type eleTy = refTy.getEleTy();
+
+  if (eleTy.isF32())
+    return fir::fnacc::ElementType::F32;
+
+  if (eleTy.isF64())
+    return fir::fnacc::ElementType::F64;
+
+  return fir::fnacc::ElementType::Unknown;
+}
+
+static fir::fnacc::ElementType getRealArrayElementType(Value v) {
   Type type = v.getType();
+
+  Type eleTy;
 
   if (auto refTy = dyn_cast<fir::ReferenceType>(type)) {
     auto arrTy = dyn_cast<fir::SequenceType>(refTy.getEleTy());
     if (!arrTy)
-      return false;
-
-    return arrTy.getEleTy().isF32();
-  }
-
-  if (auto boxTy = dyn_cast<fir::BoxType>(type)) {
+      return fir::fnacc::ElementType::Unknown;
+    eleTy = arrTy.getEleTy();
+  } else if (auto boxTy = dyn_cast<fir::BoxType>(type)) {
     auto arrTy = dyn_cast<fir::SequenceType>(boxTy.getEleTy());
     if (!arrTy)
-      return false;
-
-    return arrTy.getEleTy().isF32();
+      return fir::fnacc::ElementType::Unknown;
+    eleTy = arrTy.getEleTy();
+  } else {
+    return fir::fnacc::ElementType::Unknown;
   }
 
-  return false;
+  if (eleTy.isF32())
+    return fir::fnacc::ElementType::F32;
+
+  if (eleTy.isF64())
+    return fir::fnacc::ElementType::F64;
+
+  return fir::fnacc::ElementType::Unknown;
 }
 
-static bool allArraysAreF32(const ElementwiseKernel &k) {
-  if (!k.writeArray || !isF32ArrayLike(k.writeArray))
+static bool inferAndCheckElementType(ElementwiseKernel &k,
+                                     std::string &reason) {
+  if (!k.writeArray) {
+    reason = "kernel has no write array";
     return false;
-
-  for (Value v : k.readArrays) {
-    if (!isF32ArrayLike(v))
-      return false;
   }
 
+  fir::fnacc::ElementType type = getRealArrayElementType(k.writeArray);
+  if (type == fir::fnacc::ElementType::Unknown) {
+    reason = "write array must be real(4) or real(8)";
+    return false;
+  }
+
+  for (Value read : k.readArrays) {
+    fir::fnacc::ElementType readType = getRealArrayElementType(read);
+    if (readType != type) {
+      reason = "all read/write arrays must have the same real element type";
+      return false;
+    }
+  }
+
+  for (Value scalar : k.scalarRefs) {
+    if (getScalarRealRefElementType(scalar) != type) {
+      reason = "scalar captures must match array element type";
+      return false;
+    }
+  }
+
+  k.elementType = type;
   return true;
 }
 
@@ -267,7 +335,8 @@ static int findReadValueIndex(ArrayRef<Value> readValues, Value v) {
   return -1;
 }
 
-static std::optional<Value> getScalarF32RefFromValue(Value v) {
+static std::optional<Value>
+getScalarRealRefFromValue(Value v, fir::fnacc::ElementType expectedType) {
   v = stripFirConvert(v);
 
   auto load = v.getDefiningOp<fir::LoadOp>();
@@ -276,8 +345,6 @@ static std::optional<Value> getScalarF32RefFromValue(Value v) {
 
   Value memref = load.getMemref();
 
-  // If this is a load from an array_coor, it is an array element load, not
-  // a scalar capture.
   if (memref.getDefiningOp<fir::ArrayCoorOp>())
     return std::nullopt;
 
@@ -285,10 +352,21 @@ static std::optional<Value> getScalarF32RefFromValue(Value v) {
   if (!refTy)
     return std::nullopt;
 
-  if (!refTy.getEleTy().isF32())
-    return std::nullopt;
+  Type eleTy = refTy.getEleTy();
 
-  return memref;
+  if (expectedType == fir::fnacc::ElementType::Unknown) {
+    if (eleTy.isF32() || eleTy.isF64())
+      return memref;
+    return std::nullopt;
+  }
+
+  if (expectedType == fir::fnacc::ElementType::F32 && eleTy.isF32())
+    return memref;
+
+  if (expectedType == fir::fnacc::ElementType::F64 && eleTy.isF64())
+    return memref;
+
+  return std::nullopt;
 }
 
 static std::unique_ptr<ElementwiseExpr> makeExpr(ElementwiseExprKind kind) {
@@ -308,7 +386,7 @@ static unsigned getOrAddValueIndex(llvm::SmallVectorImpl<Value> &values,
   return values.size() - 1;
 }
 
-static std::optional<double> getF32ConstantValue(Value v) {
+static std::optional<double> getRealConstantValue(Value v) {
   v = stripFirConvert(v);
 
   auto constant = v.getDefiningOp<arith::ConstantOp>();
@@ -319,7 +397,7 @@ static std::optional<double> getF32ConstantValue(Value v) {
   if (!floatAttr)
     return std::nullopt;
 
-  if (!floatAttr.getType().isF32())
+  if (!floatAttr.getType().isF32() && !floatAttr.getType().isF64())
     return std::nullopt;
 
   return floatAttr.getValueAsDouble();
@@ -341,8 +419,8 @@ recognizeExpr1D(Value v, const ArrayAccessInfo &info, ElementwiseKernel &k,
     return expr;
   }
 
-  // Scalar f32 load.
-  if (auto scalarRef = getScalarF32RefFromValue(v)) {
+  // Scalar f32 or f64 load.
+  if (auto scalarRef = getScalarRealRefFromValue(v)) {
     getOrAddValueIndex(k.scalarRefs, *scalarRef);
 
     auto expr = makeExpr(ElementwiseExprKind::ScalarLoad);
@@ -350,10 +428,10 @@ recognizeExpr1D(Value v, const ArrayAccessInfo &info, ElementwiseKernel &k,
     return expr;
   }
 
-  // f32 constant.
-  if (auto constantValue = getF32ConstantValue(v)) {
-    auto expr = makeExpr(ElementwiseExprKind::ConstantF32);
-    expr->f32Value = *constantValue;
+  // f32 or f64 constant.
+  if (auto constantValue = getRealConstantValue(v)) {
+    auto expr = makeExpr(ElementwiseExprKind::ConstantReal);
+    expr->realValue = *constantValue;
     return expr;
   }
 
@@ -424,10 +502,8 @@ static bool detectGenericExpr(ElementwiseKernel &k, const ArrayAccessInfo &info,
 
   k.expression = std::move(expr);
 
-  if (!allArraysAreF32(k)) {
-    reason = "only f32 arrays are currently supported";
+  if (!inferAndCheckElementType(k, reason))
     return false;
-  }
 
   return true;
 }
@@ -558,11 +634,11 @@ static bool detectSaxpy1D(ElementwiseKernel &k, const ArrayAccessInfo &info,
     std::optional<Value> scalarRef;
 
     if (scaledArrayIndex >= 0) {
-      scalarRef = getScalarF32RefFromValue(mulRhs);
+      scalarRef = getScalarRealRefFromValue(mulRhs);
     } else {
       scaledArrayIndex = findReadValueIndex(info.readValues, mulRhs);
       if (scaledArrayIndex >= 0)
-        scalarRef = getScalarF32RefFromValue(mulLhs);
+        scalarRef = getScalarRealRefFromValue(mulLhs);
     }
 
     if (scaledArrayIndex < 0 || !scalarRef)
@@ -627,10 +703,8 @@ static bool collectArrayAccesses1D(ElementwiseKernel &k, fir::DoLoopOp loop,
   //   c(i) = a(i) op b(i)
   std::string binaryReason;
   if (detectDirectBinaryArrayArray(k, info, binaryReason)) {
-    if (!allArraysAreF32(k)) {
-      reason = "only f32 arrays are currently supported";
+    if (!inferAndCheckElementType(k, reason))
       return false;
-    }
 
     return true;
   }
@@ -640,10 +714,8 @@ static bool collectArrayAccesses1D(ElementwiseKernel &k, fir::DoLoopOp loop,
   //   c(i) = alpha * a(i) + b(i)
   std::string saxpyReason;
   if (detectSaxpy1D(k, info, saxpyReason)) {
-    if (!allArraysAreF32(k)) {
-      reason = "only f32 arrays are currently supported";
+    if (!inferAndCheckElementType(k, reason))
       return false;
-    }
 
     return true;
   }
@@ -695,10 +767,8 @@ static bool collectArrayAccesses2D(ElementwiseKernel &k,
     k.rank = 2;
     k.scalarRefs.clear();
 
-    if (!allArraysAreF32(k)) {
-      reason = "only f32 arrays are currently supported";
+    if (!inferAndCheckElementType(k, reason))
       return false;
-    }
 
     return true;
   }
@@ -1057,8 +1127,8 @@ recognizeMatMul2D(fir::fnacc::LaunchOp launchOp) {
   k.writeArray = cArray;
   k.computeOp = computeOp;
 
-  if (!allArraysAreF32(k))
-    return fail(launchOp, "matmul currently supports only f32 arrays");
+  if (!inferAndCheckElementType(k, reason))
+    return fail(iLoop.getOperation(), reason);
 
   return ElementwiseRecognitionResult::success(std::move(k));
 }

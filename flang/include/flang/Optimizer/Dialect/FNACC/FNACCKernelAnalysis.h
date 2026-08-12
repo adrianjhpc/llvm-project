@@ -50,7 +50,7 @@ enum class ElementwiseKernelKind {
 enum class ElementwiseExprKind {
   ArrayLoad,
   ScalarLoad,
-  ConstantF32,
+  ConstantReal,
   AddF,
   SubF,
   MulF,
@@ -63,11 +63,13 @@ struct ElementwiseExpr {
   // For ArrayLoad and ScalarLoad.
   mlir::Value source;
 
-  // For ConstantF32.
-  double f32Value = 0.0;
+  // For ConstantReal.
+  double realValue = 0.0;
 
   llvm::SmallVector<std::unique_ptr<ElementwiseExpr>> operands;
 };
+
+enum class ElementType { Unknown, F32, F64 };
 
 struct ElementwiseKernel {
   int32_t rank = 1;
@@ -122,6 +124,8 @@ struct ElementwiseKernel {
   mlir::Operation *computeOp = nullptr;
 
   std::unique_ptr<ElementwiseExpr> expression;
+
+  ElementType elementType = ElementType::Unknown;
 };
 
 struct RecognitionFailure {

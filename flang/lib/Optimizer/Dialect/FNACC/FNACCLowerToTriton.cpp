@@ -41,6 +41,25 @@ static constexpr int32_t kTritonHiddenPtrArgs = 2;
 static constexpr llvm::StringLiteral kKernelIdAttrName = "fnacc.kernel_id";
 static constexpr llvm::StringLiteral kKernelNameAttrName = "fnacc.kernel_name";
 
+static StringRef ttElementType(fir::fnacc::ElementType type) {
+  switch (type) {
+  case fir::fnacc::ElementType::F32:
+    return "f32";
+  case fir::fnacc::ElementType::F64:
+    return "f64";
+  default:
+    llvm_unreachable("unsupported FNACC element type");
+  }
+}
+
+static std::string ptrType(fir::fnacc::ElementType type) {
+  return std::string("!tt.ptr<") + ttElementType(type).str() + ">";
+}
+
+static std::string ptrTensorType(int64_t n, fir::fnacc::ElementType type) {
+  return std::string("tensor<") + std::to_string(n) + "x" + ptrType(type) + ">";
+}
+
 static int32_t getKernelId(fir::fnacc::LaunchOp launchOp, int32_t fallbackId) {
   if (auto attr = launchOp->getAttrOfType<IntegerAttr>(kKernelIdAttrName))
     return static_cast<int32_t>(attr.getInt());
@@ -69,8 +88,13 @@ static StringRef ttArith(Operation *op) {
 
 static void emitTriton1D(const fir::fnacc::ElementwiseKernel &k, int64_t block,
                          StringRef kernelName, llvm::raw_ostream &os) {
-  os << "tt.func @" << kernelName
-     << "(%a: !tt.ptr<f32>, %b: !tt.ptr<f32>, %c: !tt.ptr<f32>, %n: i32) "
+
+  std::string ptrTy = ptrType(k.elementType);
+  std::string ptrVecTy = ptrTensorType(block, k.elementType);
+
+  os << "tt.func @" << kernelName << "(%a: " << ptrTy << ", %b: " << ptrTy
+     << ", %c: " << ptrTy << ", %n: i32) "
+
      << "attributes {noinline = false} {\n";
 
   os << "  %pid  = tt.get_program_id x : i32\n";
@@ -86,30 +110,30 @@ static void emitTriton1D(const fir::fnacc::ElementwiseKernel &k, int64_t block,
   os << "  %nS   = tt.splat %n : i32 -> tensor<" << block << "xi32>\n";
   os << "  %mask = arith.cmpi slt, %offs, %nS : tensor<" << block << "xi32>\n";
 
-  auto loadArr = [&](StringRef ptr, StringRef dst) {
-    os << "  " << dst << "p = tt.splat " << ptr << " : !tt.ptr<f32> -> tensor<"
-       << block << "x!tt.ptr<f32>>\n";
+  auto loadArr = [&](StringRef ptr, StringRef dst, std::string ptrTy) {
+    os << "  " << dst << "p = tt.splat " << ptr << " : " << ptrTy
+       << " -> tensor<" << block << "x" << ptrTy << ">\n";
 
     os << "  " << dst << "o = tt.addptr " << dst << "p, %offs : tensor<"
-       << block << "x!tt.ptr<f32>>, tensor<" << block << "xi32>\n";
+       << block << "x" << ptrTy << ">, tensor<" << block << "xi32>\n";
 
     os << "  " << dst << " = tt.load " << dst << "o, %mask : tensor<" << block
-       << "x!tt.ptr<f32>>\n";
+       << "x" << ptrTy << ">\n";
   };
 
-  loadArr("%a", "%av");
-  loadArr("%b", "%bv");
+  loadArr("%a", "%av", ptrTy);
+  loadArr("%b", "%bv", ptrTy);
 
   os << "  %r = " << ttArith(k.computeOp) << " %av, %bv : tensor<" << block
-     << "xf32>\n";
+     << "x" << ptrTy << ">\n";
 
-  os << "  %cp = tt.splat %c : !tt.ptr<f32> -> tensor<" << block
-     << "x!tt.ptr<f32>>\n";
+  os << "  %cp = tt.splat %c " << ptrTy << " -> tensor<" << block << "x"
+     << ptrTy << ">\n";
 
-  os << "  %co = tt.addptr %cp, %offs : tensor<" << block
-     << "x!tt.ptr<f32>>, tensor<" << block << "xi32>\n";
+  os << "  %co = tt.addptr %cp, %offs : tensor<" << block << "x" << ptrTy
+     << ">, tensor<" << block << "xi32>\n";
 
-  os << "  tt.store %co, %r, %mask : tensor<" << block << "x!tt.ptr<f32>>\n";
+  os << "  tt.store %co, %r, %mask : tensor<" << block << "x" << ptrTy << ">\n";
 
   os << "  tt.return\n";
   os << "}\n\n";
@@ -118,8 +142,12 @@ static void emitTriton1D(const fir::fnacc::ElementwiseKernel &k, int64_t block,
 static void emitTritonSaxpy1D(const fir::fnacc::ElementwiseKernel &k,
                               int64_t block, StringRef kernelName,
                               llvm::raw_ostream &os) {
-  os << "tt.func @" << kernelName
-     << "(%a: !tt.ptr<f32>, %b: !tt.ptr<f32>, %c: !tt.ptr<f32>, "
+
+  std::string ptrTy = ptrType(k.elementType);
+  std::string ptrVecTy = ptrTensorType(block, k.elementType);
+
+  os << "tt.func @" << kernelName << "(%a: " << ptrTy << ", %b: " << ptrTy
+     << ", %c: " << ptrTy << ", "
      << "%alpha: f32, %n: i32) attributes {noinline = false} {\n";
 
   os << "  %pid  = tt.get_program_id x : i32\n";
@@ -136,14 +164,14 @@ static void emitTritonSaxpy1D(const fir::fnacc::ElementwiseKernel &k,
   os << "  %mask = arith.cmpi slt, %offs, %nS : tensor<" << block << "xi32>\n";
 
   auto loadArr = [&](StringRef ptr, StringRef dst) {
-    os << "  " << dst << "p = tt.splat " << ptr << " : !tt.ptr<f32> -> tensor<"
-       << block << "x!tt.ptr<f32>>\n";
+    os << "  " << dst << "p = tt.splat " << ptr << " : " << ptrTy
+       << " -> tensor<" << block << "x" << ptrTy << ">\n";
 
     os << "  " << dst << "o = tt.addptr " << dst << "p, %offs : tensor<"
-       << block << "x!tt.ptr<f32>>, tensor<" << block << "xi32>\n";
+       << block << "x" << ptrTy << ">, tensor<" << block << "xi32>\n";
 
     os << "  " << dst << " = tt.load " << dst << "o, %mask : tensor<" << block
-       << "x!tt.ptr<f32>>\n";
+       << "x" << ptrTy << ">\n";
   };
 
   loadArr("%a", "%av");
@@ -154,13 +182,13 @@ static void emitTritonSaxpy1D(const fir::fnacc::ElementwiseKernel &k,
   os << "  %tmp = arith.mulf %alpha_s, %av : tensor<" << block << "xf32>\n";
   os << "  %r = arith.addf %tmp, %bv : tensor<" << block << "xf32>\n";
 
-  os << "  %cp = tt.splat %c : !tt.ptr<f32> -> tensor<" << block
-     << "x!tt.ptr<f32>>\n";
+  os << "  %cp = tt.splat %c : " << ptrTy << " -> tensor<" << block << "x"
+     << ptrTy << ">\n";
 
-  os << "  %co = tt.addptr %cp, %offs : tensor<" << block
-     << "x!tt.ptr<f32>>, tensor<" << block << "xi32>\n";
+  os << "  %co = tt.addptr %cp, %offs : tensor<" << block << "x" << ptrTy
+     << ">, tensor<" << block << "xi32>\n";
 
-  os << "  tt.store %co, %r, %mask : tensor<" << block << "x!tt.ptr<f32>>\n";
+  os << "  tt.store %co, %r, %mask : tensor<" << block << "x" << ptrTy << ">\n";
 
   os << "  tt.return\n";
   os << "}\n\n";
@@ -232,8 +260,9 @@ static std::string emitExpr1D(const fir::fnacc::ElementwiseKernel &k,
       std::string scalarName = "%scalar" + std::to_string(index);
       std::string splatName = "%scalar" + std::to_string(index) + "_s";
 
-      os << "  " << splatName << " = tt.splat " << scalarName
-         << " : f32 -> tensor<" << block << "xf32>\n";
+      os << "  " << splatName << " = tt.splat " << scalarName << " : "
+         << ttElementType(k.elementType) << " -> tensor<" << block << "x"
+         << ttElementType(k.elementType) << ">\n";
 
       state.scalarSplatEmitted[index] = true;
       state.scalarSplatNames[index] = splatName;
@@ -242,16 +271,17 @@ static std::string emitExpr1D(const fir::fnacc::ElementwiseKernel &k,
     return state.scalarSplatNames[index];
   }
 
-  case fir::fnacc::ElementwiseExprKind::ConstantF32: {
+  case fir::fnacc::ElementwiseExprKind::ConstantReal: {
     unsigned id = state.nextTmp++;
     std::string cst = "%cst" + std::to_string(id);
     std::string splat = "%cst" + std::to_string(id) + "_s";
 
-    os << "  " << cst << " = arith.constant "
-       << static_cast<float>(expr.f32Value) << " : f32\n";
+    os << "  " << cst << " = arith.constant " << expr.realValue << " : "
+       << ttElementType(k.elementType) << "\n";
 
-    os << "  " << splat << " = tt.splat " << cst << " : f32 -> tensor<" << block
-       << "xf32>\n";
+    os << "  " << splat << " = tt.splat " << cst << " : "
+       << ttElementType(k.elementType) << " -> tensor<" << block << "x"
+       << ttElementType(k.elementType) << ">\n";
 
     return splat;
   }
@@ -268,7 +298,8 @@ static std::string emitExpr1D(const fir::fnacc::ElementwiseKernel &k,
     std::string result = "%expr" + std::to_string(state.nextTmp++);
 
     os << "  " << result << " = " << ttArithForExprKind(expr.kind) << " " << lhs
-       << ", " << rhs << " : tensor<" << block << "xf32>\n";
+       << ", " << rhs << " : tensor<" << block << "x"
+       << ttElementType(k.elementType) << ">\n";
 
     return result;
   }
@@ -286,16 +317,18 @@ static void emitTritonExpr1D(const fir::fnacc::ElementwiseKernel &k,
 
   os << "tt.func @" << kernelName << "(";
 
+  std::string ptrTy = ptrType(k.elementType);
+
   for (unsigned i = 0; i < k.readArrays.size(); ++i) {
     if (i != 0)
       os << ", ";
-    os << "%read" << i << ": !tt.ptr<f32>";
+    os << "%read" << i << ": " << ptrTy;
   }
 
-  os << ", %c: !tt.ptr<f32>";
+  os << ", %c: " << ptrTy;
 
   for (unsigned i = 0; i < k.scalarRefs.size(); ++i)
-    os << ", %scalar" << i << ": f32";
+    os << ", %scalar" << i << ": " << ptrTy;
 
   os << ", %n: i32) attributes {noinline = false} {\n";
 
@@ -312,25 +345,25 @@ static void emitTritonExpr1D(const fir::fnacc::ElementwiseKernel &k,
   os << "  %nS   = tt.splat %n : i32 -> tensor<" << block << "xi32>\n";
   os << "  %mask = arith.cmpi slt, %offs, %nS : tensor<" << block << "xi32>\n";
 
-  auto loadArr = [&](StringRef ptr, StringRef dst) {
-    os << "  " << dst << "p = tt.splat " << ptr << " : !tt.ptr<f32> -> tensor<"
-       << block << "x!tt.ptr<f32>>\n";
+  auto loadArr = [&](StringRef ptr, StringRef dst, std::string ptrTy) {
+    os << "  " << dst << "p = tt.splat " << ptr << " : " << ptrTy
+       << " -> tensor <" << block << "x" << ptrTy << ">\n";
 
     os << "  " << dst << "o = tt.addptr " << dst << "p, %offs : tensor<"
-       << block << "x!tt.ptr<f32>>, tensor<" << block << "xi32>\n";
+       << block << "x" << ptrTy << ">, tensor<" << block << "xi32>\n";
 
     os << "  " << dst << " = tt.load " << dst << "o, %mask : tensor<" << block
-       << "x!tt.ptr<f32>>\n";
+       << "x" << ptrTy << ">\n";
   };
 
   if (k.readArrays.size() >= 1)
-    loadArr("%read0", "%read0v");
+    loadArr("%read0", "%read0v", ptrTy);
 
   if (k.readArrays.size() >= 2)
-    loadArr("%read1", "%read1v");
+    loadArr("%read1", "%read1v", ptrTy);
 
   if (k.readArrays.size() >= 3)
-    loadArr("%read2", "%read2v");
+    loadArr("%read2", "%read2v", ptrTy);
 
   ExprTritonEmitterState state;
   state.block = block;
@@ -339,14 +372,14 @@ static void emitTritonExpr1D(const fir::fnacc::ElementwiseKernel &k,
 
   std::string result = emitExpr1D(k, *k.expression, state, os);
 
-  os << "  %cp = tt.splat %c : !tt.ptr<f32> -> tensor<" << block
-     << "x!tt.ptr<f32>>\n";
+  os << "  %cp = tt.splat %c : " << ptrTy << " -> tensor<" << block << "x"
+     << ptrTy << ">\n";
 
-  os << "  %co = tt.addptr %cp, %offs : tensor<" << block
-     << "x!tt.ptr<f32>>, tensor<" << block << "xi32>\n";
+  os << "  %co = tt.addptr %cp, %offs : tensor<" << block << "x" << ptrTy
+     << ">, tensor<" << block << "xi32>\n";
 
-  os << "  tt.store %co, " << result << ", %mask : tensor<" << block
-     << "x!tt.ptr<f32>>\n";
+  os << "  tt.store %co, " << result << ", %mask : tensor<" << block << "x"
+     << ptrTy << ">\n";
 
   os << "  tt.return\n";
   os << "}\n\n";
@@ -356,9 +389,10 @@ static void emitTriton2D(const fir::fnacc::ElementwiseKernel &k, int64_t blockX,
                          int64_t blockY, StringRef kernelName,
                          llvm::raw_ostream &os) {
   int64_t block = blockX * blockY;
+  std::string ptrTy = ptrType(k.elementType);
 
-  os << "tt.func @" << kernelName
-     << "(%a: !tt.ptr<f32>, %b: !tt.ptr<f32>, %c: !tt.ptr<f32>, "
+  os << "tt.func @" << kernelName << "(%a: " << ptrTy << ", %b: " << ptrTy
+     << ", %c: " << ptrTy << ", "
      << "%n: i32, %m: i32) attributes {noinline = false} {\n";
 
   os << "  %pid_x = tt.get_program_id x : i32\n";
@@ -402,14 +436,14 @@ static void emitTriton2D(const fir::fnacc::ElementwiseKernel &k, int64_t blockX,
   os << "  %offs = arith.addi %ix, %jy_n : tensor<" << block << "xi32>\n";
 
   auto loadArr = [&](StringRef ptr, StringRef dst) {
-    os << "  " << dst << "p = tt.splat " << ptr << " : !tt.ptr<f32> -> tensor<"
-       << block << "x!tt.ptr<f32>>\n";
+    os << "  " << dst << "p = tt.splat " << ptr << " : " << ptrTy
+       << " -> tensor<" << block << "x" << ptrTy << ">\n";
 
     os << "  " << dst << "o = tt.addptr " << dst << "p, %offs : tensor<"
-       << block << "x!tt.ptr<f32>>, tensor<" << block << "xi32>\n";
+       << block << "x" << ptrTy << ">, tensor<" << block << "xi32>\n";
 
     os << "  " << dst << " = tt.load " << dst << "o, %mask : tensor<" << block
-       << "x!tt.ptr<f32>>\n";
+       << "x" << ptrTy << ">\n";
   };
 
   loadArr("%a", "%av");
@@ -418,13 +452,14 @@ static void emitTriton2D(const fir::fnacc::ElementwiseKernel &k, int64_t blockX,
   os << "  %rval = " << ttArith(k.computeOp) << " %av, %bv : tensor<" << block
      << "xf32>\n";
 
-  os << "  %cp = tt.splat %c : !tt.ptr<f32> -> tensor<" << block
-     << "x!tt.ptr<f32>>\n";
+  os << "  %cp = tt.splat %c : " << ptrTy << " -> tensor<" << block << "x"
+     << ptrTy << ">\n";
 
-  os << "  %co = tt.addptr %cp, %offs : tensor<" << block
-     << "x!tt.ptr<f32>>, tensor<" << block << "xi32>\n";
+  os << "  %co = tt.addptr %cp, %offs : tensor<" << block << "x" << ptrTy
+     << ">, tensor<" << block << "xi32>\n";
 
-  os << "  tt.store %co, %rval, %mask : tensor<" << block << "x!tt.ptr<f32>>\n";
+  os << "  tt.store %co, %rval, %mask : tensor<" << block << "x" << ptrTy
+     << ">\n";
 
   os << "  tt.return\n";
   os << "}\n\n";
@@ -438,16 +473,17 @@ static void emitTritonExpr2D(const fir::fnacc::ElementwiseKernel &k,
          "Expr2D requires one to three read arrays");
 
   int64_t block = blockX * blockY;
+  std::string ptrTy = ptrType(k.elementType);
 
   os << "tt.func @" << kernelName << "(";
 
   for (unsigned i = 0; i < k.readArrays.size(); ++i) {
     if (i != 0)
       os << ", ";
-    os << "%read" << i << ": !tt.ptr<f32>";
+    os << "%read" << i << ": " << ptrTy;
   }
 
-  os << ", %c: !tt.ptr<f32>";
+  os << ", %c: " << ptrTy;
 
   for (unsigned i = 0; i < k.scalarRefs.size(); ++i)
     os << ", %scalar" << i << ": f32";
@@ -489,14 +525,14 @@ static void emitTritonExpr2D(const fir::fnacc::ElementwiseKernel &k,
   os << "  %offs = arith.addi %ix, %jy_n : tensor<" << block << "xi32>\n";
 
   auto loadArr = [&](StringRef ptr, StringRef dst) {
-    os << "  " << dst << "p = tt.splat " << ptr << " : !tt.ptr<f32> -> tensor<"
-       << block << "x!tt.ptr<f32>>\n";
+    os << "  " << dst << "p = tt.splat " << ptr << " : " << ptrTy
+       << " -> tensor<" << block << "x!tt.ptr<f32>>\n";
 
     os << "  " << dst << "o = tt.addptr " << dst << "p, %offs : tensor<"
-       << block << "x!tt.ptr<f32>>, tensor<" << block << "xi32>\n";
+       << block << "x" << ptrTy << ">, tensor<" << block << "xi32>\n";
 
     os << "  " << dst << " = tt.load " << dst << "o, %mask : tensor<" << block
-       << "x!tt.ptr<f32>>\n";
+       << "x" << ptrTy << ">\n";
   };
 
   if (k.readArrays.size() >= 1)
@@ -513,14 +549,14 @@ static void emitTritonExpr2D(const fir::fnacc::ElementwiseKernel &k,
 
   std::string result = emitExpr1D(k, *k.expression, state, os);
 
-  os << "  %cp = tt.splat %c : !tt.ptr<f32> -> tensor<" << block
-     << "x!tt.ptr<f32>>\n";
+  os << "  %cp = tt.splat %c : " << ptrTy << " -> tensor<" << block << "x"
+     << ptrTy << ">\n";
 
-  os << "  %co = tt.addptr %cp, %offs : tensor<" << block
-     << "x!tt.ptr<f32>>, tensor<" << block << "xi32>\n";
+  os << "  %co = tt.addptr %cp, %offs : tensor<" << block << "x" << ptrTy
+     << ">, tensor<" << block << "xi32>\n";
 
-  os << "  tt.store %co, " << result << ", %mask : tensor<" << block
-     << "x!tt.ptr<f32>>\n";
+  os << "  tt.store %co, " << result << ", %mask : tensor<" << block << "x"
+     << ptrTy << ">\n";
 
   os << "  tt.return\n";
   os << "}\n\n";
@@ -546,8 +582,11 @@ static void emitTritonMatMul2D(const fir::fnacc::ElementwiseKernel &k,
   //
   // Each Triton program computes a BLOCK_M x BLOCK_N tile of C.
 
-  os << "tt.func @" << kernelName
-     << "(%a: !tt.ptr<f32>, %b: !tt.ptr<f32>, %c: !tt.ptr<f32>, "
+  std::string elemTy = ttElementType(k.elementType).str();
+  std::string ptrTy = ptrType(k.elementType);
+
+  os << "tt.func @" << kernelName << "(%a: " << ptrTy << ", %b: " << ptrTy
+     << ", %c: " << ptrTy << ", "
      << "%n: i32, %m: i32, %k: i32) attributes {noinline = false} {\n";
 
   os << "  %pid_m = tt.get_program_id x : i32\n";

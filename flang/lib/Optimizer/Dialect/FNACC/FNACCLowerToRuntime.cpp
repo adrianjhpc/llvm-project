@@ -34,6 +34,18 @@ struct BlockShape {
   int32_t z = 1;
 };
 
+static FloatType getMLIRFloatType(OpBuilder &builder,
+                                  fir::fnacc::ElementType type) {
+  switch (type) {
+  case fir::fnacc::ElementType::F32:
+    return builder.getF32Type();
+  case fir::fnacc::ElementType::F64:
+    return builder.getF64Type();
+  default:
+    llvm_unreachable("unsupported FNACC element type");
+  }
+}
+
 static BlockShape getBlockShape(fir::fnacc::LaunchOp launchOp,
                                 const fir::fnacc::ElementwiseKernel &k) {
   BlockShape shape;
@@ -194,18 +206,19 @@ static std::optional<int64_t> getElementByteSize(Type elementType) {
   return std::nullopt;
 }
 
-static Value getRuntimeF32Pointer(OpBuilder &builder, Location loc,
-                                  Value arrayLike) {
-  FloatType f32Ty = builder.getF32Type();
-  Type f32RefTy = fir::ReferenceType::get(f32Ty);
+static Value getRuntimeRealPointer(OpBuilder &builder, Location loc,
+                                   Value arrayLike,
+                                   fir::fnacc::ElementType type) {
+  FloatType realTy = getMLIRFloatType(builder, type);
+  Type realRefTy = fir::ReferenceType::get(realTy);
 
   if (auto boxTy = dyn_cast<fir::BoxType>(arrayLike.getType())) {
     Type addrTy = fir::ReferenceType::get(boxTy.getEleTy());
     Value baseAddr = fir::BoxAddrOp::create(builder, loc, addrTy, arrayLike);
-    return fir::ConvertOp::create(builder, loc, f32RefTy, baseAddr);
+    return fir::ConvertOp::create(builder, loc, realRefTy, baseAddr);
   }
 
-  return fir::ConvertOp::create(builder, loc, f32RefTy, arrayLike);
+  return fir::ConvertOp::create(builder, loc, realRefTy, arrayLike);
 }
 
 static void createRuntimeCall(ModuleOp module, OpBuilder &builder, Location loc,
@@ -445,18 +458,12 @@ struct FNACCLowerToRuntimePass
         extentZValue = arith::ConstantIntOp::create(builder, loc, 1, 32);
       }
 
-      // Use a single rank-independent runtime ABI.
-      //
-      // Do not declare the runtime using rank-specific array types such as:
-      //
-      //   !fir.ref<!fir.array<?xf32>>
-      //   !fir.ref<!fir.array<?x?xf32>>
-      //
-      // Convert all arrays to !fir.ref<f32> before the call.
-      StringRef runtimeName = "__fnacc_launch_f32_v1";
+      StringRef runtimeName = k.elementType == fir::fnacc::ElementType::F64
+                                  ? "__fnacc_launch_f64_v1"
+                                  : "__fnacc_launch_f32_v1";
 
-      FloatType f32Ty = builder.getF32Type();
-      Type f32RefTy = fir::ReferenceType::get(f32Ty);
+      FloatType realTy = getMLIRFloatType(builder, k.elementType);
+      Type realRefTy = fir::ReferenceType::get(realTy);
 
       if (k.readArrays.empty() || k.readArrays.size() > 3) {
         launchOp.emitError(
@@ -466,20 +473,27 @@ struct FNACCLowerToRuntimePass
         return;
       }
 
-      Value read0Ptr = getRuntimeF32Pointer(builder, loc, k.readArrays[0]);
+      Value read0Ptr =
+          getRuntimeRealPointer(builder, loc, k.readArrays[0], k.elementType);
 
       Value read1Ptr = read0Ptr;
       if (k.readArrays.size() >= 2)
-        read1Ptr = getRuntimeF32Pointer(builder, loc, k.readArrays[1]);
+        read1Ptr =
+            getRuntimeRealPointer(builder, loc, k.readArrays[1], k.elementType);
 
       Value read2Ptr = read0Ptr;
       if (k.readArrays.size() >= 3)
-        read2Ptr = getRuntimeF32Pointer(builder, loc, k.readArrays[2]);
+        read2Ptr =
+            getRuntimeRealPointer(builder, loc, k.readArrays[2], k.elementType);
 
-      Value writePtr = getRuntimeF32Pointer(builder, loc, k.writeArray);
+      Value writePtr =
+          getRuntimeRealPointer(builder, loc, k.writeArray, k.elementType);
 
       if (k.kind == fir::fnacc::ElementwiseKernelKind::MatMul2D) {
-        StringRef runtimeName = "__fnacc_launch_matmul_f32_v1";
+
+        StringRef runtimeName = k.elementType == fir::fnacc::ElementType::F64
+                                    ? "__fnacc_launch_matmul_f64_v1"
+                                    : "__fnacc_launch_matmul_f32_v1";
 
         llvm::SmallVector<Type> argTypes;
         argTypes.push_back(kernelIdValue.getType());
@@ -528,7 +542,7 @@ struct FNACCLowerToRuntimePass
 
       if (scalarCount > 3) {
         launchOp.emitError(
-            "FNACC generic runtime supports at most three f32 scalars");
+            "FNACC generic runtime supports at most three f32 or f64 scalars");
         signalPassFailure();
         return;
       }
@@ -539,13 +553,14 @@ struct FNACCLowerToRuntimePass
       Value numScalarsValue =
           arith::ConstantIntOp::create(builder, loc, scalarCount, 32);
 
-      auto zeroAttr = builder.getFloatAttr(f32Ty, 0.0);
+      auto zeroAttr = builder.getFloatAttr(realTy, 0.0);
 
-      Value zeroF32 = arith::ConstantOp::create(builder, loc, f32Ty, zeroAttr);
+      Value zeroReal =
+          arith::ConstantOp::create(builder, loc, realTy, zeroAttr);
 
-      Value scalar0Value = zeroF32;
-      Value scalar1Value = zeroF32;
-      Value scalar2Value = zeroF32;
+      Value scalar0Value = zeroReal;
+      Value scalar1Value = zeroReal;
+      Value scalar2Value = zeroReal;
 
       if (scalarCount >= 1)
         scalar0Value = fir::LoadOp::create(builder, loc, k.scalarRefs[0]);
@@ -564,13 +579,13 @@ struct FNACCLowerToRuntimePass
       argTypes.push_back(blockZValue.getType());
       argTypes.push_back(numReadArraysValue.getType());
       argTypes.push_back(numScalarsValue.getType());
-      argTypes.push_back(f32RefTy);
-      argTypes.push_back(f32RefTy);
-      argTypes.push_back(f32RefTy);
-      argTypes.push_back(f32RefTy);
-      argTypes.push_back(f32Ty);
-      argTypes.push_back(f32Ty);
-      argTypes.push_back(f32Ty);
+      argTypes.push_back(realRefTy);
+      argTypes.push_back(realRefTy);
+      argTypes.push_back(realRefTy);
+      argTypes.push_back(realRefTy);
+      argTypes.push_back(realTy);
+      argTypes.push_back(realTy);
+      argTypes.push_back(realTy);
       argTypes.push_back(extentXValue.getType());
       argTypes.push_back(extentYValue.getType());
       argTypes.push_back(extentZValue.getType());

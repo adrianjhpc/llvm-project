@@ -1041,8 +1041,8 @@ static FNACCDeviceArg fnaccGetCachedDeviceBuffer(void *hostPtr,
   return arg;
 }
 
-static FNACCDeviceArg fnaccPrepareReadArray(
-    float *hostPtr, std::size_t bytes, int32_t target, int32_t slot) {
+static FNACCDeviceArg fnaccPrepareReadBuffer(
+    void *hostPtr, std::size_t bytes, int32_t target, int32_t slot) {
   if (target == FNACC_PACK_TARGET_DEVICE) {
     // Device target means cache/reuse device allocation. Copy in only on miss.
     return fnaccGetCachedDeviceBuffer(static_cast<void *>(hostPtr), bytes,
@@ -1053,8 +1053,8 @@ static FNACCDeviceArg fnaccPrepareReadArray(
       /*copyHostToDevice=*/true, slot, "read");
 }
 
-static FNACCDeviceArg fnaccPrepareWriteArray(
-    float *hostPtr, std::size_t bytes, int32_t target, int32_t slot) {
+static FNACCDeviceArg fnaccPrepareWriteBuffer(
+    void *hostPtr, std::size_t bytes, int32_t target, int32_t slot) {
   if (target == FNACC_PACK_TARGET_DEVICE) {
     // Device target means keep the output allocation cached. No copy-in needed.
     return fnaccGetCachedDeviceBuffer(static_cast<void *>(hostPtr), bytes,
@@ -1065,8 +1065,8 @@ static FNACCDeviceArg fnaccPrepareWriteArray(
       /*copyHostToDevice=*/false, slot, "write");
 }
 
-static void fnaccCopyBackWriteArray(
-    float *hostPtr, const FNACCDeviceArg &arg, std::size_t bytes) {
+static void fnaccCopyBackWriteBuffer(
+    void *hostPtr, const FNACCDeviceArg &arg, std::size_t bytes) {
   // Conservative semantics: always copy writes back to host after launch.
   // Even target=device remains host-visible for now.
   FNACC_CUDA_CHECK(cuMemcpyDtoH(hostPtr, arg.ptr, bytes));
@@ -2003,18 +2003,18 @@ extern "C" void __fnacc_launch_f32_v1(int32_t kernelId, int32_t rank,
   }
 
   FNACCDeviceArg read0Dev =
-      fnaccPrepareReadArray(read0, numBytes, read0Target, read0Slot);
+      fnaccPrepareReadBuffer(read0, numBytes, read0Target, read0Slot);
 
   FNACCDeviceArg read1Dev;
   if (numReadArrays >= 2)
-    read1Dev = fnaccPrepareReadArray(read1, numBytes, read1Target, read1Slot);
+    read1Dev = fnaccPrepareReadBuffer(read1, numBytes, read1Target, read1Slot);
 
   FNACCDeviceArg read2Dev;
   if (numReadArrays >= 3)
-    read2Dev = fnaccPrepareReadArray(read2, numBytes, read2Target, read2Slot);
+    read2Dev = fnaccPrepareReadBuffer(read2, numBytes, read2Target, read2Slot);
 
   FNACCDeviceArg writeDev =
-      fnaccPrepareWriteArray(write, numBytes, writeTarget, writeSlot);
+      fnaccPrepareWriteBuffer(write, numBytes, writeTarget, writeSlot);
 
   CUdeviceptr dRead0 = read0Dev.ptr;
   CUdeviceptr dRead1 = read1Dev.ptr;
@@ -2082,7 +2082,219 @@ extern "C" void __fnacc_launch_f32_v1(int32_t kernelId, int32_t rank,
   FNACC_CUDA_CHECK(cuCtxSynchronize());
 
   if (writeDev.target == FNACC_PACK_TARGET_HOST) {
-    fnaccCopyBackWriteArray(write, writeDev, numBytes);
+    fnaccCopyBackWriteBuffer(write, writeDev, numBytes);
+  } else {
+    if (fnaccDebugEnabled()) {
+      std::fprintf(stderr,
+          "FNACC: skipped automatic copy-back for write slot %d "
+          "because target=device; use !$fnacc update host(...) to copy back\n",
+          writeDev.slot);
+    }
+  }
+
+  fnaccReleaseDeviceArg(read0Dev);
+
+  if (numReadArrays >= 2)
+    fnaccReleaseDeviceArg(read1Dev);
+
+  if (numReadArrays >= 3)
+    fnaccReleaseDeviceArg(read2Dev);
+
+  fnaccReleaseDeviceArg(writeDev);
+}
+
+// FNACC generic f64 launch ABI v1.
+//
+// This ABI intentionally supports only the compiler subset currently emitted:
+//
+//   - rank 1 or rank 2
+//   - f32 arrays
+//   - exactly two read arrays
+//   - one write array
+//   - zero to three f64 scalar captures
+//   - contiguous storage
+//   - Triton/NVVM PTX with exactly two hidden pointer arguments
+//
+// The runtime validates JSON schema version and hidden-argument count so that
+// compiler/runtime drift fails explicitly rather than launching with a wrong
+// CUDA argument layout.
+extern "C" void __fnacc_launch_f64_v1(int32_t kernelId, int32_t rank,
+    int32_t blockX, int32_t blockY, int32_t blockZ, int32_t numReadArrays,
+    int32_t numScalars, double *read0, double *read1, double *read2,
+    double *write, double scalar0, double scalar1, double scalar2,
+    int32_t extentX, int32_t extentY, int32_t extentZ) {
+  fnaccEnsureCurrentContext();
+
+  fnaccValidateHostLaunchAgainstDesc(kernelId, rank, blockX, blockY, blockZ);
+
+  if (numReadArrays < 1 || numReadArrays > 3) {
+    std::fprintf(stderr,
+        "FNACC error: __fnacc_launch_f64_v1 requires one to three read arrays; "
+        "got numReadArrays=%d for kernel id %d\n",
+        numReadArrays, kernelId);
+    std::abort();
+  }
+
+  if (numScalars < 0 || numScalars > 3) {
+    std::fprintf(stderr,
+        "FNACC error: unsupported numScalars=%d for kernel id %d\n", numScalars,
+        kernelId);
+    std::abort();
+  }
+
+  if (rank < 1 || rank > 3) {
+    std::fprintf(stderr,
+        "FNACC error: unsupported rank %d in __fnacc_launch_f64_v1\n", rank);
+    std::abort();
+  }
+
+  if (blockX <= 0 || blockY <= 0 || blockZ <= 0) {
+    std::fprintf(stderr,
+        "FNACC error: invalid tile/block shape (%d,%d,%d) in "
+        "__fnacc_launch_f64_v1\n",
+        blockX, blockY, blockZ);
+    std::abort();
+  }
+
+  if (!read0 || !write) {
+    std::fprintf(stderr,
+        "FNACC error: null required pointer in __fnacc_launch_f64_v1: "
+        "read0=%p write=%p\n",
+        static_cast<void *>(read0), static_cast<void *>(write));
+    std::abort();
+  }
+
+  if (numReadArrays >= 2 && !read1) {
+    std::fprintf(
+        stderr, "FNACC error: null read1 pointer in __fnacc_launch_f64_v1\n");
+    std::abort();
+  }
+
+  if (numReadArrays >= 3 && !read2) {
+    std::fprintf(
+        stderr, "FNACC error: null read2 pointer in __fnacc_launch_f64_v1\n");
+    std::abort();
+  }
+
+  if (extentX <= 0 || extentY <= 0 || extentZ <= 0)
+    return;
+
+  CUfunction fn = getKernelFunction(kernelId);
+
+  unsigned gridX = fnaccCdiv(extentX, blockX);
+  unsigned gridY = rank >= 2 ? fnaccCdiv(extentY, blockY) : 1;
+  unsigned cudaBlockX = fnaccCudaThreadsPerCTA(kernelId);
+
+  std::size_t elemCount = fnaccElementCount(rank, extentX, extentY, extentZ);
+  std::size_t numBytes = elemCount * sizeof(double);
+
+  const FNACCKernelDesc *desc = fnaccLookupKernelDesc(kernelId);
+
+  if (!desc) {
+    std::fprintf(stderr,
+        "FNACC error: no JSON descriptor for generic f64 kernel id %d\n",
+        kernelId);
+    std::abort();
+  }
+
+  if (desc->kind == "matmul2d") {
+    std::fprintf(stderr,
+        "FNACC error: generic f64 launcher called for matmul kernel id %d\n",
+        kernelId);
+    std::abort();
+  }
+
+  int32_t read0Slot = 0;
+  int32_t read1Slot = 1;
+  int32_t read2Slot = 2;
+  int32_t writeSlot = numReadArrays;
+
+  int32_t read0Target = fnaccPackTargetForSlot(desc, read0Slot);
+  int32_t read1Target = fnaccPackTargetForSlot(desc, read1Slot);
+  int32_t read2Target = fnaccPackTargetForSlot(desc, read2Slot);
+  int32_t writeTarget = fnaccPackTargetForSlot(desc, writeSlot);
+
+  FNACCDeviceArg read0Dev =
+      fnaccPrepareReadBuffer(read0, numBytes, read0Target, read0Slot);
+
+  FNACCDeviceArg read1Dev;
+  if (numReadArrays >= 2)
+    read1Dev = fnaccPrepareReadBuffer(read1, numBytes, read1Target, read1Slot);
+
+  FNACCDeviceArg read2Dev;
+  if (numReadArrays >= 3)
+    read2Dev = fnaccPrepareReadBuffer(read2, numBytes, read2Target, read2Slot);
+
+  FNACCDeviceArg writeDev =
+      fnaccPrepareWriteBuffer(write, numBytes, writeTarget, writeSlot);
+
+  CUdeviceptr dRead0 = read0Dev.ptr;
+  CUdeviceptr dRead1 = read1Dev.ptr;
+  CUdeviceptr dRead2 = read2Dev.ptr;
+  CUdeviceptr dWrite = writeDev.ptr;
+
+  fnaccValidateSupportedHiddenPtrArgCount(kernelId);
+  FNACCHiddenTritonArgs hidden;
+
+  void *args[16];
+  int argCount = 0;
+
+  args[argCount++] = &dRead0;
+
+  if (numReadArrays >= 2)
+    args[argCount++] = &dRead1;
+
+  if (numReadArrays >= 3)
+    args[argCount++] = &dRead2;
+
+  args[argCount++] = &dWrite;
+
+  if (numScalars >= 1)
+    args[argCount++] = &scalar0;
+
+  if (numScalars >= 2)
+    args[argCount++] = &scalar1;
+
+  if (numScalars >= 3)
+    args[argCount++] = &scalar2;
+
+  args[argCount++] = &extentX;
+
+  if (rank >= 2)
+    args[argCount++] = &extentY;
+
+  if (rank >= 3)
+    args[argCount++] = &extentZ;
+
+  args[argCount++] = &hidden.hidden0;
+  args[argCount++] = &hidden.hidden1;
+
+  if (argCount > 16) {
+    std::fprintf(stderr,
+        "FNACC error: internal runtime argument buffer overflow "
+        "for kernel id %d; argCount=%d\n",
+        kernelId, argCount);
+    std::abort();
+  }
+
+  if (fnaccDebugEnabled()) {
+    std::fprintf(stderr,
+        "FNACC: launch generic f32 kernel id=%d rank=%d "
+        "reads=%d scalars=%d grid=(%u,%u,1) tile=(%d,%d,%d) "
+        "cuda_block=(%u,1,1) extent=(%d,%d,%d) bytes=%zu\n",
+        kernelId, rank, numReadArrays, numScalars, gridX, gridY, blockX, blockY,
+        blockZ, cudaBlockX, extentX, extentY, extentZ, numBytes);
+  }
+
+  fnaccValidateCudaBlockSize(fn, kernelId, cudaBlockX);
+
+  FNACC_CUDA_CHECK(cuLaunchKernel(
+      fn, gridX, gridY, 1, cudaBlockX, 1, 1, 0, nullptr, args, nullptr));
+
+  FNACC_CUDA_CHECK(cuCtxSynchronize());
+
+  if (writeDev.target == FNACC_PACK_TARGET_HOST) {
+    fnaccCopyBackWriteBuffer(write, writeDev, numBytes);
   } else {
     if (fnaccDebugEnabled()) {
       std::fprintf(stderr,
@@ -2180,9 +2392,9 @@ extern "C" void __fnacc_launch_matmul_f32_v1(int32_t kernelId, int32_t blockX,
   int32_t bTarget = fnaccPackTargetForSlot(desc, 1);
   int32_t cTarget = fnaccPackTargetForSlot(desc, 2);
 
-  FNACCDeviceArg aDev = fnaccPrepareReadArray(a, bytesA, aTarget, 0);
-  FNACCDeviceArg bDev = fnaccPrepareReadArray(b, bytesB, bTarget, 1);
-  FNACCDeviceArg cDev = fnaccPrepareWriteArray(c, bytesC, cTarget, 2);
+  FNACCDeviceArg aDev = fnaccPrepareReadBuffer(a, bytesA, aTarget, 0);
+  FNACCDeviceArg bDev = fnaccPrepareReadBuffer(b, bytesB, bTarget, 1);
+  FNACCDeviceArg cDev = fnaccPrepareWriteBuffer(c, bytesC, cTarget, 2);
 
   CUdeviceptr dA = aDev.ptr;
   CUdeviceptr dB = bDev.ptr;
@@ -2237,7 +2449,7 @@ extern "C" void __fnacc_launch_matmul_f32_v1(int32_t kernelId, int32_t blockX,
   FNACC_CUDA_CHECK(cuCtxSynchronize());
 
   if (cDev.target == FNACC_PACK_TARGET_HOST) {
-    fnaccCopyBackWriteArray(c, cDev, bytesC);
+    fnaccCopyBackWriteBuffer(c, cDev, bytesC);
   } else {
     if (fnaccDebugEnabled()) {
       std::fprintf(stderr,
