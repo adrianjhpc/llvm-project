@@ -26,11 +26,20 @@ TYPE_PARSER(construct<FnACCPackClause::Item>(
 TYPE_PARSER(construct<FnACCPackClause>(
     "PACK"_tok >> parenthesized(nonemptyList(Parser<FnACCPackClause::Item>{}))))
 
+TYPE_PARSER("+"_tok >> pure(FnACCReductionOperator::Add))
+
+TYPE_PARSER(construct<FnACCReductionClause::Item>(
+    Parser<FnACCReductionOperator>{}, ":"_tok >> name))
+
+TYPE_PARSER(construct<FnACCReductionClause>("REDUCTION"_tok >>
+    parenthesized(nonemptyList(Parser<FnACCReductionClause::Item>{}))))
+
 TYPE_PARSER(construct<FnACCTileClause>(
     "TILE"_tok >> parenthesized(nonemptyList(scalarIntConstantExpr))))
 
 TYPE_PARSER(construct<FnACCClause>(Parser<FnACCTileClause>{}) ||
-    construct<FnACCClause>(Parser<FnACCPackClause>{}))
+    construct<FnACCClause>(Parser<FnACCPackClause>{}) ||
+    construct<FnACCClause>(Parser<FnACCReductionClause>{}))
 
 TYPE_PARSER(construct<FnACCParallelDirective>(
     "PARALLEL"_tok >> many(Parser<FnACCClause>{})))

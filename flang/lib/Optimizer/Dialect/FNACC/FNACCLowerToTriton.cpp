@@ -357,6 +357,53 @@ static void emitTritonExpr1D(const fir::fnacc::ElementwiseKernel &k,
   os << "}\n\n";
 }
 
+static void emitTritonReductionSum1D(const fir::fnacc::ElementwiseKernel &k,
+                                     int64_t block, StringRef kernelName,
+                                     llvm::raw_ostream &os) {
+  std::string ptrTy = ptrType(k.elementType);
+  std::string elemTy = ttElementType(k.elementType).str();
+
+  os << "tt.func @" << kernelName << "(%a: " << ptrTy
+     << ", %partials: " << ptrTy
+     << ", %n: i32) attributes {noinline = false} {\n";
+
+  os << "  %pid  = tt.get_program_id x : i32\n";
+  os << "  %blk  = arith.constant " << block << " : i32\n";
+  os << "  %base = arith.muli %pid, %blk : i32\n";
+  os << "  %rng  = tt.make_range {start = 0 : i32, end = " << block
+     << " : i32} : tensor<" << block << "xi32>\n";
+  os << "  %base_s = tt.splat %base : i32 -> tensor<" << block << "xi32>\n";
+  os << "  %offs = arith.addi %base_s, %rng : tensor<" << block << "xi32>\n";
+  os << "  %n_s = tt.splat %n : i32 -> tensor<" << block << "xi32>\n";
+  os << "  %mask = arith.cmpi slt, %offs, %n_s : tensor<" << block << "xi32>\n";
+
+  os << "  %ap = tt.splat %a : " << ptrTy << " -> tensor<" << block << "x"
+     << ptrTy << ">\n";
+  os << "  %ao = tt.addptr %ap, %offs : tensor<" << block << "x" << ptrTy
+     << ">, tensor<" << block << "xi32>\n";
+  os << "  %vals = tt.load %ao, %mask : tensor<" << block << "x" << ptrTy
+     << ">\n";
+
+  os << "  %zero = arith.constant 0.000000e+00 : " << elemTy << "\n";
+  os << "  %zero_s = tt.splat %zero : " << elemTy << " -> tensor<" << block
+     << "x" << elemTy << ">\n";
+  os << "  %safe = arith.select %mask, %vals, %zero_s : tensor<" << block
+     << "xi1>, tensor<" << block << "x" << elemTy << ">\n";
+
+  os << "  %sum = \"tt.reduce\"(%safe) ({\n";
+  os << "  ^bb0(%lhs: " << elemTy << ", %rhs: " << elemTy << "):\n";
+  os << "    %r = arith.addf %lhs, %rhs : " << elemTy << "\n";
+  os << "    \"tt.reduce.return\"(%r) : (" << elemTy << ") -> ()\n";
+  os << "  }) {axis = 0 : i32} : (tensor<" << block << "x" << elemTy << ">) -> "
+     << elemTy << "\n";
+
+  os << "  %outp = tt.addptr %partials, %pid : " << ptrTy << ", i32\n";
+  os << "  tt.store %outp, %sum : " << ptrTy << "\n";
+
+  os << "  tt.return\n";
+  os << "}\n\n";
+}
+
 static void emitTriton2D(const fir::fnacc::ElementwiseKernel &k, int64_t blockX,
                          int64_t blockY, StringRef kernelName,
                          llvm::raw_ostream &os) {
@@ -404,6 +451,84 @@ static void emitTriton2D(const fir::fnacc::ElementwiseKernel &k, int64_t blockX,
   os << "  %co = tt.addptr %cp, %offs : " << ptrVecTy << ", tensor<" << block
      << "xi32>\n";
   os << "  tt.store %co, %rval, %mask : " << ptrVecTy << "\n";
+
+  os << "  tt.return\n";
+  os << "}\n\n";
+}
+
+static void emitTritonReductionDot1D(const fir::fnacc::ElementwiseKernel &k,
+                                     int64_t block, StringRef kernelName,
+                                     llvm::raw_ostream &os) {
+  assert(k.kind == fir::fnacc::ElementwiseKernelKind::ReductionDot1D &&
+         "expected ReductionDot1D kernel");
+  assert(k.readArrays.size() == 2 &&
+         "dot reduction requires exactly two read arrays");
+
+  std::string ptrTy = ptrType(k.elementType);
+  std::string elemTy = ttElementType(k.elementType).str();
+
+  // ABI:
+  //
+  //   %a        read array 0
+  //   %b        read array 1
+  //   %partials one output scalar per Triton program
+  //   %n        number of elements
+  //
+  // Runtime performs the final host-side reduction over %partials.
+  //
+  // NOTE: the textual tt.reduce form is Triton-version-sensitive. If your
+  // Triton build uses a slightly different printed form, adjust this block
+  // while preserving the function ABI.
+  os << "tt.func @" << kernelName << "(%a: " << ptrTy << ", %b: " << ptrTy
+     << ", %partials: " << ptrTy
+     << ", %n: i32) attributes {noinline = false} {\n";
+
+  os << "  %pid  = tt.get_program_id x : i32\n";
+  os << "  %blk  = arith.constant " << block << " : i32\n";
+  os << "  %base = arith.muli %pid, %blk : i32\n";
+
+  os << "  %rng  = tt.make_range {start = 0 : i32, end = " << block
+     << " : i32} : tensor<" << block << "xi32>\n";
+
+  os << "  %base_s = tt.splat %base : i32 -> tensor<" << block << "xi32>\n";
+  os << "  %offs = arith.addi %base_s, %rng : tensor<" << block << "xi32>\n";
+
+  os << "  %n_s = tt.splat %n : i32 -> tensor<" << block << "xi32>\n";
+  os << "  %mask = arith.cmpi slt, %offs, %n_s : tensor<" << block << "xi32>\n";
+
+  os << "  %ap = tt.splat %a : " << ptrTy << " -> tensor<" << block << "x"
+     << ptrTy << ">\n";
+  os << "  %ao = tt.addptr %ap, %offs : tensor<" << block << "x" << ptrTy
+     << ">, tensor<" << block << "xi32>\n";
+  os << "  %av = tt.load %ao, %mask : tensor<" << block << "x" << ptrTy
+     << ">\n";
+
+  os << "  %bp = tt.splat %b : " << ptrTy << " -> tensor<" << block << "x"
+     << ptrTy << ">\n";
+  os << "  %bo = tt.addptr %bp, %offs : tensor<" << block << "x" << ptrTy
+     << ">, tensor<" << block << "xi32>\n";
+  os << "  %bv = tt.load %bo, %mask : tensor<" << block << "x" << ptrTy
+     << ">\n";
+
+  os << "  %prod = arith.mulf %av, %bv : tensor<" << block << "x" << elemTy
+     << ">\n";
+
+  os << "  %zero = arith.constant 0.000000e+00 : " << elemTy << "\n";
+  os << "  %zero_s = tt.splat %zero : " << elemTy << " -> tensor<" << block
+     << "x" << elemTy << ">\n";
+
+  os << "  %safe = arith.select %mask, %prod, %zero_s : tensor<" << block
+     << "xi1>, tensor<" << block << "x" << elemTy << ">\n";
+
+  os << "  %sum = \"tt.reduce\"(%safe) ({\n";
+  os << "  ^bb0(%lhs: " << elemTy << ", %rhs: " << elemTy << "):\n";
+  os << "    %r = arith.addf %lhs, %rhs : " << elemTy << "\n";
+  os << "    \"tt.reduce.return\"(%r) : (" << elemTy << ") -> ()\n";
+  os << "  }) {axis = 0 : i32} : (tensor<" << block << "x" << elemTy << ">) -> "
+     << elemTy << "\n";
+
+  os << "  %outp = tt.addptr %partials, %pid : " << ptrTy << ", i32\n";
+  os << "  tt.store %outp, %sum : " << ptrTy << "\n";
 
   os << "  tt.return\n";
   os << "}\n\n";
@@ -860,6 +985,22 @@ kernelParamSlotsForValue(const fir::fnacc::ElementwiseKernel &k, Value v) {
   return slots;
 }
 
+static bool isReductionMetadataPackSlot(fir::fnacc::LaunchOp launchOp,
+                                        unsigned packIndex) {
+  auto slotsAttr =
+      launchOp->getAttrOfType<DenseI32ArrayAttr>("fnacc.reduction_slots");
+
+  if (!slotsAttr)
+    return false;
+
+  for (int32_t slot : slotsAttr.asArrayRef()) {
+    if (slot >= 0 && static_cast<unsigned>(slot) == packIndex)
+      return true;
+  }
+
+  return false;
+}
+
 static void emitJsonDescriptor(
     fir::fnacc::LaunchOp launchOp, const fir::fnacc::ElementwiseKernel &k,
     int64_t blockX, int64_t blockY, int64_t blockZ, int32_t kernelId,
@@ -879,6 +1020,10 @@ static void emitJsonDescriptor(
     kindName = "expr2d";
   else if (k.kind == fir::fnacc::ElementwiseKernelKind::MatMul2D)
     kindName = "matmul2d";
+  else if (k.kind == fir::fnacc::ElementwiseKernelKind::ReductionSum1D)
+    kindName = "reduction_sum1d";
+  else if (k.kind == fir::fnacc::ElementwiseKernelKind::ReductionDot1D)
+    kindName = "reduction_dot1d";
 
   std::string ptrJsonTy = jsonPtrType(k.elementType);
   std::string elemJsonTy = jsonElementType(k.elementType);
@@ -904,55 +1049,99 @@ static void emitJsonDescriptor(
     os << "      \"grid\": [\"cdiv(extent_x, tile_x)\", \"1\", \"1\"],\n";
   }
 
+  bool isReduction =
+      k.kind == fir::fnacc::ElementwiseKernelKind::ReductionSum1D ||
+      k.kind == fir::fnacc::ElementwiseKernelKind::ReductionDot1D;
+
   os << "      \"params\": [\n";
 
   unsigned nextSlot = 0;
-  for (unsigned i = 0; i < k.readArrays.size(); ++i) {
-    if (i != 0)
+
+  if (isReduction) {
+    // Reduction kernel ABI:
+    //
+    //   reduction_sum1d:
+    //     read0, partials, extent_x
+    //
+    //   reduction_dot1d:
+    //     read0, read1, partials, extent_x
+    //
+    // The final scalar result is not a Triton kernel parameter. Runtime
+    // lowering passes the scalar to the host runtime, and the runtime performs
+    // the final host-side reduction over the partials buffer.
+    for (unsigned i = 0; i < k.readArrays.size(); ++i) {
+      if (i != 0)
+        os << ",\n";
+
+      os << "        {\"slot\": " << nextSlot++
+         << ", \"role\": \"read\",     \"name\": \"read" << i
+         << "\",    \"type\": \"" << ptrJsonTy << "\"}";
+    }
+
+    if (!k.readArrays.empty())
       os << ",\n";
+
     os << "        {\"slot\": " << nextSlot++
-       << ", \"role\": \"read\",     \"name\": \"read" << i
-       << "\",    \"type\": \"" << ptrJsonTy << "\"}";
-  }
+       << ", \"role\": \"partials\", \"name\": \"partials\", "
+       << "\"type\": \"" << ptrJsonTy << "\"},\n";
 
-  if (!k.readArrays.empty())
-    os << ",\n";
-
-  os << "        {\"slot\": " << nextSlot++
-     << ", \"role\": \"write\",    \"name\": \"write\",    "
-     << "\"type\": \"" << ptrJsonTy << "\"}";
-
-  for (unsigned i = 0; i < k.scalarRefs.size(); ++i) {
-    os << ",\n";
     os << "        {\"slot\": " << nextSlot++
-       << ", \"role\": \"scalar\",   \"name\": \"scalar" << i
-       << "\",  \"type\": \"" << elemJsonTy << "\"}";
-  }
+       << ", \"role\": \"extent_x\", \"name\": \"extent_x\", "
+       << "\"type\": \"i32\"}\n";
 
-  os << ",\n";
-  os << "        {\"slot\": " << nextSlot++
-     << ", \"role\": \"extent_x\", \"name\": \"extent_x\", "
-     << "\"type\": \"i32\"}";
+    os << "      ],\n";
 
-  if (k.rank == 2) {
-    os << ",\n";
+  } else {
+    // Generic elementwise/matmul parameter metadata.
+    for (unsigned i = 0; i < k.readArrays.size(); ++i) {
+      if (i != 0)
+        os << ",\n";
+
+      os << "        {\"slot\": " << nextSlot++
+         << ", \"role\": \"read\",     \"name\": \"read" << i
+         << "\",    \"type\": \"" << ptrJsonTy << "\"}";
+    }
+
+    if (!k.readArrays.empty())
+      os << ",\n";
+
     os << "        {\"slot\": " << nextSlot++
-       << ", \"role\": \"extent_y\", \"name\": \"extent_y\", "
-       << "\"type\": \"i32\"}";
+       << ", \"role\": \"write\",    \"name\": \"write\",    "
+       << "\"type\": \"" << ptrJsonTy << "\"}";
 
-    if (k.kind == fir::fnacc::ElementwiseKernelKind::MatMul2D) {
+    for (unsigned i = 0; i < k.scalarRefs.size(); ++i) {
       os << ",\n";
       os << "        {\"slot\": " << nextSlot++
-         << ", \"role\": \"extent_k\", \"name\": \"extent_k\", "
-         << "\"type\": \"i32\"}\n";
+         << ", \"role\": \"scalar\",   \"name\": \"scalar" << i
+         << "\",  \"type\": \"" << elemJsonTy << "\"}";
+    }
+
+    os << ",\n";
+    os << "        {\"slot\": " << nextSlot++
+       << ", \"role\": \"extent_x\", \"name\": \"extent_x\", "
+       << "\"type\": \"i32\"}";
+
+    if (k.rank == 2) {
+      os << ",\n";
+      os << "        {\"slot\": " << nextSlot++
+         << ", \"role\": \"extent_y\", \"name\": \"extent_y\", "
+         << "\"type\": \"i32\"}";
+
+      if (k.kind == fir::fnacc::ElementwiseKernelKind::MatMul2D) {
+        os << ",\n";
+        os << "        {\"slot\": " << nextSlot++
+           << ", \"role\": \"extent_k\", \"name\": \"extent_k\", "
+           << "\"type\": \"i32\"}\n";
+      } else {
+        os << "\n";
+      }
     } else {
       os << "\n";
     }
-  } else {
-    os << "\n";
+
+    os << "      ],\n";
   }
 
-  os << "      ],\n";
   os << "      \"pack\": [";
 
   auto packVars = launchOp.getPackVars();
@@ -962,6 +1151,12 @@ static void emitJsonDescriptor(
   for (auto it : llvm::enumerate(packVars)) {
     unsigned packIndex = it.index();
     Value packValue = it.value();
+
+    // Reduction scalars are carried through pack_vars only as launch metadata.
+    // They are not Triton kernel arguments and should not appear in JSON pack
+    // entries.
+    if (isReductionMetadataPackSlot(launchOp, packIndex))
+      continue;
 
     llvm::SmallVector<unsigned> slots = kernelParamSlotsForValue(k, packValue);
     if (slots.empty()) {
@@ -1033,6 +1228,7 @@ struct FNACCLowerToTritonPass
     }
 
     bool hasSimpleElementwiseLaunch = false;
+    bool hasReductionLaunch = false;
     bool hasMatmulLaunch = false;
 
     module.walk([&](fir::fnacc::LaunchOp launchOp) {
@@ -1041,6 +1237,7 @@ struct FNACCLowerToTritonPass
         return;
 
       const fir::fnacc::ElementwiseKernel &k = result.getKernel();
+
       switch (k.kind) {
       case fir::fnacc::ElementwiseKernelKind::BinaryArrayArray:
       case fir::fnacc::ElementwiseKernelKind::Saxpy1D:
@@ -1048,25 +1245,48 @@ struct FNACCLowerToTritonPass
       case fir::fnacc::ElementwiseKernelKind::Expr2D:
         hasSimpleElementwiseLaunch = true;
         break;
+
+      case fir::fnacc::ElementwiseKernelKind::ReductionSum1D:
+      case fir::fnacc::ElementwiseKernelKind::ReductionDot1D:
+        hasReductionLaunch = true;
+        break;
+
       case fir::fnacc::ElementwiseKernelKind::MatMul2D:
         hasMatmulLaunch = true;
         break;
       }
     });
 
-    if (hasSimpleElementwiseLaunch && tritonNumWarps != 1) {
+    bool hasSingleWarpOnlyKernel =
+        hasSimpleElementwiseLaunch || hasReductionLaunch;
+
+    if (hasSingleWarpOnlyKernel && tritonNumWarps != 1) {
       if (hasMatmulLaunch) {
         module.emitWarning()
-            << "FNACC module contains both simple elementwise and matmul "
-               "kernels. TTIR currently has one module-wide num-warps setting, "
-               "so simple elementwise lowering forces num-warps=1 for the "
-               "whole module. Consider compiling matmul kernels separately.";
+            << "FNACC module contains simple elementwise/reduction kernels and "
+               "matmul kernels. TTIR currently has one module-wide num-warps "
+               "setting, so simple elementwise/reduction lowering forces "
+               "num-warps=1 for the whole module. Consider compiling matmul "
+               "kernels separately.";
+      } else if (hasReductionLaunch && !hasSimpleElementwiseLaunch) {
+        module.emitWarning()
+            << "FNACC reduction kernels currently use the conservative "
+               "single-warp Triton lowering path; using num-warps=1 instead "
+               "of requested "
+            << tritonNumWarps;
+      } else if (hasReductionLaunch) {
+        module.emitWarning()
+            << "FNACC simple elementwise/reduction kernels currently use the "
+               "single-warp Triton lowering path; using num-warps=1 instead "
+               "of requested "
+            << tritonNumWarps;
       } else {
         module.emitWarning()
             << "FNACC simple elementwise kernels currently use the single-warp "
                "Triton lowering path; using num-warps=1 instead of requested "
             << tritonNumWarps;
       }
+
       tritonNumWarps = 1;
     }
 
@@ -1156,12 +1376,18 @@ struct FNACCLowerToTritonPass
         blockY = 1;
         blockZ = 1;
 
-        if (k.kind == fir::fnacc::ElementwiseKernelKind::Expr1D)
+        if (k.kind == fir::fnacc::ElementwiseKernelKind::ReductionDot1D) {
+          emitTritonReductionDot1D(k, blockX, kernelName, ttirOs);
+        } else if (k.kind ==
+                   fir::fnacc::ElementwiseKernelKind::ReductionSum1D) {
+          emitTritonReductionSum1D(k, blockX, kernelName, ttirOs);
+        } else if (k.kind == fir::fnacc::ElementwiseKernelKind::Expr1D) {
           emitTritonExpr1D(k, blockX, kernelName, ttirOs);
-        else if (k.kind == fir::fnacc::ElementwiseKernelKind::Saxpy1D)
+        } else if (k.kind == fir::fnacc::ElementwiseKernelKind::Saxpy1D) {
           emitTritonSaxpy1D(k, blockX, kernelName, ttirOs);
-        else
+        } else {
           emitTriton1D(k, blockX, kernelName, ttirOs);
+        }
       }
 
       emitJsonDescriptor(launchOp, k, blockX, blockY, blockZ, kernelId,

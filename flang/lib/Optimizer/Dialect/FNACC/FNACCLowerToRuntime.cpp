@@ -209,6 +209,10 @@ static std::optional<int64_t> getElementByteSize(Type elementType) {
 static Value getRuntimeRealPointer(OpBuilder &builder, Location loc,
                                    Value arrayLike,
                                    fir::fnacc::ElementType type) {
+  if (!arrayLike) {
+    mlir::emitError(loc) << "FNACC internal error: null array-like value";
+    return {};
+  }
   FloatType realTy = getMLIRFloatType(builder, type);
   Type realRefTy = fir::ReferenceType::get(realTy);
 
@@ -219,6 +223,18 @@ static Value getRuntimeRealPointer(OpBuilder &builder, Location loc,
   }
 
   return fir::ConvertOp::create(builder, loc, realRefTy, arrayLike);
+}
+
+static Value getRuntimeScalarRealPointer(OpBuilder &builder, Location loc,
+                                         Value scalarRef,
+                                         fir::fnacc::ElementType type) {
+  FloatType realTy = getMLIRFloatType(builder, type);
+  Type realRefTy = fir::ReferenceType::get(realTy);
+
+  if (scalarRef.getType() == realRefTy)
+    return scalarRef;
+
+  return fir::ConvertOp::create(builder, loc, realRefTy, scalarRef);
 }
 
 static void createRuntimeCall(ModuleOp module, OpBuilder &builder, Location loc,
@@ -722,6 +738,71 @@ struct FNACCLowerToRuntimePass
         extentZValue = materializeExtentValue(builder, loc, k.extentZ);
       } else {
         extentZValue = arith::ConstantIntOp::create(builder, loc, 1, 32);
+      }
+
+      if (k.kind == fir::fnacc::ElementwiseKernelKind::ReductionSum1D ||
+          k.kind == fir::fnacc::ElementwiseKernelKind::ReductionDot1D) {
+        if (!k.reductionScalarRef) {
+          launchOp.emitError("FNACC reduction has no reduction scalar ref");
+          signalPassFailure();
+          return;
+        }
+
+        if (k.readArrays.empty() || k.readArrays.size() > 2) {
+          launchOp.emitError(
+              "FNACC reduction runtime supports one or two read arrays");
+          signalPassFailure();
+          return;
+        }
+
+        StringRef reductionRuntimeName =
+            k.elementType == fir::fnacc::ElementType::F64
+                ? "__fnacc_launch_reduce_f64_v1"
+                : "__fnacc_launch_reduce_f32_v1";
+
+        Value numReadArraysValue = arith::ConstantIntOp::create(
+            builder, loc, static_cast<int32_t>(k.readArrays.size()), 32);
+
+        Value read0Ptr =
+            getRuntimeRealPointer(builder, loc, k.readArrays[0], k.elementType);
+
+        Value read1Ptr = read0Ptr;
+        if (k.readArrays.size() >= 2) {
+          read1Ptr = getRuntimeRealPointer(builder, loc, k.readArrays[1],
+                                           k.elementType);
+        }
+
+        Value resultPtr = getRuntimeScalarRealPointer(
+            builder, loc, k.reductionScalarRef, k.elementType);
+
+        llvm::SmallVector<Type> argTypes;
+        argTypes.push_back(kernelIdValue.getType());
+        argTypes.push_back(blockXValue.getType());
+        argTypes.push_back(numReadArraysValue.getType());
+        argTypes.push_back(read0Ptr.getType());
+        argTypes.push_back(read1Ptr.getType());
+        argTypes.push_back(resultPtr.getType());
+        argTypes.push_back(extentXValue.getType());
+
+        func::FuncOp callee = getOrCreateRuntimeDecl(
+            module, builder, loc, reductionRuntimeName, argTypes);
+
+        llvm::SmallVector<Value> operands;
+        operands.push_back(kernelIdValue);
+        operands.push_back(blockXValue);
+        operands.push_back(numReadArraysValue);
+        operands.push_back(read0Ptr);
+        operands.push_back(read1Ptr);
+        operands.push_back(resultPtr);
+        operands.push_back(extentXValue);
+
+        func::CallOp::create(builder, loc, callee.getSymName(), TypeRange{},
+                             operands);
+
+        launchOp.erase();
+
+        ++fallbackKernelId;
+        continue;
       }
 
       StringRef runtimeName = k.elementType == fir::fnacc::ElementType::F64

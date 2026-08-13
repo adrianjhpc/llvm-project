@@ -2100,6 +2100,11 @@ public:
     messageHandler().set_currStmtSource(std::nullopt);
   }
 
+  void Post(const parser::FnACCReductionClause::Item &item) {
+    auto &name{const_cast<parser::Name &>(std::get<parser::Name>(item.t))};
+    ResolveFNACCName(name, "REDUCTION clause");
+  }
+
   // The PACK clause holds bare parser::Name nodes. ResolveNamesVisitor does
   // not visit standalone Names in this context, so resolve them explicitly.
   //

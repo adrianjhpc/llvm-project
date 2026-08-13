@@ -44,7 +44,9 @@ enum class ElementwiseKernelKind {
   Saxpy1D,
   Expr1D,
   Expr2D,
-  MatMul2D
+  MatMul2D,
+  ReductionSum1D,
+  ReductionDot1D
 };
 
 enum class ElementwiseExprKind {
@@ -115,6 +117,7 @@ struct ElementwiseKernel {
 
   mlir::Value reductionIndMemref;
   mlir::Value accumulatorMemref;
+  mlir::Value reductionScalarRef;
 
   llvm::SmallVector<mlir::Value> readArrays;
   mlir::Value writeArray;

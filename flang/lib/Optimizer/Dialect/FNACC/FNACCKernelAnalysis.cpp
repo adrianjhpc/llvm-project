@@ -21,6 +21,14 @@ static ElementwiseRecognitionResult fail(Operation *op, StringRef reason) {
   return ElementwiseRecognitionResult::failure(op, reason.str());
 }
 
+static ElementwiseRecognitionResult
+failWithDefault(Operation *op, StringRef reason, StringRef fallback) {
+  if (!reason.empty())
+    return fail(op, reason);
+
+  return fail(op, fallback);
+}
+
 static Value stripFirConvert(Value v) {
   while (auto cvt = v.getDefiningOp<fir::ConvertOp>())
     v = cvt.getValue();
@@ -825,11 +833,381 @@ static bool isZeroReal(Value v) {
   return floatAttr.getValue().isZero();
 }
 
+struct ReductionArrayLoadInfo {
+  Value arrayBase;
+  Value loadedValue;
+};
+
+static std::optional<Value>
+getSingleReductionScalarFromLaunch(fir::fnacc::LaunchOp launchOp) {
+  auto slotsAttr =
+      launchOp->getAttrOfType<DenseI32ArrayAttr>("fnacc.reduction_slots");
+
+  if (!slotsAttr)
+    return std::nullopt;
+
+  llvm::ArrayRef<int32_t> slots = slotsAttr.asArrayRef();
+
+  if (slots.size() != 1)
+    return std::nullopt;
+
+  int32_t slot = slots[0];
+
+  if (slot < 0)
+    return std::nullopt;
+
+  auto packVars = launchOp.getPackVars();
+
+  if (static_cast<unsigned>(slot) >= packVars.size())
+    return std::nullopt;
+
+  return packVars[slot];
+}
+
+static bool allReductionOpsAreAdd(fir::fnacc::LaunchOp launchOp) {
+  auto opsAttr =
+      launchOp->getAttrOfType<DenseI32ArrayAttr>("fnacc.reduction_ops");
+
+  if (!opsAttr)
+    return true; // Backwards-compatible default: reduction(+) only.
+
+  llvm::ArrayRef<int32_t> ops = opsAttr.asArrayRef();
+
+  if (ops.empty())
+    return true;
+
+  // 0 = add
+  for (int32_t op : ops)
+    if (op != 0)
+      return false;
+
+  return true;
+}
+
+static bool collectReductionArrayLoads1D(
+    fir::DoLoopOp loop, Value indMemref,
+    llvm::SmallVectorImpl<ReductionArrayLoadInfo> &loads, std::string &reason) {
+  Block *body = loop.getBody();
+
+  if (!body) {
+    reason = "reduction loop has no body";
+    return false;
+  }
+
+  for (Operation &op : body->getOperations()) {
+    auto ac = dyn_cast<fir::ArrayCoorOp>(op);
+    if (!ac)
+      continue;
+
+    auto indices = ac.getIndices();
+
+    if (indices.size() != 1) {
+      reason = "reduction only supports rank-1 array accesses";
+      return false;
+    }
+
+    if (!indexIsLoadOf(indices[0], indMemref)) {
+      reason =
+          "reduction array index is not a load of the expected induction var";
+      return false;
+    }
+
+    Value base = ac.getMemref();
+
+    for (Operation *user : ac.getResult().getUsers()) {
+      if (auto load = dyn_cast<fir::LoadOp>(user)) {
+        ReductionArrayLoadInfo info;
+        info.arrayBase = base;
+        info.loadedValue = load.getResult();
+        loads.push_back(info);
+      } else {
+        reason = "reduction array_coor result has unsupported user";
+        return false;
+      }
+    }
+  }
+
+  if (loads.empty()) {
+    reason = "reduction has no array loads";
+    return false;
+  }
+
+  if (loads.size() > 2) {
+    reason = "reduction supports at most two array loads";
+    return false;
+  }
+
+  return true;
+}
+
+static int findReductionLoadedValueIndex(ArrayRef<ReductionArrayLoadInfo> loads,
+                                         Value value) {
+  value = stripFirConvert(value);
+
+  for (auto it : llvm::enumerate(loads)) {
+    Value loaded = stripFirConvert(it.value().loadedValue);
+    if (loaded == value)
+      return static_cast<int>(it.index());
+  }
+
+  return -1;
+}
+
+static bool getOrCheckReductionElementType(ElementwiseKernel &k,
+                                           std::string &reason) {
+  if (k.readArrays.empty()) {
+    reason = "reduction has no read arrays";
+    return false;
+  }
+
+  fir::fnacc::ElementType type = getRealArrayElementType(k.readArrays[0]);
+
+  if (type == fir::fnacc::ElementType::Unknown) {
+    reason = "reduction read array must be real(4) or real(8)";
+    return false;
+  }
+
+  for (Value read : k.readArrays) {
+    if (getRealArrayElementType(read) != type) {
+      reason = "all reduction read arrays must have same element type";
+      return false;
+    }
+  }
+
+  if (!k.reductionScalarRef) {
+    reason = "reduction has no scalar result reference";
+    return false;
+  }
+
+  if (getScalarRealRefElementType(k.reductionScalarRef) != type) {
+    reason = "reduction scalar type must match array element type";
+    return false;
+  }
+
+  k.elementType = type;
+  return true;
+}
+
 static bool valueIsLoadOfMemref(Value v, Value memref) {
   v = stripFirConvert(v);
 
   auto load = v.getDefiningOp<fir::LoadOp>();
   return load && load.getMemref() == memref;
+}
+
+static bool matchReductionSumValue(Value value,
+                                   ArrayRef<ReductionArrayLoadInfo> loads,
+                                   Value reductionScalarRef, Value &arrayBase,
+                                   Operation *&computeOp, std::string &reason) {
+  value = stripFirConvert(value);
+
+  auto add = value.getDefiningOp<arith::AddFOp>();
+  if (!add) {
+    reason = "reduction store value is not arith.addf";
+    return false;
+  }
+
+  Value lhs = stripFirConvert(add.getLhs());
+  Value rhs = stripFirConvert(add.getRhs());
+
+  Value candidate;
+
+  if (valueIsLoadOfMemref(lhs, reductionScalarRef)) {
+    candidate = rhs;
+  } else if (valueIsLoadOfMemref(rhs, reductionScalarRef)) {
+    candidate = lhs;
+  } else {
+    reason = "reduction add does not include previous scalar value";
+    return false;
+  }
+
+  int loadIndex = findReductionLoadedValueIndex(loads, candidate);
+  if (loadIndex < 0) {
+    reason = "reduction sum term is not an array element load";
+    return false;
+  }
+
+  arrayBase = loads[loadIndex].arrayBase;
+  computeOp = add.getOperation();
+  return true;
+}
+
+static bool matchReductionDotValue(Value value,
+                                   ArrayRef<ReductionArrayLoadInfo> loads,
+                                   Value reductionScalarRef, Value &arrayA,
+                                   Value &arrayB, Operation *&computeOp,
+                                   std::string &reason) {
+  value = stripFirConvert(value);
+
+  auto add = value.getDefiningOp<arith::AddFOp>();
+  if (!add) {
+    reason = "dot reduction store value is not arith.addf";
+    return false;
+  }
+
+  Value lhs = stripFirConvert(add.getLhs());
+  Value rhs = stripFirConvert(add.getRhs());
+
+  Value maybeMul;
+
+  if (valueIsLoadOfMemref(lhs, reductionScalarRef)) {
+    maybeMul = rhs;
+  } else if (valueIsLoadOfMemref(rhs, reductionScalarRef)) {
+    maybeMul = lhs;
+  } else {
+    reason = "dot reduction add does not include previous scalar value";
+    return false;
+  }
+
+  maybeMul = stripFirConvert(maybeMul);
+
+  auto mul = maybeMul.getDefiningOp<arith::MulFOp>();
+  if (!mul) {
+    reason = "dot reduction term is not arith.mulf";
+    return false;
+  }
+
+  Value mulLhs = stripFirConvert(mul.getLhs());
+  Value mulRhs = stripFirConvert(mul.getRhs());
+
+  int lhsIndex = findReductionLoadedValueIndex(loads, mulLhs);
+  int rhsIndex = findReductionLoadedValueIndex(loads, mulRhs);
+
+  if (lhsIndex < 0 || rhsIndex < 0 || lhsIndex == rhsIndex) {
+    reason = "dot reduction multiply operands are not two distinct array loads";
+    return false;
+  }
+
+  arrayA = loads[lhsIndex].arrayBase;
+  arrayB = loads[rhsIndex].arrayBase;
+  computeOp = mul.getOperation();
+  return true;
+}
+
+static ElementwiseRecognitionResult
+recognizeReduction1D(fir::fnacc::LaunchOp launchOp) {
+  if (!launchOp->hasAttr("fnacc.reduction_slots"))
+    return fail(launchOp, "launch has no FNACC reduction metadata");
+
+  if (!allReductionOpsAreAdd(launchOp))
+    return fail(launchOp, "only reduction(+) is currently supported");
+
+  std::optional<Value> reductionScalar =
+      getSingleReductionScalarFromLaunch(launchOp);
+
+  if (!reductionScalar)
+    return fail(launchOp,
+                "reduction recognition requires exactly one reduction scalar");
+
+  Region &region = launchOp.getRegion();
+
+  if (region.empty())
+    return fail(launchOp, "reduction launch region is empty");
+
+  Block &launchBlock = region.front();
+
+  fir::DoLoopOp loop;
+  for (Operation &op : launchBlock) {
+    if (auto dl = dyn_cast<fir::DoLoopOp>(op)) {
+      if (loop)
+        return fail(
+            &op, "reduction recognition expected exactly one top-level loop");
+      loop = dl;
+    }
+  }
+
+  if (!loop)
+    return fail(launchOp, "reduction recognition found no top-level loop");
+
+  std::string loopReason;
+  if (!verifyLoopLowerBoundAndStep(loop, "reduction", loopReason))
+    return fail(loop.getOperation(), loopReason);
+
+  ElementwiseExtentSource extentX = getLoopExtentSource(loop);
+
+  if (extentX.kind == ElementwiseExtentSourceKind::Unknown)
+    return fail(loop.getOperation(), "could not determine reduction extent");
+
+  Value indMemref = findInductionMemref(loop);
+  if (!indMemref)
+    return fail(loop.getOperation(),
+                "could not find reduction induction variable storage");
+
+  llvm::SmallVector<ReductionArrayLoadInfo> loads;
+  std::string reason;
+
+  if (!collectReductionArrayLoads1D(loop, indMemref, loads, reason))
+    return fail(loop.getOperation(), reason);
+
+  fir::StoreOp reductionStore;
+
+  for (Operation &op : loop.getBody()->getOperations()) {
+    auto st = dyn_cast<fir::StoreOp>(op);
+    if (!st)
+      continue;
+
+    if (st.getMemref() == *reductionScalar) {
+      if (reductionStore)
+        return fail(st.getOperation(),
+                    "reduction loop has multiple stores to reduction scalar");
+      reductionStore = st;
+    }
+  }
+
+  if (!reductionStore)
+    return fail(loop.getOperation(),
+                "reduction loop does not store to reduction scalar");
+
+  ElementwiseKernel k;
+  k.rank = 1;
+  k.loop1D = loop;
+  k.extentX = extentX;
+  k.innerIndMemref = indMemref;
+  k.reductionScalarRef = *reductionScalar;
+  k.writeArray = {};
+  k.scalarRefs.clear();
+
+  // Try dot first because it is also an additive reduction.
+  Value arrayA;
+  Value arrayB;
+  Operation *computeOp = nullptr;
+
+  std::string dotReason;
+  if (matchReductionDotValue(reductionStore.getValue(), loads, *reductionScalar,
+                             arrayA, arrayB, computeOp, dotReason)) {
+    k.kind = ElementwiseKernelKind::ReductionDot1D;
+    k.readArrays.push_back(arrayA);
+    k.readArrays.push_back(arrayB);
+    k.computeOp = computeOp;
+
+    if (!getOrCheckReductionElementType(k, reason))
+      return fail(loop.getOperation(), reason);
+
+    return ElementwiseRecognitionResult::success(std::move(k));
+  }
+
+  Value arrayBase;
+  computeOp = nullptr;
+
+  std::string sumReason;
+  if (matchReductionSumValue(reductionStore.getValue(), loads, *reductionScalar,
+                             arrayBase, computeOp, sumReason)) {
+    k.kind = ElementwiseKernelKind::ReductionSum1D;
+    k.readArrays.push_back(arrayBase);
+    k.computeOp = computeOp;
+
+    if (!getOrCheckReductionElementType(k, reason))
+      return fail(loop.getOperation(), reason);
+
+    return ElementwiseRecognitionResult::success(std::move(k));
+  }
+
+  reason = "unsupported reduction expression; dot failure: ";
+  reason += dotReason;
+  reason += "; sum failure: ";
+  reason += sumReason;
+
+  return fail(loop.getOperation(), reason);
 }
 
 static bool loadIsArrayAccess(Value v, Value expectedIndex0,
@@ -910,37 +1288,47 @@ static bool findMatmulReductionBody(fir::DoLoopOp pLoop, Value accMemref,
       continue;
 
     Value stored = stripFirConvert(st.getValue());
-    auto add = stored.getDefiningOp<arith::AddFOp>();
-    if (!add) {
+    Operation *addOp = stored.getDefiningOp();
+
+    if (!addOp || !isa<arith::AddFOp>(addOp)) {
       reason = "matmul accumulator store is not arith.addf";
       return false;
     }
 
-    Value lhs = stripFirConvert(add.getLhs());
-    Value rhs = stripFirConvert(add.getRhs());
+    if (addOp->getNumOperands() != 2) {
+      reason = "matmul accumulator add is not binary";
+      return false;
+    }
 
-    Value oldAcc;
+    Value lhs = stripFirConvert(addOp->getOperand(0));
+    Value rhs = stripFirConvert(addOp->getOperand(1));
+
     Value maybeMul;
 
     if (valueIsLoadOfMemref(lhs, accMemref)) {
-      oldAcc = lhs;
       maybeMul = rhs;
     } else if (valueIsLoadOfMemref(rhs, accMemref)) {
-      oldAcc = rhs;
       maybeMul = lhs;
     } else {
       reason = "matmul add does not include previous accumulator value";
       return false;
     }
 
-    auto mul = maybeMul.getDefiningOp<arith::MulFOp>();
-    if (!mul) {
+    maybeMul = stripFirConvert(maybeMul);
+    Operation *mulOp = maybeMul.getDefiningOp();
+
+    if (!mulOp || !isa<arith::MulFOp>(mulOp)) {
       reason = "matmul accumulator update does not multiply two array loads";
       return false;
     }
 
-    Value mulLhs = stripFirConvert(mul.getLhs());
-    Value mulRhs = stripFirConvert(mul.getRhs());
+    if (mulOp->getNumOperands() != 2) {
+      reason = "matmul multiply is not binary";
+      return false;
+    }
+
+    Value mulLhs = stripFirConvert(mulOp->getOperand(0));
+    Value mulRhs = stripFirConvert(mulOp->getOperand(1));
 
     Value lhsArray;
     Value rhsArray;
@@ -951,7 +1339,7 @@ static bool findMatmulReductionBody(fir::DoLoopOp pLoop, Value accMemref,
     if (lhsIsA && rhsIsB) {
       aArray = lhsArray;
       bArray = rhsArray;
-      computeOp = mul.getOperation();
+      computeOp = mulOp;
       return true;
     }
 
@@ -961,7 +1349,7 @@ static bool findMatmulReductionBody(fir::DoLoopOp pLoop, Value accMemref,
     if (rhsIsA && lhsIsB) {
       aArray = rhsArray;
       bArray = lhsArray;
-      computeOp = mul.getOperation();
+      computeOp = mulOp;
       return true;
     }
 
@@ -1102,7 +1490,8 @@ recognizeMatMul2D(fir::fnacc::LaunchOp launchOp) {
   std::string reason;
 
   if (!findAccumulatorInit(iLoop, pLoop, accMemref, reason))
-    return fail(iLoop.getOperation(), reason);
+    return failWithDefault(iLoop.getOperation(), reason,
+                           "matmul failed to find accumulator initialisation");
 
   Value aArray;
   Value bArray;
@@ -1110,13 +1499,15 @@ recognizeMatMul2D(fir::fnacc::LaunchOp launchOp) {
 
   if (!findMatmulReductionBody(pLoop, accMemref, iMemref, jMemref, pMemref,
                                aArray, bArray, computeOp, reason))
-    return fail(pLoop.getOperation(), reason);
+    return failWithDefault(pLoop.getOperation(), reason,
+                           "matmul failed to match reduction loop body");
 
   Value cArray;
 
   if (!findMatmulFinalStore(iLoop, pLoop, accMemref, iMemref, jMemref, cArray,
                             reason))
-    return fail(iLoop.getOperation(), reason);
+    return failWithDefault(iLoop.getOperation(), reason,
+                           "matmul failed to find final C(i,j) store");
 
   ElementwiseKernel k;
   k.kind = ElementwiseKernelKind::MatMul2D;
@@ -1141,7 +1532,8 @@ recognizeMatMul2D(fir::fnacc::LaunchOp launchOp) {
   k.computeOp = computeOp;
 
   if (!inferAndCheckElementType(k, reason))
-    return fail(iLoop.getOperation(), reason);
+    return failWithDefault(iLoop.getOperation(), reason,
+                           "matmul failed element type inference");
 
   if (getRealRefElementType(accMemref) != k.elementType) {
     return fail(iLoop.getOperation(),
@@ -1284,12 +1676,25 @@ bool isSupportedElementwiseCompute(Operation *op) {
 
 ElementwiseRecognitionResult
 recognizeElementwiseKernel(fir::fnacc::LaunchOp launchOp) {
-  // Try matmul first because it is also a 2-D nest.
+  // Reductions are explicitly marked by lowering with fnacc.reduction_slots.
+  // Do not try reduction recognition on ordinary elementwise/matmul launches,
+  // otherwise diagnostics become noisy and misleading.
+  if (launchOp->hasAttr("fnacc.reduction_slots")) {
+    auto rRed = recognizeReduction1D(launchOp);
+    if (rRed.succeeded())
+      return rRed;
+
+    std::string reason = "not a supported FNACC reduction kernel; ";
+    reason += rRed.getFailure().reason;
+    return fail(launchOp, reason);
+  }
+
+  // Try matmul first because it is also a 2-D loop nest.
   auto rMatmul = recognizeMatMul2D(launchOp);
   if (rMatmul.succeeded())
     return rMatmul;
 
-  // Try 2-D first because a 2-D launch also has one top-level loop.
+  // Try 2-D before 1-D because 2-D kernels have one top-level loop too.
   auto r2 = recognize2D(launchOp);
   if (r2.succeeded())
     return r2;
@@ -1298,10 +1703,12 @@ recognizeElementwiseKernel(fir::fnacc::LaunchOp launchOp) {
   if (r1.succeeded())
     return r1;
 
-  std::string reason = "not a supported 1-D or 2-D elementwise kernel; ";
+  std::string reason = "not a supported FNACC kernel; ";
   reason += "matmul failure: ";
-  reason += rMatmul.getFailure().reason;
-  reason += "2-D failure: ";
+  reason += rMatmul.getFailure().reason.empty()
+                ? "<unknown matmul recognition failure>"
+                : rMatmul.getFailure().reason;
+  reason += "; 2-D failure: ";
   reason += r2.getFailure().reason;
   reason += "; 1-D failure: ";
   reason += r1.getFailure().reason;

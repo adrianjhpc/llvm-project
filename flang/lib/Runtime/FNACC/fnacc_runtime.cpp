@@ -2833,6 +2833,196 @@ extern "C" void __fnacc_launch_matmul_f64_v1(int32_t kernelId, int32_t blockX,
   fnaccReleaseDeviceArg(cDev);
 }
 
+extern "C" void __fnacc_launch_reduce_f32_v1(int32_t kernelId, int32_t blockX,
+    int32_t numReadArrays, float *read0, float *read1, float *result,
+    int32_t extentX) {
+  fnaccEnsureCurrentContext();
+
+  if (!read0 || !result) {
+    std::fprintf(
+        stderr, "FNACC error: null pointer in __fnacc_launch_reduce_f32_v1\n");
+    std::abort();
+  }
+
+  if (numReadArrays < 1 || numReadArrays > 2) {
+    std::fprintf(stderr,
+        "FNACC error: reduction f32 supports one or two read arrays, got %d\n",
+        numReadArrays);
+    std::abort();
+  }
+
+  if (extentX <= 0) {
+    *result = 0.0f;
+    return;
+  }
+
+  CUfunction fn = getKernelFunction(kernelId);
+  const FNACCKernelDesc *desc = fnaccLookupKernelDesc(kernelId);
+  if (!desc) {
+    std::fprintf(stderr,
+        "FNACC error: no JSON descriptor for reduction kernel id %d\n",
+        kernelId);
+    std::abort();
+  }
+
+  unsigned gridX = fnaccCdiv(extentX, blockX);
+  unsigned cudaBlockX = fnaccCudaThreadsPerCTA(kernelId);
+
+  std::size_t bytes = static_cast<std::size_t>(extentX) * sizeof(float);
+
+  int32_t read0Target = fnaccEffectivePackTargetForSlot(desc, 0, read0);
+  int32_t read1Target = numReadArrays >= 2
+      ? fnaccEffectivePackTargetForSlot(desc, 1, read1)
+      : FNACC_PACK_TARGET_HOST;
+
+  FNACCDeviceArg read0Dev =
+      fnaccPrepareReadBuffer(read0, bytes, read0Target, 0);
+
+  FNACCDeviceArg read1Dev;
+  if (numReadArrays >= 2)
+    read1Dev = fnaccPrepareReadBuffer(read1, bytes, read1Target, 1);
+
+  CUdeviceptr dRead0 = read0Dev.ptr;
+  CUdeviceptr dRead1 = read1Dev.ptr;
+
+  CUdeviceptr dPartials = 0;
+  std::size_t partialBytes = static_cast<std::size_t>(gridX) * sizeof(float);
+  FNACC_CUDA_CHECK(cuMemAlloc(&dPartials, partialBytes));
+
+  fnaccValidateSupportedHiddenPtrArgCount(kernelId);
+  FNACCHiddenTritonArgs hidden;
+
+  void *args[8];
+  int argCount = 0;
+
+  args[argCount++] = &dRead0;
+
+  if (numReadArrays >= 2)
+    args[argCount++] = &dRead1;
+
+  args[argCount++] = &dPartials;
+  args[argCount++] = &extentX;
+  args[argCount++] = &hidden.hidden0;
+  args[argCount++] = &hidden.hidden1;
+
+  fnaccValidateCudaBlockSize(fn, kernelId, cudaBlockX);
+
+  FNACC_CUDA_CHECK(cuLaunchKernel(
+      fn, gridX, 1, 1, cudaBlockX, 1, 1, 0, nullptr, args, nullptr));
+
+  FNACC_CUDA_CHECK(cuCtxSynchronize());
+
+  std::vector<float> partials(gridX);
+  FNACC_CUDA_CHECK(cuMemcpyDtoH(partials.data(), dPartials, partialBytes));
+
+  float sum = 0.0f;
+  for (float v : partials)
+    sum += v;
+
+  *result = sum;
+
+  FNACC_CUDA_CHECK(cuMemFree(dPartials));
+
+  fnaccReleaseDeviceArg(read0Dev);
+  if (numReadArrays >= 2)
+    fnaccReleaseDeviceArg(read1Dev);
+}
+
+extern "C" void __fnacc_launch_reduce_f64_v1(int32_t kernelId, int32_t blockX,
+    int32_t numReadArrays, double *read0, double *read1, double *result,
+    int32_t extentX) {
+  fnaccEnsureCurrentContext();
+
+  if (!read0 || !result) {
+    std::fprintf(
+        stderr, "FNACC error: null pointer in __fnacc_launch_reduce_f64_v1\n");
+    std::abort();
+  }
+
+  if (numReadArrays < 1 || numReadArrays > 2) {
+    std::fprintf(stderr,
+        "FNACC error: reduction f64 supports one or two read arrays, got %d\n",
+        numReadArrays);
+    std::abort();
+  }
+
+  if (extentX <= 0) {
+    *result = 0.0f;
+    return;
+  }
+
+  CUfunction fn = getKernelFunction(kernelId);
+  const FNACCKernelDesc *desc = fnaccLookupKernelDesc(kernelId);
+  if (!desc) {
+    std::fprintf(stderr,
+        "FNACC error: no JSON descriptor for reduction kernel id %d\n",
+        kernelId);
+    std::abort();
+  }
+
+  unsigned gridX = fnaccCdiv(extentX, blockX);
+  unsigned cudaBlockX = fnaccCudaThreadsPerCTA(kernelId);
+
+  std::size_t bytes = static_cast<std::size_t>(extentX) * sizeof(double);
+
+  int32_t read0Target = fnaccEffectivePackTargetForSlot(desc, 0, read0);
+  int32_t read1Target = numReadArrays >= 2
+      ? fnaccEffectivePackTargetForSlot(desc, 1, read1)
+      : FNACC_PACK_TARGET_HOST;
+
+  FNACCDeviceArg read0Dev =
+      fnaccPrepareReadBuffer(read0, bytes, read0Target, 0);
+
+  FNACCDeviceArg read1Dev;
+  if (numReadArrays >= 2)
+    read1Dev = fnaccPrepareReadBuffer(read1, bytes, read1Target, 1);
+
+  CUdeviceptr dRead0 = read0Dev.ptr;
+  CUdeviceptr dRead1 = read1Dev.ptr;
+
+  CUdeviceptr dPartials = 0;
+  std::size_t partialBytes = static_cast<std::size_t>(gridX) * sizeof(double);
+  FNACC_CUDA_CHECK(cuMemAlloc(&dPartials, partialBytes));
+
+  fnaccValidateSupportedHiddenPtrArgCount(kernelId);
+  FNACCHiddenTritonArgs hidden;
+
+  void *args[8];
+  int argCount = 0;
+
+  args[argCount++] = &dRead0;
+
+  if (numReadArrays >= 2)
+    args[argCount++] = &dRead1;
+
+  args[argCount++] = &dPartials;
+  args[argCount++] = &extentX;
+  args[argCount++] = &hidden.hidden0;
+  args[argCount++] = &hidden.hidden1;
+
+  fnaccValidateCudaBlockSize(fn, kernelId, cudaBlockX);
+
+  FNACC_CUDA_CHECK(cuLaunchKernel(
+      fn, gridX, 1, 1, cudaBlockX, 1, 1, 0, nullptr, args, nullptr));
+
+  FNACC_CUDA_CHECK(cuCtxSynchronize());
+
+  std::vector<double> partials(gridX);
+  FNACC_CUDA_CHECK(cuMemcpyDtoH(partials.data(), dPartials, partialBytes));
+
+  double sum = 0.0f;
+  for (double v : partials)
+    sum += v;
+
+  *result = sum;
+
+  FNACC_CUDA_CHECK(cuMemFree(dPartials));
+
+  fnaccReleaseDeviceArg(read0Dev);
+  if (numReadArrays >= 2)
+    fnaccReleaseDeviceArg(read1Dev);
+}
+
 // Memory management functions to help with cached data and data lifetimes
 extern "C" void __fnacc_update_host(void *hostPtr) {
   fnaccEnsureCurrentContext();

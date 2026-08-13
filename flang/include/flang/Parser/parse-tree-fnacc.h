@@ -18,9 +18,20 @@ struct FnACCTileClause {
   WRAPPER_CLASS_BOILERPLATE(FnACCTileClause, std::list<ScalarIntConstantExpr>);
 };
 
+ENUM_CLASS(FnACCReductionOperator, Add);
+
+struct FnACCReductionClause {
+  struct Item {
+    TUPLE_CLASS_BOILERPLATE(Item);
+    std::tuple<FnACCReductionOperator, Name> t;
+  };
+
+  WRAPPER_CLASS_BOILERPLATE(FnACCReductionClause, std::list<Item>);
+};
+
 struct FnACCClause {
   UNION_CLASS_BOILERPLATE(FnACCClause);
-  std::variant<FnACCTileClause, FnACCPackClause> u;
+  std::variant<FnACCTileClause, FnACCPackClause, FnACCReductionClause> u;
 };
 
 struct FnACCParallelDirective {

@@ -3665,6 +3665,8 @@ private:
     llvm::SmallVector<int64_t> tileSizes;
     llvm::SmallVector<mlir::Value> packVars;
     llvm::SmallVector<int32_t> packTargets;
+    llvm::SmallVector<mlir::Value> reductionVars;
+    llvm::SmallVector<int32_t> reductionOps;
 
     for (const Fortran::parser::FnACCClause &clause : clauses) {
       Fortran::common::visit(
@@ -3688,13 +3690,50 @@ private:
                   }
                 }
               },
+              [&](const Fortran::parser::FnACCReductionClause &redClause) {
+                for (const auto &item : redClause.v) {
+                  const auto op{
+                      std::get<Fortran::parser::FnACCReductionOperator>(
+                          item.t)};
+                  const auto &name{std::get<Fortran::parser::Name>(item.t)};
+
+                  if (name.symbol) {
+                    reductionVars.push_back(getSymbolAddress(*name.symbol));
+
+                    // 0 = add
+                    reductionOps.push_back(
+                        op == Fortran::parser::FnACCReductionOperator::Add ? 0
+                                                                           : 0);
+                  }
+                }
+              },
               [&](const auto &) {}},
           clause.u);
+    }
+
+    // parse clauses, fill packVars/packTargets/reductionVars/reductionOps
+
+    unsigned reductionBase = packVars.size();
+
+    for (mlir::Value v : reductionVars) {
+      packVars.push_back(v);
+      packTargets.push_back(0);
     }
 
     auto launchOp = fir::fnacc::LaunchOp::create(
         *builder, loc, builder->getDenseI64ArrayAttr(tileSizes), packVars,
         builder->getDenseI32ArrayAttr(packTargets));
+
+    if (!reductionVars.empty()) {
+      llvm::SmallVector<int32_t> reductionSlots;
+      for (unsigned i = 0; i < reductionVars.size(); ++i)
+        reductionSlots.push_back(reductionBase + i);
+
+      launchOp->setAttr("fnacc.reduction_slots",
+                        builder->getDenseI32ArrayAttr(reductionSlots));
+      launchOp->setAttr("fnacc.reduction_ops",
+                        builder->getDenseI32ArrayAttr(reductionOps));
+    }
 
     // 4. New block inside the region
     builder->createBlock(&launchOp.getRegion());
