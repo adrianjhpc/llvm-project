@@ -27,7 +27,7 @@ end subroutine
 ! TTIR-SAME: %n: i32
 ! TTIR-SAME: %m: i32
 ! TTIR: arith.mulf
-! TTIR: arith.addf
+! TTIR: math.fma
 ! TTIR: tt.store
 
 ! JSON: "kind": "expr2d"

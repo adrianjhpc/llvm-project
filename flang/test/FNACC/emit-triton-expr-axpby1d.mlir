@@ -67,10 +67,9 @@ module {
 // TTIR-SAME: %scalar1: f32
 // TTIR-SAME: %n: i32
 // TTIR: %[[S0:.*]] = tt.splat %scalar0 : f32 -> tensor<128xf32>
-// TTIR: %[[M0:.*]] = arith.mulf %[[S0]], %read0v : tensor<128xf32>
 // TTIR: %[[S1:.*]] = tt.splat %scalar1 : f32 -> tensor<128xf32>
-// TTIR: %[[M1:.*]] = arith.mulf %[[S1]], %read1v : tensor<128xf32>
-// TTIR: %[[R:.*]] = arith.addf %[[M0]], %[[M1]] : tensor<128xf32>
+// TTIR: %[[M1:.*]] = arith.mulf %[[S1]], %read1v fastmath<contract> : tensor<128xf32>
+// TTIR: %[[R:.*]] = math.fma %[[S0]], %read0v, %[[M1]] : tensor<128xf32>
 // TTIR: tt.store %{{.*}}, %[[R]], %mask : tensor<128x!tt.ptr<f32>>
 
 // JSON: "cuda_threads_per_cta": 32

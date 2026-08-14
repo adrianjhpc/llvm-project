@@ -39,19 +39,18 @@ end subroutine
 ! TTIR: scf.for
 ! TTIR: tt.load
 ! TTIR-SAME: !tt.ptr<f64>
-! TTIR: arith.mulf
-! TTIR-SAME: f64
-! TTIR: arith.addf
-! TTIR-SAME: f64
+! TTIR: math.fma
+! TTIR-SAME: tensor<8x8xf64>
 ! TTIR: tt.store
 ! TTIR-SAME: !tt.ptr<f64>
+! TTIR-NOT: tt.reduce
 
 ! JSON: "fnacc_schema_version": 1
 ! JSON-DAG: "id": 0
 ! JSON-DAG: "name": "fnacc_kernel_0"
 ! JSON-DAG: "kind": "matmul2d"
 ! JSON-DAG: "rank": 2
-! JSON-DAG: "tile": [8, 8, 32]
+! JSON-DAG: "tile": [8, 8, 8]
 ! JSON-DAG: "type": "ptr<f64>"
 ! JSON-DAG: "role": "extent_k"
 

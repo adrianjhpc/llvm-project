@@ -533,6 +533,9 @@ struct FNACCKernelDesc {
 
   // PACK metadata from JSON.
   std::vector<FNACCPackEntry> pack;
+
+  int32_t ptxIndex = 0;
+  std::string ptxFile;
 };
 
 struct FNACCDeviceAllocation {
@@ -545,7 +548,7 @@ struct FNACCKernelRegistry {
 
   CUdevice device = 0;
   CUcontext context = nullptr;
-  CUmodule module = nullptr;
+  std::vector<CUmodule> modules;
 
   std::unordered_map<int32_t, FNACCKernelDesc> kernels;
   std::unordered_map<int32_t, CUfunction> functionCache;
@@ -554,8 +557,8 @@ struct FNACCKernelRegistry {
   std::unordered_map<void *, FNACCDeviceAllocation> deviceCache;
 };
 
-static const char *fnaccEmbeddedPtxData = nullptr;
-static std::size_t fnaccEmbeddedPtxSize = 0;
+static std::vector<const char *> fnaccEmbeddedPtxData;
+static std::vector<std::size_t> fnaccEmbeddedPtxSize;
 
 static const char *fnaccEmbeddedJsonData = nullptr;
 static std::size_t fnaccEmbeddedJsonSize = 0;
@@ -574,8 +577,28 @@ static bool fnaccDebugEnabled() {
   return value && value[0] != '\0' && std::strcmp(value, "0") != 0;
 }
 
-static bool fnaccHasEmbeddedPtx() {
-  return fnaccEmbeddedPtxData && fnaccEmbeddedPtxSize > 0;
+static bool fnaccHasEmbeddedPtxBundle() {
+  return !fnaccEmbeddedPtxData.empty() &&
+      fnaccEmbeddedPtxData.size() == fnaccEmbeddedPtxSize.size();
+}
+
+static std::vector<std::string> fnaccGetPtxTextsFromEmbeddedBundle() {
+  std::vector<std::string> result;
+
+  if (!fnaccHasEmbeddedPtxBundle())
+    return result;
+
+  for (std::size_t i = 0; i < fnaccEmbeddedPtxData.size(); ++i) {
+    result.emplace_back(fnaccEmbeddedPtxData[i], fnaccEmbeddedPtxSize[i]);
+
+    if (fnaccDebugEnabled()) {
+      std::fprintf(stderr,
+          "FNACC: loading embedded PTX bundle entry %zu, bytes=%zu\n", i,
+          fnaccEmbeddedPtxSize[i]);
+    }
+  }
+
+  return result;
 }
 
 static bool fnaccHasEmbeddedJson() {
@@ -594,31 +617,63 @@ static std::string fnaccReadTextFile(const char *path) {
   return ss.str();
 }
 
-static std::string fnaccGetPtxText() {
-  const char *ptxPath = std::getenv("FNACC_PTX");
+static std::vector<std::string> fnaccGetPtxTextsFromDirectory(
+    const std::unordered_map<int32_t, FNACCKernelDesc> &kernels) {
+  std::vector<std::string> result;
 
-  if (ptxPath && ptxPath[0] != '\0') {
-    if (fnaccDebugEnabled())
-      std::fprintf(stderr, "FNACC: loading PTX from '%s'\n", ptxPath);
+  const char *dir = std::getenv("FNACC_PTX_DIR");
+  if (!dir || dir[0] == '\0')
+    return result;
 
-    return fnaccReadTextFile(ptxPath);
-  }
+  int32_t maxIndex = -1;
+  for (const auto &entry : kernels)
+    if (entry.second.ptxIndex > maxIndex)
+      maxIndex = entry.second.ptxIndex;
 
-  if (fnaccHasEmbeddedPtx()) {
+  if (maxIndex < 0)
+    return result;
+
+  result.resize(static_cast<std::size_t>(maxIndex + 1));
+
+  for (const auto &entry : kernels) {
+    const FNACCKernelDesc &desc = entry.second;
+
+    std::string path = std::string(dir) + "/" + desc.ptxFile;
+
     if (fnaccDebugEnabled()) {
-      std::fprintf(stderr, "FNACC: loading embedded PTX, bytes=%zu\n",
-          fnaccEmbeddedPtxSize);
+      std::fprintf(stderr, "FNACC: loading PTX for kernel id %d from '%s'\n",
+          desc.id, path.c_str());
     }
 
-    return std::string(fnaccEmbeddedPtxData, fnaccEmbeddedPtxSize);
+    result[static_cast<std::size_t>(desc.ptxIndex)] =
+        fnaccReadTextFile(path.c_str());
   }
 
-  const char *fallback = "fnacc_kernels.ptx";
+  return result;
+}
 
-  if (fnaccDebugEnabled())
-    std::fprintf(stderr, "FNACC: loading PTX from '%s'\n", fallback);
+static std::vector<std::string> fnaccGetPtxTexts(
+    const std::unordered_map<int32_t, FNACCKernelDesc> &kernels) {
+  const char *singlePtxPath = std::getenv("FNACC_PTX");
 
-  return fnaccReadTextFile(fallback);
+  if (singlePtxPath && singlePtxPath[0] != '\0') {
+    if (fnaccDebugEnabled())
+      std::fprintf(
+          stderr, "FNACC: loading single PTX from '%s'\n", singlePtxPath);
+
+    return {fnaccReadTextFile(singlePtxPath)};
+  }
+
+  if (const char *dir = std::getenv("FNACC_PTX_DIR")) {
+    if (dir[0] != '\0')
+      return fnaccGetPtxTextsFromDirectory(kernels);
+  }
+
+  if (fnaccHasEmbeddedPtxBundle())
+    return fnaccGetPtxTextsFromEmbeddedBundle();
+
+  // Backwards-compatible fallback.
+  return {fnaccReadTextFile("fnacc_kernels.ptx")};
 }
 
 static std::string fnaccGetJsonText() {
@@ -685,6 +740,15 @@ fnaccParseKernelDescsFromJson(const std::string &json) {
 
     jsonFindString(objectText, "kind", desc.kind);
 
+    jsonFindInt(objectText, "ptx_index", desc.ptxIndex);
+    jsonFindString(objectText, "ptx_file", desc.ptxFile);
+
+    if (desc.ptxFile.empty())
+      desc.ptxFile = desc.name + ".ptx";
+
+    if (desc.ptxIndex < 0)
+      desc.ptxIndex = 0;
+
     jsonFindInt(objectText, "rank", desc.rank);
 
     jsonFindIntArray3(objectText, "tile", desc.tileX, desc.tileY, desc.tileZ);
@@ -742,10 +806,11 @@ static void fnaccCleanup() {
   fnaccRegistry.functionCache.clear();
   fnaccRegistry.kernels.clear();
 
-  if (fnaccRegistry.module) {
-    cuModuleUnload(fnaccRegistry.module);
-    fnaccRegistry.module = nullptr;
+  for (CUmodule module : fnaccRegistry.modules) {
+    if (module)
+      cuModuleUnload(module);
   }
+  fnaccRegistry.modules.clear();
 
   if (fnaccRegistry.context) {
     cuDevicePrimaryCtxRelease(fnaccRegistry.device);
@@ -819,6 +884,82 @@ static unsigned fnaccMatmulDynamicSharedBytes(const FNACCKernelDesc *desc,
   return requiredBytes;
 }
 
+static unsigned fnaccMatmulF64DynamicSharedBytes(const FNACCKernelDesc *desc,
+    int32_t blockX, int32_t blockY, int32_t blockK) {
+  if (blockX <= 0 || blockY <= 0 || blockK <= 0) {
+    std::fprintf(stderr,
+        "FNACC error: invalid f64 matmul tile shape (%d,%d,%d) while "
+        "computing dynamic shared memory\n",
+        blockX, blockY, blockK);
+    std::abort();
+  }
+
+  // The f64 blocked fallback materialises/reduces an M x N x K product-like
+  // tensor and Triton lowering uses dynamic shared memory for parts of the
+  // lowering. This is a conservative estimate; the optional environment
+  // override below can be used to tune/debug.
+  std::size_t aElems = fnaccCheckedMul(static_cast<std::size_t>(blockX),
+      static_cast<std::size_t>(blockK), "f64 matmul shared A tile elements");
+
+  std::size_t bElems = fnaccCheckedMul(static_cast<std::size_t>(blockK),
+      static_cast<std::size_t>(blockY), "f64 matmul shared B tile elements");
+
+  std::size_t prodElems =
+      fnaccCheckedMul(fnaccCheckedMul(static_cast<std::size_t>(blockX),
+                          static_cast<std::size_t>(blockY),
+                          "f64 matmul shared product M*N elements"),
+          static_cast<std::size_t>(blockK),
+          "f64 matmul shared product M*N*K elements");
+
+  std::size_t accElems = fnaccCheckedMul(static_cast<std::size_t>(blockX),
+      static_cast<std::size_t>(blockY), "f64 matmul shared accumulator elems");
+
+  std::size_t elems = aElems + bElems + prodElems + accElems;
+
+  std::size_t bytes =
+      fnaccCheckedMul(elems, sizeof(double), "f64 matmul dynamic shared bytes");
+
+  // Align to 256 bytes.
+  bytes = (bytes + 255) & ~static_cast<std::size_t>(255);
+
+  // Triton-generated kernels often assume a non-trivial shared-memory arena.
+  // Keep a conservative minimum.
+  if (bytes < 16384)
+    bytes = 16384;
+
+  if (bytes > static_cast<std::size_t>(std::numeric_limits<unsigned>::max())) {
+    std::fprintf(stderr,
+        "FNACC error: f64 matmul dynamic shared memory requirement too large: "
+        "%zu bytes\n",
+        bytes);
+    std::abort();
+  }
+
+  unsigned requiredBytes = static_cast<unsigned>(bytes);
+
+  // Debug/tuning override. Do not allow values below the computed minimum.
+  if (const char *value = std::getenv("FNACC_MATMUL_F64_SHARED_BYTES")) {
+    if (value[0] != '\0') {
+      unsigned requested = fnaccGetEnvUnsignedAllowZero(
+          "FNACC_MATMUL_F64_SHARED_BYTES", requiredBytes);
+
+      if (requested < requiredBytes) {
+        std::fprintf(stderr,
+            "FNACC error: FNACC_MATMUL_F64_SHARED_BYTES=%u is smaller than "
+            "the computed required minimum %u bytes for tile=(%d,%d,%d). "
+            "Refusing to launch because this can cause illegal GPU memory "
+            "accesses.\n",
+            requested, requiredBytes, blockX, blockY, blockK);
+        std::abort();
+      }
+
+      return requested;
+    }
+  }
+
+  return requiredBytes;
+}
+
 static void fnaccEnsureInitialized() {
   if (fnaccRegistry.initialized)
     return;
@@ -827,8 +968,6 @@ static void fnaccEnsureInitialized() {
     std::fprintf(
         stderr, "FNACC: runtime build id: %s\n", FNACC_RUNTIME_BUILD_ID);
   }
-
-  std::string ptx = fnaccGetPtxText();
 
   FNACC_CUDA_CHECK(cuInit(0));
 
@@ -843,9 +982,6 @@ static void fnaccEnsureInitialized() {
       cuDevicePrimaryCtxRetain(&fnaccRegistry.context, fnaccRegistry.device));
 
   FNACC_CUDA_CHECK(cuCtxSetCurrent(fnaccRegistry.context));
-
-  FNACC_CUDA_CHECK(cuModuleLoadDataEx(
-      &fnaccRegistry.module, ptx.c_str(), 0, nullptr, nullptr));
 
   std::string json = fnaccGetJsonText();
 
@@ -866,6 +1002,30 @@ static void fnaccEnsureInitialized() {
 
   fnaccRegistry.kernels = fnaccParseKernelDescsFromJson(json);
 
+  std::vector<std::string> ptxTexts = fnaccGetPtxTexts(fnaccRegistry.kernels);
+
+  if (ptxTexts.empty()) {
+    std::fprintf(stderr, "FNACC error: no PTX modules were available\n");
+    std::abort();
+  }
+
+  fnaccRegistry.modules.resize(ptxTexts.size(), nullptr);
+
+  for (std::size_t i = 0; i < ptxTexts.size(); ++i) {
+    if (ptxTexts[i].empty()) {
+      std::fprintf(
+          stderr, "FNACC error: PTX bundle entry %zu is empty or missing\n", i);
+      std::abort();
+    }
+
+    FNACC_CUDA_CHECK(cuModuleLoadDataEx(
+        &fnaccRegistry.modules[i], ptxTexts[i].c_str(), 0, nullptr, nullptr));
+
+    if (fnaccDebugEnabled()) {
+      std::fprintf(stderr, "FNACC: loaded CUDA module %zu\n", i);
+    }
+  }
+
   if (fnaccDebugEnabled()) {
     for (const auto &entry : fnaccRegistry.kernels) {
       const FNACCKernelDesc &desc = entry.second;
@@ -874,15 +1034,12 @@ static void fnaccEnsureInitialized() {
           "FNACC: registered kernel id %d -> '%s' "
           "kind=%s rank=%d tile=(%d,%d,%d) "
           "warps=%d threads_per_warp=%d "
-          "cuda_threads_per_cta=%d hidden_ptr_args=%d\n",
+          "cuda_threads_per_cta=%d hidden_ptr_args=%d "
+          "ptx_index=%d ptx_file=%s\n",
           desc.id, desc.name.c_str(), desc.kind.c_str(), desc.rank, desc.tileX,
           desc.tileY, desc.tileZ, desc.numWarps, desc.threadsPerWarp,
-          desc.cudaThreadsPerCTA, desc.tritonHiddenPtrArgs);
-      for (const FNACCPackEntry &entry : desc.pack) {
-        std::fprintf(stderr, "FNACC:   pack slot %d -> %s\n",
-            entry.kernelArgSlot,
-            entry.target == FNACC_PACK_TARGET_DEVICE ? "device" : "host");
-      }
+          desc.cudaThreadsPerCTA, desc.tritonHiddenPtrArgs, desc.ptxIndex,
+          desc.ptxFile.c_str());
     }
   }
 
@@ -1190,9 +1347,24 @@ static CUfunction getKernelFunction(int32_t kernelId) {
         kernelId, kernelName.c_str());
   }
 
+  const FNACCKernelDesc *desc = fnaccLookupKernelDesc(kernelId);
+
+  std::size_t moduleIndex = 0;
+  if (desc)
+    moduleIndex = static_cast<std::size_t>(desc->ptxIndex);
+
+  if (moduleIndex >= fnaccRegistry.modules.size() ||
+      !fnaccRegistry.modules[moduleIndex]) {
+    std::fprintf(stderr,
+        "FNACC error: kernel id %d requests PTX module index %zu, "
+        "but only %zu module(s) are loaded\n",
+        kernelId, moduleIndex, fnaccRegistry.modules.size());
+    std::abort();
+  }
+
   CUfunction fn = nullptr;
-  FNACC_CUDA_CHECK(
-      cuModuleGetFunction(&fn, fnaccRegistry.module, kernelName.c_str()));
+  FNACC_CUDA_CHECK(cuModuleGetFunction(
+      &fn, fnaccRegistry.modules[moduleIndex], kernelName.c_str()));
 
   fnaccRegistry.functionCache[kernelId] = fn;
   return fn;
@@ -2780,9 +2952,8 @@ extern "C" void __fnacc_launch_matmul_f64_v1(int32_t kernelId, int32_t blockX,
       &hidden.hidden1,
   };
 
-  // The f64 fallback TTIR path does not use Triton dot or dynamic shared
-  // memory.
-  unsigned dynamicSharedBytes = 0;
+  unsigned dynamicSharedBytes =
+      fnaccMatmulF64DynamicSharedBytes(desc, blockX, blockY, blockK);
 
   if (fnaccDebugEnabled()) {
     std::fprintf(stderr,
@@ -2811,6 +2982,7 @@ extern "C" void __fnacc_launch_matmul_f64_v1(int32_t kernelId, int32_t blockX,
   }
 
   fnaccValidateCudaBlockSize(fn, kernelId, cudaBlockX);
+  fnaccConfigureDynamicSharedMemory(fn, kernelId, dynamicSharedBytes);
 
   FNACC_CUDA_CHECK(cuLaunchKernel(fn, gridX, gridY, gridZ, cudaBlockX, 1, 1,
       dynamicSharedBytes, nullptr, args, nullptr));
@@ -2915,11 +3087,11 @@ extern "C" void __fnacc_launch_reduce_f32_v1(int32_t kernelId, int32_t blockX,
   std::vector<float> partials(gridX);
   FNACC_CUDA_CHECK(cuMemcpyDtoH(partials.data(), dPartials, partialBytes));
 
-  float sum = 0.0f;
+  double sum = 0.0;
   for (float v : partials)
-    sum += v;
+    sum += static_cast<double>(v);
 
-  *result = sum;
+  *result = static_cast<float>(sum);
 
   FNACC_CUDA_CHECK(cuMemFree(dPartials));
 
@@ -3135,10 +3307,29 @@ extern "C" void __fnacc_release_all() {
   fnaccRegistry.deviceCache.clear();
 }
 
+extern "C" void __fnacc_register_embedded_kernel_bundle(
+    const char *const *ptxData, std::size_t const *ptxSizes,
+    std::size_t ptxCount, const char *jsonData, std::size_t jsonSize) {
+  fnaccEmbeddedPtxData.clear();
+  fnaccEmbeddedPtxSize.clear();
+
+  for (std::size_t i = 0; i < ptxCount; ++i) {
+    fnaccEmbeddedPtxData.push_back(ptxData[i]);
+    fnaccEmbeddedPtxSize.push_back(ptxSizes[i]);
+  }
+
+  fnaccEmbeddedJsonData = jsonData;
+  fnaccEmbeddedJsonSize = jsonSize;
+}
+
 extern "C" void __fnacc_register_embedded_kernels(const char *ptxData,
     std::size_t ptxSize, const char *jsonData, std::size_t jsonSize) {
-  fnaccEmbeddedPtxData = ptxData;
-  fnaccEmbeddedPtxSize = ptxSize;
+  fnaccEmbeddedPtxData.clear();
+  fnaccEmbeddedPtxSize.clear();
+
+  fnaccEmbeddedPtxData.push_back(ptxData);
+  fnaccEmbeddedPtxSize.push_back(ptxSize);
+
   fnaccEmbeddedJsonData = jsonData;
   fnaccEmbeddedJsonSize = jsonSize;
 }

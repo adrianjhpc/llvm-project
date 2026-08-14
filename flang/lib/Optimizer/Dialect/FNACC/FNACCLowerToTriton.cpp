@@ -85,6 +85,42 @@ static std::string getKernelName(fir::fnacc::LaunchOp launchOp,
   return "fnacc_kernel_" + std::to_string(fallbackId);
 }
 
+static int32_t getKernelNumWarps(const fir::fnacc::ElementwiseKernel &k,
+                                 int32_t requestedNumWarps) {
+  using Kind = fir::fnacc::ElementwiseKernelKind;
+  using Elem = fir::fnacc::ElementType;
+
+  // f64 scalar elementwise kernels such as:
+  //
+  //   c(i) = alpha * a(i) + b(i)
+  //   c(i) = alpha * a(i) + beta * b(i)
+  //
+  // are more compute-heavy than plain vector add. Let them use the requested
+  // number of warps.
+  bool isF64ScalarElementwise =
+      k.elementType == Elem::F64 && !k.scalarRefs.empty() &&
+      (k.kind == Kind::Saxpy1D || k.kind == Kind::Expr1D ||
+       k.kind == Kind::Expr2D);
+
+  if (isF64ScalarElementwise)
+    return requestedNumWarps;
+
+  switch (k.kind) {
+  case Kind::BinaryArrayArray:
+  case Kind::Saxpy1D:
+  case Kind::Expr1D:
+  case Kind::Expr2D:
+  case Kind::ReductionSum1D:
+  case Kind::ReductionDot1D:
+    return 1;
+
+  case Kind::MatMul2D:
+    return requestedNumWarps;
+  }
+
+  llvm_unreachable("unknown FNACC kernel kind");
+}
+
 static StringRef ttArith(Operation *op) {
   if (isa<arith::AddFOp>(op))
     return "arith.addf";
@@ -204,15 +240,19 @@ static void emitTritonSaxpy1D(const fir::fnacc::ElementwiseKernel &k,
 
   os << "  %alpha_s = tt.splat %alpha : " << elemTy << " -> tensor<" << block
      << "x" << elemTy << ">\n";
-  os << "  %tmp = arith.mulf %alpha_s, %av : tensor<" << block << "x" << elemTy
-     << ">\n";
-  os << "  %r = arith.addf %tmp, %bv : tensor<" << block << "x" << elemTy
+
+  os << "  %r = math.fma %alpha_s, %av, %bv : tensor<" << block << "x" << elemTy
      << ">\n";
 
   emitStore1D("%c", "%r", block, k.elementType, os);
 
   os << "  tt.return\n";
   os << "}\n\n";
+}
+
+static bool isBinaryMulExpr(const fir::fnacc::ElementwiseExpr &expr) {
+  return expr.kind == fir::fnacc::ElementwiseExprKind::MulF &&
+         expr.operands.size() == 2;
 }
 
 struct ExprTritonEmitterState {
@@ -287,13 +327,77 @@ static std::string emitExprVector(const fir::fnacc::ElementwiseKernel &k,
   case fir::fnacc::ElementwiseExprKind::DivF: {
     assert(expr.operands.size() == 2 && "binary expression expected");
 
+    // Recognise:
+    //
+    //   (x * y) + z
+    //   z + (x * y)
+    //
+    // Emit explicit FMA:
+    //
+    //   math.fma x, y, z
+    //
+    // For AXPBY:
+    //
+    //   alpha*a + beta*b
+    //
+    // this emits:
+    //
+    //   tmp = beta*b
+    //   r   = fma(alpha, a, tmp)
+    //
+    // rather than:
+    //
+    //   tmp0 = alpha*a
+    //   tmp1 = beta*b
+    //   r    = tmp0 + tmp1
+    if (expr.kind == fir::fnacc::ElementwiseExprKind::AddF) {
+      const auto &lhsExpr = *expr.operands[0];
+      const auto &rhsExpr = *expr.operands[1];
+
+      if (isBinaryMulExpr(lhsExpr)) {
+        std::string a = emitExprVector(k, *lhsExpr.operands[0], state, os);
+        std::string b = emitExprVector(k, *lhsExpr.operands[1], state, os);
+        std::string c = emitExprVector(k, rhsExpr, state, os);
+
+        std::string result = "%expr" + std::to_string(state.nextTmp++);
+
+        os << "  " << result << " = math.fma " << a << ", " << b << ", " << c
+           << " : tensor<" << block << "x" << elemTy << ">\n";
+
+        return result;
+      }
+
+      if (isBinaryMulExpr(rhsExpr)) {
+        std::string a = emitExprVector(k, *rhsExpr.operands[0], state, os);
+        std::string b = emitExprVector(k, *rhsExpr.operands[1], state, os);
+        std::string c = emitExprVector(k, lhsExpr, state, os);
+
+        std::string result = "%expr" + std::to_string(state.nextTmp++);
+
+        os << "  " << result << " = math.fma " << a << ", " << b << ", " << c
+           << " : tensor<" << block << "x" << elemTy << ">\n";
+
+        return result;
+      }
+    }
+
     std::string lhs = emitExprVector(k, *expr.operands[0], state, os);
     std::string rhs = emitExprVector(k, *expr.operands[1], state, os);
 
     std::string result = "%expr" + std::to_string(state.nextTmp++);
 
-    os << "  " << result << " = " << ttArithForExprKind(expr.kind) << " " << lhs
-       << ", " << rhs << " : tensor<" << block << "x" << elemTy << ">\n";
+    StringRef opName = ttArithForExprKind(expr.kind);
+
+    bool canContract = expr.kind == fir::fnacc::ElementwiseExprKind::AddF ||
+                       expr.kind == fir::fnacc::ElementwiseExprKind::SubF ||
+                       expr.kind == fir::fnacc::ElementwiseExprKind::MulF;
+
+    os << "  " << result << " = " << opName << " " << lhs << ", " << rhs;
+
+    if (canContract)
+      os << " fastmath<contract>";
+
+    os << " : tensor<" << block << "x" << elemTy << ">\n";
 
     return result;
   }
@@ -789,20 +893,6 @@ static void emitTritonMatMul2DF64(const fir::fnacc::ElementwiseKernel &k,
                                   int64_t blockM, int64_t blockN,
                                   int64_t blockK, StringRef kernelName,
                                   llvm::raw_ostream &os) {
-  // f64 matmul fallback:
-  //
-  //   C(i,j) = sum_p A(i,p) * B(p,j)
-  //
-  // This intentionally does not use tt.dot. Many Triton versions do not support
-  // f64 dot in the same way as f32/f16/bf16/tf32 matmul. Instead, each program
-  // computes a BLOCK_M x BLOCK_N C tile and loops over K one scalar position at
-  // a time, broadcasting A(:,k) and B(k,:) to a tile.
-  //
-  // This is slower than the f32 tt.dot path, but it is correct and keeps the
-  // ABI identical:
-  //
-  //   (%a, %b, %c, %n, %m, %k)
-
   assert(k.elementType == fir::fnacc::ElementType::F64 &&
          "f64 matmul emitter requires f64 kernel");
 
@@ -818,13 +908,13 @@ static void emitTritonMatMul2DF64(const fir::fnacc::ElementwiseKernel &k,
 
   os << "  %bm = arith.constant " << blockM << " : i32\n";
   os << "  %bn = arith.constant " << blockN << " : i32\n";
+  os << "  %bk = arith.constant " << blockK << " : i32\n";
 
   os << "  %base_m = arith.muli %pid_m, %bm : i32\n";
   os << "  %base_n = arith.muli %pid_n, %bn : i32\n";
 
   os << "  %offs_m0 = tt.make_range {start = 0 : i32, end = " << blockM
      << " : i32} : tensor<" << blockM << "xi32>\n";
-
   os << "  %offs_n0 = tt.make_range {start = 0 : i32, end = " << blockN
      << " : i32} : tensor<" << blockN << "xi32>\n";
 
@@ -846,76 +936,126 @@ static void emitTritonMatMul2DF64(const fir::fnacc::ElementwiseKernel &k,
   os << "  %mask_n = arith.cmpi slt, %offs_n, %m_s_n : tensor<" << blockN
      << "xi32>\n";
 
-  os << "  %zero = arith.constant 0.000000e+00 : " << elemTy << "\n";
-
-  os << "  %acc0 = tt.splat %zero : " << elemTy << " -> tensor<" << blockM
-     << "x" << blockN << "x" << elemTy << ">\n";
+  os << "  %zero = arith.constant 0.000000e+00 : f64\n";
+  os << "  %acc0 = tt.splat %zero : f64 -> tensor<" << blockM << "x"
+     << blockN << "xf64>\n";
 
   os << "  %c0_idx = arith.constant 0 : index\n";
-  os << "  %c1_idx = arith.constant 1 : index\n";
+  os << "  %bk_idx = arith.constant " << blockK << " : index\n";
   os << "  %k_idx = arith.index_cast %k : i32 to index\n";
 
-  os << "  %acc = scf.for %kk_idx = %c0_idx to %k_idx step %c1_idx "
+  os << "  %acc = scf.for %kk_idx = %c0_idx to %k_idx step %bk_idx "
         "iter_args(%acc_body = %acc0) -> (tensor<"
-     << blockM << "x" << blockN << "x" << elemTy << ">) {\n";
+     << blockM << "x" << blockN << "xf64>) {\n";
 
-  os << "    %kk = arith.index_cast %kk_idx : index to i32\n";
+  os << "    %kk_base = arith.index_cast %kk_idx : index to i32\n";
 
-  // A(i, kk) offset = i + kk * n
-  os << "    %kk_m = tt.splat %kk : i32 -> tensor<" << blockM << "xi32>\n";
-  os << "    %n_s_m_body = tt.splat %n : i32 -> tensor<" << blockM << "xi32>\n";
-  os << "    %a_col = arith.muli %kk_m, %n_s_m_body : tensor<" << blockM
-     << "xi32>\n";
-  os << "    %a_offsets = arith.addi %offs_m, %a_col : tensor<" << blockM
-     << "xi32>\n";
+  // Start each K-block accumulation from the incoming accumulator.
+  std::string accPrev = "%acc_body";
 
-  // B(kk, j) offset = kk + j * k
-  os << "    %kk_n = tt.splat %kk : i32 -> tensor<" << blockN << "xi32>\n";
-  os << "    %k_s_n_body = tt.splat %k : i32 -> tensor<" << blockN << "xi32>\n";
-  os << "    %b_col = arith.muli %offs_n, %k_s_n_body : tensor<" << blockN
-     << "xi32>\n";
-  os << "    %b_offsets = arith.addi %kk_n, %b_col : tensor<" << blockN
-     << "xi32>\n";
+  for (int64_t q = 0; q < blockK; ++q) {
+    std::string suffix = std::to_string(q);
 
-  os << "    %a_base = tt.splat %a : " << ptrTy << " -> tensor<" << blockM
-     << "x" << ptrTy << ">\n";
-  os << "    %b_base = tt.splat %b : " << ptrTy << " -> tensor<" << blockN
-     << "x" << ptrTy << ">\n";
+    os << "    %q" << suffix << " = arith.constant " << q << " : i32\n";
+    os << "    %kk" << suffix << " = arith.addi %kk_base, %q" << suffix
+       << " : i32\n";
 
-  os << "    %a_ptrs = tt.addptr %a_base, %a_offsets : tensor<" << blockM << "x"
-     << ptrTy << ">, tensor<" << blockM << "xi32>\n";
-  os << "    %b_ptrs = tt.addptr %b_base, %b_offsets : tensor<" << blockN << "x"
-     << ptrTy << ">, tensor<" << blockN << "xi32>\n";
+    // Scalar K mask for this unrolled K lane:
+    //
+    //   kk + q < k
+    os << "    %mask_k_scalar" << suffix
+       << " = arith.cmpi slt, %kk" << suffix << ", %k : i32\n";
 
-  os << "    %a_vec = tt.load %a_ptrs, %mask_m : tensor<" << blockM << "x"
-     << ptrTy << ">\n";
-  os << "    %b_vec = tt.load %b_ptrs, %mask_n : tensor<" << blockN << "x"
-     << ptrTy << ">\n";
+    os << "    %mask_k_m" << suffix << " = tt.splat %mask_k_scalar" << suffix
+       << " : i1 -> tensor<" << blockM << "xi1>\n";
+    os << "    %mask_k_n" << suffix << " = tt.splat %mask_k_scalar" << suffix
+       << " : i1 -> tensor<" << blockN << "xi1>\n";
 
-  os << "    %a_e = tt.expand_dims %a_vec {axis = 1 : i32} : tensor<" << blockM
-     << "x" << elemTy << "> -> tensor<" << blockM << "x1x" << elemTy << ">\n";
+    os << "    %mask_a" << suffix << " = arith.andi %mask_m, %mask_k_m"
+       << suffix << " : tensor<" << blockM << "xi1>\n";
+    os << "    %mask_b" << suffix << " = arith.andi %mask_n, %mask_k_n"
+       << suffix << " : tensor<" << blockN << "xi1>\n";
 
-  os << "    %b_e = tt.expand_dims %b_vec {axis = 0 : i32} : tensor<" << blockN
-     << "x" << elemTy << "> -> tensor<1x" << blockN << "x" << elemTy << ">\n";
+    // A(i, kk+q), column-major offset:
+    //
+    //   i + (kk+q) * n
+    os << "    %kk_m" << suffix << " = tt.splat %kk" << suffix
+       << " : i32 -> tensor<" << blockM << "xi32>\n";
+    os << "    %n_s_m_body" << suffix << " = tt.splat %n : i32 -> tensor<"
+       << blockM << "xi32>\n";
+    os << "    %a_col" << suffix << " = arith.muli %kk_m" << suffix
+       << ", %n_s_m_body" << suffix << " : tensor<" << blockM << "xi32>\n";
+    os << "    %a_offsets" << suffix << " = arith.addi %offs_m, %a_col"
+       << suffix << " : tensor<" << blockM << "xi32>\n";
 
-  os << "    %a_b = tt.broadcast %a_e : tensor<" << blockM << "x1x" << elemTy
-     << "> -> tensor<" << blockM << "x" << blockN << "x" << elemTy << ">\n";
+    // B(kk+q, j), column-major offset:
+    //
+    //   (kk+q) + j * k
+    os << "    %kk_n" << suffix << " = tt.splat %kk" << suffix
+       << " : i32 -> tensor<" << blockN << "xi32>\n";
+    os << "    %k_s_n_body" << suffix << " = tt.splat %k : i32 -> tensor<"
+       << blockN << "xi32>\n";
+    os << "    %b_col" << suffix << " = arith.muli %offs_n, %k_s_n_body"
+       << suffix << " : tensor<" << blockN << "xi32>\n";
+    os << "    %b_offsets" << suffix << " = arith.addi %kk_n" << suffix
+       << ", %b_col" << suffix << " : tensor<" << blockN << "xi32>\n";
 
-  os << "    %b_b = tt.broadcast %b_e : tensor<1x" << blockN << "x" << elemTy
-     << "> -> tensor<" << blockM << "x" << blockN << "x" << elemTy << ">\n";
+    os << "    %a_base" << suffix << " = tt.splat %a : " << ptrTy
+       << " -> tensor<" << blockM << "x" << ptrTy << ">\n";
+    os << "    %b_base" << suffix << " = tt.splat %b : " << ptrTy
+       << " -> tensor<" << blockN << "x" << ptrTy << ">\n";
 
-  os << "    %prod = arith.mulf %a_b, %b_b : tensor<" << blockM << "x" << blockN
-     << "x" << elemTy << ">\n";
+    os << "    %a_ptrs" << suffix << " = tt.addptr %a_base" << suffix
+       << ", %a_offsets" << suffix << " : tensor<" << blockM << "x" << ptrTy
+       << ">, tensor<" << blockM << "xi32>\n";
+    os << "    %b_ptrs" << suffix << " = tt.addptr %b_base" << suffix
+       << ", %b_offsets" << suffix << " : tensor<" << blockN << "x" << ptrTy
+       << ">, tensor<" << blockN << "xi32>\n";
 
-  os << "    %acc_next = arith.addf %acc_body, %prod : tensor<" << blockM << "x"
-     << blockN << "x" << elemTy << ">\n";
+    os << "    %a_vec" << suffix << " = tt.load %a_ptrs" << suffix
+       << ", %mask_a" << suffix << " : tensor<" << blockM << "x" << ptrTy
+       << ">\n";
+    os << "    %b_vec" << suffix << " = tt.load %b_ptrs" << suffix
+       << ", %mask_b" << suffix << " : tensor<" << blockN << "x" << ptrTy
+       << ">\n";
 
-  os << "    scf.yield %acc_next : tensor<" << blockM << "x" << blockN << "x"
-     << elemTy << ">\n";
+    // Broadcast A(:, kk+q) and B(kk+q, :) to an M x N tile.
+    os << "    %a_e" << suffix << " = tt.expand_dims %a_vec" << suffix
+       << " {axis = 1 : i32} : tensor<" << blockM
+       << "xf64> -> tensor<" << blockM << "x1xf64>\n";
+    os << "    %b_e" << suffix << " = tt.expand_dims %b_vec" << suffix
+       << " {axis = 0 : i32} : tensor<" << blockN
+       << "xf64> -> tensor<1x" << blockN << "xf64>\n";
+
+    os << "    %a_b" << suffix << " = tt.broadcast %a_e" << suffix
+       << " : tensor<" << blockM << "x1xf64> -> tensor<" << blockM << "x"
+       << blockN << "xf64>\n";
+    os << "    %b_b" << suffix << " = tt.broadcast %b_e" << suffix
+       << " : tensor<1x" << blockN << "xf64> -> tensor<" << blockM << "x"
+       << blockN << "xf64>\n";
+
+    std::string accNext = "%acc_fma" + suffix;
+
+    // Explicit f64 FMA:
+    //
+    //   acc = A(:, kk+q) * B(kk+q, :) + acc
+    //
+    // This avoids materialising tensor<MxNxKxf64> and avoids tt.reduce.
+    os << "    " << accNext << " = math.fma %a_b" << suffix << ", %b_b"
+       << suffix << ", " << accPrev << " : tensor<" << blockM << "x"
+       << blockN << "xf64>\n";
+
+    accPrev = accNext;
+  }
+
+  os << "    scf.yield " << accPrev << " : tensor<" << blockM << "x"
+     << blockN << "xf64>\n";
 
   os << "  }\n";
 
-  // Store C(i,j), offset = i + j * n
+  // Store C(i,j), column-major offset:
+  //
+  //   i + j * n
   os << "  %offs_m_e_c = tt.expand_dims %offs_m {axis = 1 : i32} : tensor<"
      << blockM << "xi32> -> tensor<" << blockM << "x1xi32>\n";
 
@@ -959,8 +1099,8 @@ static void emitTritonMatMul2DF64(const fir::fnacc::ElementwiseKernel &k,
      << blockN << "x" << ptrTy << ">, tensor<" << blockM << "x" << blockN
      << "xi32>\n";
 
-  os << "  tt.store %c_ptrs, %acc, %mask_c : tensor<" << blockM << "x" << blockN
-     << "x" << ptrTy << ">\n";
+  os << "  tt.store %c_ptrs, %acc, %mask_c : tensor<" << blockM << "x"
+     << blockN << "x" << ptrTy << ">\n";
 
   os << "  tt.return\n";
   os << "}\n\n";
@@ -1004,9 +1144,10 @@ static bool isReductionMetadataPackSlot(fir::fnacc::LaunchOp launchOp,
 static void emitJsonDescriptor(
     fir::fnacc::LaunchOp launchOp, const fir::fnacc::ElementwiseKernel &k,
     int64_t blockX, int64_t blockY, int64_t blockZ, int32_t kernelId,
-    llvm::StringRef kernelName, int32_t tritonNumWarps,
+    int32_t ptxIndex, llvm::StringRef kernelName, int32_t tritonNumWarps,
     int32_t tritonThreadsPerWarp, int32_t tritonNumStages,
     int32_t cudaThreadsPerCTA, llvm::raw_ostream &os, bool &firstKernel) {
+
   if (!firstKernel)
     os << ",\n";
   firstKernel = false;
@@ -1031,6 +1172,8 @@ static void emitJsonDescriptor(
   os << "    {\n";
   os << "      \"id\": " << kernelId << ",\n";
   os << "      \"name\": \"" << kernelName << "\",\n";
+  os << "      \"ptx_index\": " << ptxIndex << ",\n";
+  os << "      \"ptx_file\": \"" << kernelName << ".ptx\",\n";
   os << "      \"kind\": \"" << kindName << "\",\n";
   os << "      \"rank\": " << k.rank << ",\n";
   os << "      \"tile\": [" << blockX << ", " << blockY << ", " << blockZ
@@ -1257,40 +1400,16 @@ struct FNACCLowerToTritonPass
       }
     });
 
-    bool hasSingleWarpOnlyKernel =
-        hasSimpleElementwiseLaunch || hasReductionLaunch;
-
-    if (hasSingleWarpOnlyKernel && tritonNumWarps != 1) {
-      if (hasMatmulLaunch) {
-        module.emitWarning()
-            << "FNACC module contains simple elementwise/reduction kernels and "
-               "matmul kernels. TTIR currently has one module-wide num-warps "
-               "setting, so simple elementwise/reduction lowering forces "
-               "num-warps=1 for the whole module. Consider compiling matmul "
-               "kernels separately.";
-      } else if (hasReductionLaunch && !hasSimpleElementwiseLaunch) {
-        module.emitWarning()
-            << "FNACC reduction kernels currently use the conservative "
-               "single-warp Triton lowering path; using num-warps=1 instead "
-               "of requested "
-            << tritonNumWarps;
-      } else if (hasReductionLaunch) {
-        module.emitWarning()
-            << "FNACC simple elementwise/reduction kernels currently use the "
-               "single-warp Triton lowering path; using num-warps=1 instead "
-               "of requested "
-            << tritonNumWarps;
-      } else {
-        module.emitWarning()
-            << "FNACC simple elementwise kernels currently use the single-warp "
-               "Triton lowering path; using num-warps=1 instead of requested "
-            << tritonNumWarps;
-      }
-
-      tritonNumWarps = 1;
+    if ((hasSimpleElementwiseLaunch || hasReductionLaunch) && hasMatmulLaunch &&
+        tritonNumWarps != 1) {
+      module.emitWarning()
+          << "FNACC module contains both simple elementwise/reduction kernels "
+             "and "
+             "matmul kernels. Per-kernel TTIR splitting is required for true "
+             "per-kernel num-warps. The FNACC wrapper should compile each "
+             "emitted "
+             "kernel separately.";
     }
-
-    int32_t cudaThreadsPerCTA = tritonNumWarps * tritonThreadsPerWarp;
 
     std::string ttirPath = this->ttirOutput;
     std::string jsonPath = this->jsonOutput;
@@ -1326,6 +1445,8 @@ struct FNACCLowerToTritonPass
     int32_t fallbackId = 0;
     bool failed = false;
 
+    int32_t emittedPtxIndex = 0;
+
     module.walk([&](fir::fnacc::LaunchOp launchOp) {
       if (failed)
         return;
@@ -1354,7 +1475,10 @@ struct FNACCLowerToTritonPass
         blockY = tiles.size() >= 2 ? tiles[1] : 16;
 
         if (k.kind == fir::fnacc::ElementwiseKernelKind::MatMul2D) {
-          blockZ = tiles.size() >= 3 ? tiles[2] : 32;
+          blockZ =
+              tiles.size() >= 3
+                  ? tiles[2]
+                  : (k.elementType == fir::fnacc::ElementType::F64 ? 8 : 32);
 
           if (k.elementType == fir::fnacc::ElementType::F64) {
             emitTritonMatMul2DF64(k, blockX, blockY, blockZ, kernelName,
@@ -1390,11 +1514,15 @@ struct FNACCLowerToTritonPass
         }
       }
 
-      emitJsonDescriptor(launchOp, k, blockX, blockY, blockZ, kernelId,
-                         kernelName, tritonNumWarps, tritonThreadsPerWarp,
-                         tritonNumStages, cudaThreadsPerCTA, jsonOs,
-                         firstKernel);
+      int32_t kernelNumWarps = getKernelNumWarps(k, tritonNumWarps);
+      int32_t kernelCudaThreadsPerCTA = kernelNumWarps * tritonThreadsPerWarp;
 
+      emitJsonDescriptor(launchOp, k, blockX, blockY, blockZ, kernelId,
+                         emittedPtxIndex, kernelName, kernelNumWarps,
+                         tritonThreadsPerWarp, tritonNumStages,
+                         kernelCudaThreadsPerCTA, jsonOs, firstKernel);
+
+      ++emittedPtxIndex;
       ++fallbackId;
     });
 

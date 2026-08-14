@@ -56,7 +56,11 @@ static BlockShape getBlockShape(fir::fnacc::LaunchOp launchOp,
     shape.rank = 2;
     shape.x = tiles.size() >= 1 ? static_cast<int32_t>(tiles[0]) : 16;
     shape.y = tiles.size() >= 2 ? static_cast<int32_t>(tiles[1]) : 16;
-    shape.z = tiles.size() >= 3 ? static_cast<int32_t>(tiles[2]) : 32;
+
+    shape.z = tiles.size() >= 3
+                  ? static_cast<int32_t>(tiles[2])
+                  : (k.elementType == fir::fnacc::ElementType::F64 ? 8 : 32);
+
     return shape;
   }
 
