@@ -10,7 +10,17 @@ module {
 
     return
   }
+
+  func.func @bad_pack_duplicate(
+      %a: !fir.ref<!fir.array<?xf32>>) {
+    fnacc.launch tile_sizes = [128] pack(%a, %a : !fir.ref<!fir.array<?xf32>>, !fir.ref<!fir.array<?xf32>>) {
+      "fir.end"() : () -> ()
+    } attributes {pack_targets = array<i32: 1, 1>}
+
+    return
+  }
 }
 
 // CHECK: expected pack_targets to have exactly one entry per pack var
+// CHECK: the same variable appears more than once in PACK/REDUCTION
 

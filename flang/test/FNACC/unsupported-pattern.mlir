@@ -1,4 +1,4 @@
-// RUN: fir-opt \
+// RUN: not fir-opt \
 // RUN:   --fnacc-assign-kernel-ids \
 // RUN:   --fnacc-lower-to-runtime \
 // RUN:   %s -o /dev/null 2>&1 | FileCheck %s
@@ -58,6 +58,6 @@ module {
   }
 }
 
-// CHECK: warning: FNACC runtime lowering skipped launch:
+// CHECK: error: FNACC runtime cannot lower launch:
 // CHECK-SAME: unsupported number of read arrays
 

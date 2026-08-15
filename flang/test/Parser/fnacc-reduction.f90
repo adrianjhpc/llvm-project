@@ -1,4 +1,5 @@
 ! RUN: %flang_fc1 -fdebug-dump-parse-tree-no-sema %s 2>&1 | FileCheck %s
+! RUN: %flang_fc1 -fdebug-unparse %s 2>&1 | FileCheck %s --check-prefix=UNPARSE
 
 subroutine test_fnacc_reduction(n, a, b, sum)
   integer :: n
@@ -19,3 +20,4 @@ end subroutine
 ! CHECK: FnACCReductionOperator
 ! CHECK: Name = 'sum'
 
+! UNPARSE: !$FNACC PARALLEL TILE(256_4) REDUCTION(+:sum)

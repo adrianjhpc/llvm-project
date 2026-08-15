@@ -2890,6 +2890,24 @@ public:
     Put(":");
     Walk(std::get<1>(x.t));
   }
+  void Unparse(const FnACCReductionOperator &x) {
+    switch (x) {
+    case FnACCReductionOperator::Add:
+      Put("+");
+      break;
+    }
+  }
+  void Unparse(const FnACCReductionClause::Item &x) {
+    Walk(std::get<0>(x.t));
+    Put(":");
+    Walk(std::get<1>(x.t));
+  }
+  void Unparse(const FnACCReductionClause &x) {
+    Word("REDUCTION");
+    Put("(");
+    Walk(x.v, ", ");
+    Put(")");
+  }
   void Unparse(const FnACCUpdateHostDirective &x) {
     Word("UPDATE HOST");
     Put("(");

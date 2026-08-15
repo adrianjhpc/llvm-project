@@ -19,9 +19,11 @@ subroutine vector_add_assumed_shape(a, b, c)
 end subroutine
 
 ! HOST-DAG: func.func private @__fnacc_launch_f32_v1
+! HOST-DAG: func.func private @__fnacc_validate_contiguous_desc
 
 ! HOST-LABEL: func.func @_QPvector_add_assumed_shape
 ! HOST: fir.box_dims
+! HOST-COUNT-3: call @__fnacc_validate_contiguous_desc
 ! HOST: fir.box_addr
 ! HOST: call @__fnacc_launch_f32_v1
 ! HOST-NOT: fnacc.launch

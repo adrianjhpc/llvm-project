@@ -59,7 +59,10 @@ module {
 // TTIR-SAME: %alpha: f32
 // TTIR-SAME: %n: i32
 // TTIR: tt.splat %alpha : f32
-// TTIR: math.fma
+// TTIR: arith.mulf
+// TTIR: arith.addf
+// TTIR-NOT: math.fma
+// TTIR-NOT: fastmath
 
 // JSON: "id": 0
 // JSON: "name": "fnacc_kernel_0"

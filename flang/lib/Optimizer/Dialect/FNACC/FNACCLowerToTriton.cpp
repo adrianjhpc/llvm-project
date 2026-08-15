@@ -241,18 +241,15 @@ static void emitTritonSaxpy1D(const fir::fnacc::ElementwiseKernel &k,
   os << "  %alpha_s = tt.splat %alpha : " << elemTy << " -> tensor<" << block
      << "x" << elemTy << ">\n";
 
-  os << "  %r = math.fma %alpha_s, %av, %bv : tensor<" << block << "x" << elemTy
+  os << "  %scaled = arith.mulf %alpha_s, %av : tensor<" << block << "x"
+     << elemTy << ">\n";
+  os << "  %r = arith.addf %scaled, %bv : tensor<" << block << "x" << elemTy
      << ">\n";
 
   emitStore1D("%c", "%r", block, k.elementType, os);
 
   os << "  tt.return\n";
   os << "}\n\n";
-}
-
-static bool isBinaryMulExpr(const fir::fnacc::ElementwiseExpr &expr) {
-  return expr.kind == fir::fnacc::ElementwiseExprKind::MulF &&
-         expr.operands.size() == 2;
 }
 
 struct ExprTritonEmitterState {
@@ -327,60 +324,6 @@ static std::string emitExprVector(const fir::fnacc::ElementwiseKernel &k,
   case fir::fnacc::ElementwiseExprKind::DivF: {
     assert(expr.operands.size() == 2 && "binary expression expected");
 
-    // Recognise:
-    //
-    //   (x * y) + z
-    //   z + (x * y)
-    //
-    // Emit explicit FMA:
-    //
-    //   math.fma x, y, z
-    //
-    // For AXPBY:
-    //
-    //   alpha*a + beta*b
-    //
-    // this emits:
-    //
-    //   tmp = beta*b
-    //   r   = fma(alpha, a, tmp)
-    //
-    // rather than:
-    //
-    //   tmp0 = alpha*a
-    //   tmp1 = beta*b
-    //   r    = tmp0 + tmp1
-    if (expr.kind == fir::fnacc::ElementwiseExprKind::AddF) {
-      const auto &lhsExpr = *expr.operands[0];
-      const auto &rhsExpr = *expr.operands[1];
-
-      if (isBinaryMulExpr(lhsExpr)) {
-        std::string a = emitExprVector(k, *lhsExpr.operands[0], state, os);
-        std::string b = emitExprVector(k, *lhsExpr.operands[1], state, os);
-        std::string c = emitExprVector(k, rhsExpr, state, os);
-
-        std::string result = "%expr" + std::to_string(state.nextTmp++);
-
-        os << "  " << result << " = math.fma " << a << ", " << b << ", " << c
-           << " : tensor<" << block << "x" << elemTy << ">\n";
-
-        return result;
-      }
-
-      if (isBinaryMulExpr(rhsExpr)) {
-        std::string a = emitExprVector(k, *rhsExpr.operands[0], state, os);
-        std::string b = emitExprVector(k, *rhsExpr.operands[1], state, os);
-        std::string c = emitExprVector(k, lhsExpr, state, os);
-
-        std::string result = "%expr" + std::to_string(state.nextTmp++);
-
-        os << "  " << result << " = math.fma " << a << ", " << b << ", " << c
-           << " : tensor<" << block << "x" << elemTy << ">\n";
-
-        return result;
-      }
-    }
-
     std::string lhs = emitExprVector(k, *expr.operands[0], state, os);
     std::string rhs = emitExprVector(k, *expr.operands[1], state, os);
 
@@ -388,15 +331,7 @@ static std::string emitExprVector(const fir::fnacc::ElementwiseKernel &k,
 
     StringRef opName = ttArithForExprKind(expr.kind);
 
-    bool canContract = expr.kind == fir::fnacc::ElementwiseExprKind::AddF ||
-                       expr.kind == fir::fnacc::ElementwiseExprKind::SubF ||
-                       expr.kind == fir::fnacc::ElementwiseExprKind::MulF;
-
     os << "  " << result << " = " << opName << " " << lhs << ", " << rhs;
-
-    if (canContract)
-      os << " fastmath<contract>";
-
     os << " : tensor<" << block << "x" << elemTy << ">\n";
 
     return result;
@@ -891,7 +826,6 @@ static void emitTritonMatMul2DDot(const fir::fnacc::ElementwiseKernel &k,
   os << "  tt.return\n";
   os << "}\n\n";
 }
-
 
 static void emitTritonMatMul2DF32(const fir::fnacc::ElementwiseKernel &k,
                                   int64_t blockM, int64_t blockN,
@@ -1632,11 +1566,16 @@ struct FNACCLowerToTritonPass
     bool hasSimpleElementwiseLaunch = false;
     bool hasReductionLaunch = false;
     bool hasMatmulLaunch = false;
+    bool recognitionFailed = false;
 
     module.walk([&](fir::fnacc::LaunchOp launchOp) {
       auto result = fir::fnacc::recognizeElementwiseKernel(launchOp);
-      if (result.failed())
+      if (result.failed()) {
+        launchOp.emitError("FNACC Triton cannot emit launch: ")
+            << result.getFailure().reason;
+        recognitionFailed = true;
         return;
+      }
 
       const fir::fnacc::ElementwiseKernel &k = result.getKernel();
 
@@ -1658,6 +1597,11 @@ struct FNACCLowerToTritonPass
         break;
       }
     });
+
+    if (recognitionFailed) {
+      signalPassFailure();
+      return;
+    }
 
     if ((hasSimpleElementwiseLaunch || hasReductionLaunch) && hasMatmulLaunch &&
         tritonNumWarps != 1) {
@@ -1712,9 +1656,9 @@ struct FNACCLowerToTritonPass
 
       auto result = fir::fnacc::recognizeElementwiseKernel(launchOp);
       if (result.failed()) {
-        launchOp.emitWarning("FNACC Triton emission skipped launch: ")
+        launchOp.emitError("FNACC Triton recognition changed during emission: ")
             << result.getFailure().reason;
-        ++fallbackId;
+        failed = true;
         return;
       }
 
@@ -1819,7 +1763,9 @@ std::unique_ptr<mlir::Pass> fir::fnacc::createFNACCLowerToTritonPass() {
 
 std::unique_ptr<mlir::Pass> fir::fnacc::createFNACCLowerToTritonPass(
     llvm::StringRef ttirOutput, llvm::StringRef jsonOutput, int32_t numWarps,
-    int32_t threadsPerWarp, int32_t numStages, llvm::StringRef f64MatmulStrategy) {
-  return std::make_unique<FNACCLowerToTritonPass>(
-      ttirOutput, jsonOutput, numWarps, threadsPerWarp, numStages, f64MatmulStrategy);
+    int32_t threadsPerWarp, int32_t numStages,
+    llvm::StringRef f64MatmulStrategy) {
+  return std::make_unique<FNACCLowerToTritonPass>(ttirOutput, jsonOutput,
+                                                  numWarps, threadsPerWarp,
+                                                  numStages, f64MatmulStrategy);
 }

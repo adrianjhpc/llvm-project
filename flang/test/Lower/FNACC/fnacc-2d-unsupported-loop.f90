@@ -1,5 +1,5 @@
 ! RUN: %flang_fc1 -emit-fir %s -o %t.fir
-! RUN: fir-opt --fnacc-pipeline="ttir-output=%t.ttir json-output=%t.json" %t.fir -o /dev/null 2>&1 | FileCheck %s
+! RUN: not fir-opt --fnacc-pipeline="ttir-output=%t.ttir json-output=%t.json" %t.fir -o /dev/null 2>&1 | FileCheck %s
 
 subroutine bad_2d_step(n, m, a, b, c)
   integer :: n, m
@@ -27,9 +27,9 @@ subroutine bad_2d_lower_bound(n, m, a, b, c)
   end do
 end subroutine
 
-! CHECK: warning: FNACC
+! CHECK: error: FNACC Triton cannot emit launch:
 ! CHECK-SAME: loop step must be constant 1
 
-! CHECK: warning: FNACC
+! CHECK: error: FNACC Triton cannot emit launch:
 ! CHECK-SAME: loop lower bound must be constant 1
 

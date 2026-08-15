@@ -4,7 +4,7 @@ module {
   func.func @assign_ids() {
     fnacc.launch tile_sizes = [] {
       "fir.end"() : () -> ()
-    } attributes {pack_targets = array<i32>}
+    } attributes {fnacc.kernel_id = 0 : i32, pack_targets = array<i32>}
 
     fnacc.launch tile_sizes = [16, 16] {
       "fir.end"() : () -> ()

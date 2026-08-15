@@ -2145,6 +2145,28 @@ public:
     messageHandler().set_currStmtSource(std::nullopt);
   }
 
+  void Post(const parser::FnACCParallelDirective &dir) {
+    unsigned tileClauses = 0;
+    unsigned packClauses = 0;
+    unsigned reductionClauses = 0;
+    for (const parser::FnACCClause &clause : std::get<0>(dir.t)) {
+      tileClauses +=
+          std::holds_alternative<parser::FnACCTileClause>(clause.u) ? 1 : 0;
+      packClauses +=
+          std::holds_alternative<parser::FnACCPackClause>(clause.u) ? 1 : 0;
+      reductionClauses +=
+          std::holds_alternative<parser::FnACCReductionClause>(clause.u) ? 1
+                                                                         : 0;
+    }
+    if (tileClauses > 1)
+      Say(dir.source, "FNACC TILE clause may appear at most once"_err_en_US);
+    if (packClauses > 1)
+      Say(dir.source, "FNACC PACK clause may appear at most once"_err_en_US);
+    if (reductionClauses > 1)
+      Say(dir.source,
+          "FNACC REDUCTION clause may appear at most once"_err_en_US);
+  }
+
   bool Pre(const parser::FnACCStandaloneConstruct &) { return true; }
 
   void Post(const parser::FnACCStandaloneConstruct &) {

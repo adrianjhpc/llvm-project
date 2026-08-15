@@ -1,5 +1,5 @@
 ! RUN: %flang_fc1 -emit-fir %s -o %t.fir
-! RUN: fir-opt --fnacc-pipeline="ttir-output=%t.ttir json-output=%t.json" %t.fir -o /dev/null 2>&1 | FileCheck %s
+! RUN: not fir-opt --fnacc-pipeline="ttir-output=%t.ttir json-output=%t.json" %t.fir -o /dev/null 2>&1 | FileCheck %s
 
 subroutine fnacc_bad_multi_reduce(n, a, sum1, sum2)
   integer :: n
@@ -17,6 +17,6 @@ subroutine fnacc_bad_multi_reduce(n, a, sum1, sum2)
   end do
 end subroutine
 
-! CHECK: warning: FNACC
+! CHECK: error: FNACC Triton cannot emit launch:
 ! CHECK-SAME: reduction recognition requires exactly one reduction scalar
 

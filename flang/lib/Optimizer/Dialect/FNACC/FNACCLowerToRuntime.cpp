@@ -336,6 +336,18 @@ tryCreateContiguousArrayDescriptorArgs(OpBuilder &builder, Location loc,
   return desc;
 }
 
+static void validateContiguousBoxForLaunch(ModuleOp module, OpBuilder &builder,
+                                           Location loc, Value arrayLike) {
+  if (!arrayLike)
+    return;
+
+  if (auto desc =
+          tryCreateContiguousArrayDescriptorArgs(builder, loc, arrayLike)) {
+    createDescriptorRuntimeCall(module, builder, loc,
+                                "__fnacc_validate_contiguous_desc", *desc);
+  }
+}
+
 struct FNACCByteSizedArgs {
   // ABI:
   //   ptr, bytes
@@ -693,16 +705,30 @@ struct FNACCLowerToRuntimePass
     module.walk(
         [&](fir::fnacc::LaunchOp launchOp) { launches.push_back(launchOp); });
 
+    bool recognitionFailed = false;
+    for (fir::fnacc::LaunchOp launchOp : launches) {
+      auto result = fir::fnacc::recognizeElementwiseKernel(launchOp);
+      if (result.failed()) {
+        launchOp.emitError("FNACC runtime cannot lower launch: ")
+            << result.getFailure().reason;
+        recognitionFailed = true;
+      }
+    }
+    if (recognitionFailed) {
+      signalPassFailure();
+      return;
+    }
+
     int32_t fallbackKernelId = 0;
 
     for (fir::fnacc::LaunchOp launchOp : launches) {
       auto result = fir::fnacc::recognizeElementwiseKernel(launchOp);
 
       if (result.failed()) {
-        launchOp.emitWarning("FNACC runtime lowering skipped launch: ")
+        launchOp.emitError("FNACC runtime cannot lower launch: ")
             << result.getFailure().reason;
-        ++fallbackKernelId;
-        continue;
+        signalPassFailure();
+        return;
       }
 
       const fir::fnacc::ElementwiseKernel &k = result.getKernel();
@@ -711,6 +737,14 @@ struct FNACCLowerToRuntimePass
       BlockShape blockShape = getBlockShape(launchOp, k);
 
       builder.setInsertionPoint(launchOp);
+
+      // Kernel emitters currently linearize arrays and therefore require
+      // contiguous storage. Preserve box strides long enough to reject a
+      // non-contiguous assumed-shape actual argument before its base pointer
+      // is passed to the CUDA runtime.
+      for (Value readArray : k.readArrays)
+        validateContiguousBoxForLaunch(module, builder, loc, readArray);
+      validateContiguousBoxForLaunch(module, builder, loc, k.writeArray);
 
       int32_t stableKernelId = getKernelId(launchOp, fallbackKernelId);
 

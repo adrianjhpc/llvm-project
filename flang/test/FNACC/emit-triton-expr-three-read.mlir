@@ -78,10 +78,12 @@ module {
 // TTIR: %[[READ2O:.*]] = tt.addptr %[[READ2P]], %offs : tensor<128x!tt.ptr<f32>>, tensor<128xi32>
 // TTIR: %[[READ2V:.*]] = tt.load %[[READ2O]], %mask : tensor<128x!tt.ptr<f32>>
 
-// TTIR: %[[ADD0:.*]] = arith.addf %[[READ0V]], %[[READ1V]] fastmath<contract> : tensor<128xf32>
-// TTIR: %[[ADD1:.*]] = arith.addf %[[ADD0]], %[[READ2V]] fastmath<contract> : tensor<128xf32>
+// TTIR: %[[ADD0:.*]] = arith.addf %[[READ0V]], %[[READ1V]] : tensor<128xf32>
+// TTIR: %[[ADD1:.*]] = arith.addf %[[ADD0]], %[[READ2V]] : tensor<128xf32>
 // TTIR: tt.store %{{.*}}, %[[ADD1]], %mask : tensor<128x!tt.ptr<f32>>
 // TTIR: tt.return
+// TTIR-NOT: fastmath
+// TTIR-NOT: math.fma
 
 // JSON: "fnacc_schema_version": 1
 // JSON: "id": 0

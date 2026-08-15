@@ -1,5 +1,6 @@
 #include <cuda.h>
 
+#include <cerrno>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -7,6 +8,7 @@
 
 #include <fstream>
 #include <limits>
+#include <mutex>
 #include <optional>
 #include <sstream>
 #include <string>
@@ -14,6 +16,10 @@
 #include <vector>
 
 namespace {
+
+static std::recursive_mutex fnaccRuntimeMutex;
+#define FNACC_RUNTIME_GUARD() \
+  std::lock_guard<std::recursive_mutex> fnaccRuntimeLock(fnaccRuntimeMutex)
 
 static void fnaccCudaCheck(
     CUresult result, const char *expr, const char *file, int line) {
@@ -50,6 +56,16 @@ static std::size_t fnaccCheckedMul(
   }
 
   return a * b;
+}
+
+static std::size_t fnaccCheckedAdd(
+    std::size_t a, std::size_t b, const char *what) {
+  if (b > std::numeric_limits<std::size_t>::max() - a) {
+    std::fprintf(
+        stderr, "FNACC error: size overflow while computing %s\n", what);
+    std::abort();
+  }
+  return a + b;
 }
 
 static void fnaccConfigureDynamicSharedMemory(
@@ -195,9 +211,18 @@ static bool jsonFindInt(
     ++cursor;
   }
 
+  errno = 0;
   char *end = nullptr;
-  long value = std::strtol(cursor, &end, 10);
-  if (end == cursor)
+  long long value = std::strtoll(cursor, &end, 10);
+  if (end == cursor || errno == ERANGE ||
+      value < std::numeric_limits<int32_t>::min() ||
+      value > std::numeric_limits<int32_t>::max())
+    return false;
+
+  while (end < endOfString &&
+      (*end == ' ' || *end == '\t' || *end == '\n' || *end == '\r'))
+    ++end;
+  if (end < endOfString && *end != ',' && *end != '}' && *end != ']')
     return false;
 
   out = static_cast<int32_t>(value);
@@ -351,9 +376,28 @@ static void fnaccValidateContiguousDescriptor(const char *operationName,
     std::abort();
   }
 
-  int64_t expected0 = elementBytes;
-  int64_t expected1 = elementBytes * extent0;
-  int64_t expected2 = elementBytes * extent0 * extent1;
+  if (extent0 < 0 || extent1 < 0 || extent2 < 0) {
+    std::fprintf(
+        stderr, "FNACC error: %s received a negative extent\n", operationName);
+    std::abort();
+  }
+
+  std::size_t expected0Size = static_cast<std::size_t>(elementBytes);
+  std::size_t expected1Size = fnaccCheckedMul(expected0Size,
+      static_cast<std::size_t>(extent0), "descriptor byte stride 1");
+  std::size_t expected2Size = fnaccCheckedMul(expected1Size,
+      static_cast<std::size_t>(extent1), "descriptor byte stride 2");
+
+  if (expected2Size >
+      static_cast<std::size_t>(std::numeric_limits<int64_t>::max())) {
+    std::fprintf(stderr, "FNACC error: %s descriptor stride exceeds i64\n",
+        operationName);
+    std::abort();
+  }
+
+  int64_t expected0 = static_cast<int64_t>(expected0Size);
+  int64_t expected1 = static_cast<int64_t>(expected1Size);
+  int64_t expected2 = static_cast<int64_t>(expected2Size);
 
   bool contiguous = true;
 
@@ -562,6 +606,7 @@ static std::vector<std::size_t> fnaccEmbeddedPtxSize;
 
 static const char *fnaccEmbeddedJsonData = nullptr;
 static std::size_t fnaccEmbeddedJsonSize = 0;
+static bool fnaccEmbeddedBundleRegistered = false;
 
 static FNACCKernelRegistry fnaccRegistry;
 
@@ -756,8 +801,11 @@ fnaccParseKernelDescsFromJson(const std::string &json) {
     if (desc.ptxFile.empty())
       desc.ptxFile = desc.name + ".ptx";
 
-    if (desc.ptxIndex < 0)
-      desc.ptxIndex = 0;
+    if (desc.id < 0 || desc.ptxIndex < 0) {
+      std::fprintf(stderr,
+          "FNACC error: kernel JSON contains a negative id or PTX index\n");
+      std::abort();
+    }
 
     jsonFindInt(objectText, "rank", desc.rank);
 
@@ -768,31 +816,52 @@ fnaccParseKernelDescsFromJson(const std::string &json) {
     jsonFindInt(objectText, "num_ctas", desc.numCTAs);
     jsonFindInt(objectText, "num_stages", desc.numStages);
 
-    if (!jsonFindInt(
-            objectText, "cuda_threads_per_cta", desc.cudaThreadsPerCTA)) {
-      desc.cudaThreadsPerCTA = desc.numWarps * desc.threadsPerWarp;
-    }
+    bool hasCudaThreads =
+        jsonFindInt(objectText, "cuda_threads_per_cta", desc.cudaThreadsPerCTA);
 
     jsonFindInt(objectText, "triton_hidden_ptr_args", desc.tritonHiddenPtrArgs);
 
     desc.pack = jsonParsePackEntries(objectText);
 
-    if (desc.numWarps <= 0)
-      desc.numWarps = 1;
+    int64_t expectedCudaThreads =
+        static_cast<int64_t>(desc.numWarps) * desc.threadsPerWarp;
+    if (desc.rank < 1 || desc.rank > 3 || desc.tileX <= 0 || desc.tileY <= 0 ||
+        desc.tileZ <= 0 || desc.numWarps <= 0 || desc.threadsPerWarp != 32 ||
+        desc.numCTAs <= 0 || desc.numStages <= 0 || expectedCudaThreads <= 0 ||
+        expectedCudaThreads > std::numeric_limits<int32_t>::max()) {
+      std::fprintf(stderr,
+          "FNACC error: invalid launch metadata for kernel id %d\n", desc.id);
+      std::abort();
+    }
 
-    if (desc.threadsPerWarp <= 0)
-      desc.threadsPerWarp = 32;
+    if (!hasCudaThreads)
+      desc.cudaThreadsPerCTA = static_cast<int32_t>(expectedCudaThreads);
+    if (desc.cudaThreadsPerCTA != expectedCudaThreads) {
+      std::fprintf(stderr,
+          "FNACC error: cuda_threads_per_cta disagrees with warp metadata "
+          "for kernel id %d\n",
+          desc.id);
+      std::abort();
+    }
+    if (desc.tritonHiddenPtrArgs != 2) {
+      std::fprintf(stderr,
+          "FNACC error: kernel id %d requires %d hidden Triton parameters; "
+          "this runtime ABI supports exactly 2\n",
+          desc.id, desc.tritonHiddenPtrArgs);
+      std::abort();
+    }
 
-    if (desc.cudaThreadsPerCTA <= 0)
-      desc.cudaThreadsPerCTA = desc.numWarps * desc.threadsPerWarp;
-
-    if (desc.cudaThreadsPerCTA <= 0)
-      desc.cudaThreadsPerCTA = 32;
-
-    if (desc.tritonHiddenPtrArgs < 0)
-      desc.tritonHiddenPtrArgs = 0;
-
-    result[desc.id] = desc;
+    for (const auto &entry : result) {
+      if (entry.second.name == desc.name) {
+        std::fprintf(stderr, "FNACC error: duplicate kernel name '%s'\n",
+            desc.name.c_str());
+        std::abort();
+      }
+    }
+    if (!result.emplace(desc.id, std::move(desc)).second) {
+      std::fprintf(stderr, "FNACC error: duplicate kernel id in JSON\n");
+      std::abort();
+    }
 
     pos = objectEnd;
   }
@@ -801,6 +870,7 @@ fnaccParseKernelDescsFromJson(const std::string &json) {
 }
 
 static void fnaccCleanup() {
+  FNACC_RUNTIME_GUARD();
   if (!fnaccRegistry.initialized)
     return;
 
@@ -844,15 +914,17 @@ static unsigned fnaccMatmulDynamicSharedBytes(const FNACCKernelDesc *desc,
       static_cast<std::size_t>(blockY),
       "matmul dynamic shared B tile elements");
 
-  std::size_t elems =
-      fnaccCheckedMul(aElems + bElems, static_cast<std::size_t>(stages),
-          "matmul dynamic shared staged tile elements");
+  std::size_t elems = fnaccCheckedMul(
+      fnaccCheckedAdd(aElems, bElems, "matmul shared tile elements"),
+      static_cast<std::size_t>(stages),
+      "matmul dynamic shared staged tile elements");
 
   std::size_t bytes =
       fnaccCheckedMul(elems, sizeof(float), "matmul dynamic shared bytes");
 
   // Align to 256 bytes.
-  bytes = (bytes + 255) & ~static_cast<std::size_t>(255);
+  bytes = fnaccCheckedAdd(bytes, 255, "matmul shared alignment") &
+      ~static_cast<std::size_t>(255);
 
   // Triton may require padding/alignment beyond the simple A/B tile estimate.
   // Keep the conservative prototype minimum for now.
@@ -894,8 +966,9 @@ static unsigned fnaccMatmulDynamicSharedBytes(const FNACCKernelDesc *desc,
   return requiredBytes;
 }
 
-static unsigned fnaccMatmulF64DynamicSharedBytes(const FNACCKernelDesc *desc,
-    int32_t blockX, int32_t blockY, int32_t blockK) {
+static unsigned fnaccMatmulF64DynamicSharedBytes(
+    const FNACCKernelDesc * /*desc*/, int32_t blockX, int32_t blockY,
+    int32_t blockK) {
   if (blockX <= 0 || blockY <= 0 || blockK <= 0) {
     std::fprintf(stderr,
         "FNACC error: invalid f64 matmul tile shape (%d,%d,%d) while "
@@ -924,13 +997,18 @@ static unsigned fnaccMatmulF64DynamicSharedBytes(const FNACCKernelDesc *desc,
   std::size_t accElems = fnaccCheckedMul(static_cast<std::size_t>(blockX),
       static_cast<std::size_t>(blockY), "f64 matmul shared accumulator elems");
 
-  std::size_t elems = aElems + bElems + prodElems + accElems;
+  std::size_t elems = fnaccCheckedAdd(
+      fnaccCheckedAdd(aElems, bElems, "f64 matmul A/B shared elements"),
+      fnaccCheckedAdd(prodElems, accElems,
+          "f64 matmul product/accumulator shared elements"),
+      "f64 matmul total shared elements");
 
   std::size_t bytes =
       fnaccCheckedMul(elems, sizeof(double), "f64 matmul dynamic shared bytes");
 
   // Align to 256 bytes.
-  bytes = (bytes + 255) & ~static_cast<std::size_t>(255);
+  bytes = fnaccCheckedAdd(bytes, 255, "f64 matmul shared alignment") &
+      ~static_cast<std::size_t>(255);
 
   // Triton-generated kernels often assume a non-trivial shared-memory arena.
   // Keep a conservative minimum.
@@ -1344,12 +1422,9 @@ static CUfunction getKernelFunction(int32_t kernelId) {
   if (const FNACCKernelDesc *desc = fnaccLookupKernelDesc(kernelId)) {
     kernelName = desc->name;
   } else {
-    kernelName = "fnacc_kernel_" + std::to_string(kernelId);
-
-    std::fprintf(stderr,
-        "FNACC warning: no JSON descriptor for kernel id %d; "
-        "falling back to symbol name '%s'\n",
-        kernelId, kernelName.c_str());
+    std::fprintf(
+        stderr, "FNACC error: no JSON descriptor for kernel id %d\n", kernelId);
+    std::abort();
   }
 
   if (fnaccDebugEnabled()) {
@@ -1400,17 +1475,19 @@ static void fnaccValidateHostLaunchAgainstDesc(int32_t kernelId, int32_t rank,
 
   if (desc->rank != rank) {
     std::fprintf(stderr,
-        "FNACC warning: host launch rank %d disagrees with JSON "
+        "FNACC error: host launch rank %d disagrees with JSON "
         "rank %d for kernel id %d\n",
         rank, desc->rank, kernelId);
+    std::abort();
   }
 
   if (desc->tileX != blockX || desc->tileY != blockY || desc->tileZ != blockZ) {
     std::fprintf(stderr,
-        "FNACC warning: host tile (%d,%d,%d) disagrees with JSON "
+        "FNACC error: host tile (%d,%d,%d) disagrees with JSON "
         "tile (%d,%d,%d) for kernel id %d\n",
         blockX, blockY, blockZ, desc->tileX, desc->tileY, desc->tileZ,
         kernelId);
+    std::abort();
   }
 }
 
@@ -1423,18 +1500,26 @@ static unsigned fnaccCdiv(int32_t x, int32_t y) {
   if (x <= 0)
     return 0;
 
-  return static_cast<unsigned>((x + y - 1) / y);
+  uint64_t numerator = static_cast<uint64_t>(x) + static_cast<uint64_t>(y) - 1;
+  return static_cast<unsigned>(numerator / static_cast<uint64_t>(y));
 }
 
 static std::size_t fnaccElementCount(
     int32_t rank, int32_t extentX, int32_t extentY, int32_t extentZ) {
+  if (rank < 1 || rank > 3 || extentX < 0 || extentY < 0 || extentZ < 0) {
+    std::fprintf(stderr, "FNACC error: invalid rank or negative extent\n");
+    std::abort();
+  }
+
   std::size_t count = static_cast<std::size_t>(extentX);
 
   if (rank >= 2)
-    count *= static_cast<std::size_t>(extentY);
+    count = fnaccCheckedMul(
+        count, static_cast<std::size_t>(extentY), "launch element count");
 
   if (rank >= 3)
-    count *= static_cast<std::size_t>(extentZ);
+    count = fnaccCheckedMul(
+        count, static_cast<std::size_t>(extentZ), "launch element count");
 
   return count;
 }
@@ -1476,6 +1561,19 @@ static void fnaccValidateCommonLaunchInputs(const char *entryName, int32_t rank,
 
 } // namespace
 
+extern "C" void __fnacc_validate_contiguous_desc(void *hostPtr,
+    int64_t elementBytes, int32_t rank, int64_t extent0, int64_t extent1,
+    int64_t extent2, int64_t stride0, int64_t stride1, int64_t stride2) {
+  FNACC_RUNTIME_GUARD();
+  if (!hostPtr && extent0 != 0 && extent1 != 0 && extent2 != 0) {
+    std::fprintf(
+        stderr, "FNACC error: launch descriptor has a null base pointer\n");
+    std::abort();
+  }
+  fnaccValidateContiguousDescriptor("FNACC kernel launch", elementBytes, rank,
+      extent0, extent1, extent2, stride0, stride1, stride2);
+}
+
 // -------------------------------------------------------------------------- //
 // Public runtime ABI: binary elementwise kernels
 // -------------------------------------------------------------------------- //
@@ -1509,10 +1607,12 @@ static std::size_t fnaccElementCountFromExtents(
   std::size_t count = static_cast<std::size_t>(extent0);
 
   if (rank >= 2)
-    count *= static_cast<std::size_t>(extent1);
+    count = fnaccCheckedMul(
+        count, static_cast<std::size_t>(extent1), "descriptor element count");
 
   if (rank >= 3)
-    count *= static_cast<std::size_t>(extent2);
+    count = fnaccCheckedMul(
+        count, static_cast<std::size_t>(extent2), "descriptor element count");
 
   return count;
 }
@@ -1579,6 +1679,7 @@ static FNACCDeviceAllocation &fnaccGetOrCreateCachedAllocation(void *hostPtr,
 }
 
 extern "C" void __fnacc_create_bytes(void *hostPtr, int64_t bytesValue) {
+  FNACC_RUNTIME_GUARD();
   fnaccEnsureCurrentContext();
 
   if (!hostPtr) {
@@ -1617,6 +1718,7 @@ extern "C" void __fnacc_create_bytes(void *hostPtr, int64_t bytesValue) {
 extern "C" void __fnacc_create_desc(void *hostPtr, int64_t elementBytes,
     int32_t rank, int64_t extent0, int64_t extent1, int64_t extent2,
     int64_t stride0, int64_t stride1, int64_t stride2) {
+  FNACC_RUNTIME_GUARD();
   fnaccEnsureCurrentContext();
 
   if (!hostPtr) {
@@ -1654,6 +1756,7 @@ extern "C" void __fnacc_create_desc(void *hostPtr, int64_t elementBytes,
 }
 
 extern "C" void __fnacc_update_device_bytes(void *hostPtr, int64_t bytesValue) {
+  FNACC_RUNTIME_GUARD();
   fnaccEnsureCurrentContext();
 
   if (!hostPtr) {
@@ -1693,6 +1796,7 @@ extern "C" void __fnacc_update_device_bytes(void *hostPtr, int64_t bytesValue) {
 }
 
 extern "C" void __fnacc_update_host_bytes(void *hostPtr, int64_t bytesValue) {
+  FNACC_RUNTIME_GUARD();
   fnaccEnsureCurrentContext();
 
   if (!hostPtr) {
@@ -1721,13 +1825,11 @@ extern "C" void __fnacc_update_host_bytes(void *hostPtr, int64_t bytesValue) {
 
   auto it = fnaccRegistry.deviceCache.find(hostPtr);
   if (it == fnaccRegistry.deviceCache.end()) {
-    if (fnaccDebugEnabled()) {
-      std::fprintf(stderr,
-          "FNACC: update_host_bytes ignored; no cached allocation for "
-          "host=%p bytes=%zu\n",
-          hostPtr, bytes);
-    }
-    return;
+    std::fprintf(stderr,
+        "FNACC error: update_host_bytes has no cached allocation for "
+        "host=%p bytes=%zu; use create/copyin/update_device first\n",
+        hostPtr, bytes);
+    std::abort();
   }
 
   if (it->second.bytes < bytes) {
@@ -1750,6 +1852,7 @@ extern "C" void __fnacc_update_host_bytes(void *hostPtr, int64_t bytesValue) {
 extern "C" void __fnacc_update_device_desc(void *hostPtr, int64_t elementBytes,
     int32_t rank, int64_t extent0, int64_t extent1, int64_t extent2,
     int64_t stride0, int64_t stride1, int64_t stride2) {
+  FNACC_RUNTIME_GUARD();
   fnaccEnsureCurrentContext();
 
   if (!hostPtr) {
@@ -1792,6 +1895,7 @@ extern "C" void __fnacc_update_device_desc(void *hostPtr, int64_t elementBytes,
 extern "C" void __fnacc_update_host_desc(void *hostPtr, int64_t elementBytes,
     int32_t rank, int64_t extent0, int64_t extent1, int64_t extent2,
     int64_t stride0, int64_t stride1, int64_t stride2) {
+  FNACC_RUNTIME_GUARD();
 
   fnaccEnsureCurrentContext();
 
@@ -1818,12 +1922,11 @@ extern "C" void __fnacc_update_host_desc(void *hostPtr, int64_t elementBytes,
 
   auto it = fnaccRegistry.deviceCache.find(hostPtr);
   if (it == fnaccRegistry.deviceCache.end()) {
-    if (fnaccDebugEnabled()) {
-      std::fprintf(stderr,
-          "FNACC: update_host_desc ignored; no cached allocation for host=%p\n",
-          hostPtr);
-    }
-    return;
+    std::fprintf(stderr,
+        "FNACC error: update_host_desc has no cached allocation for host=%p; "
+        "use create/copyin/update_device first\n",
+        hostPtr);
+    std::abort();
   }
 
   if (it->second.bytes < bytes) {
@@ -1848,6 +1951,7 @@ extern "C" void __fnacc_update_host_desc(void *hostPtr, int64_t elementBytes,
 }
 
 extern "C" void __fnacc_release_desc(void *hostPtr) {
+  FNACC_RUNTIME_GUARD();
   fnaccEnsureCurrentContext();
 
   if (!hostPtr) {
@@ -1882,6 +1986,7 @@ extern "C" void __fnacc_release_desc(void *hostPtr) {
 extern "C" void __fnacc_launch_nd_f32(int32_t kernelId, int32_t rank,
     int32_t blockX, int32_t blockY, int32_t blockZ, float *a, float *b,
     float *c, int32_t extentX, int32_t extentY, int32_t extentZ) {
+  FNACC_RUNTIME_GUARD();
   fnaccEnsureCurrentContext();
 
   fnaccValidateHostLaunchAgainstDesc(kernelId, rank, blockX, blockY, blockZ);
@@ -1911,7 +2016,8 @@ extern "C" void __fnacc_launch_nd_f32(int32_t kernelId, int32_t rank,
 
   std::size_t elemCount = fnaccElementCount(rank, extentX, extentY, extentZ);
 
-  std::size_t numBytes = elemCount * sizeof(float);
+  std::size_t numBytes =
+      fnaccCheckedMul(elemCount, sizeof(float), "f32 launch byte count");
 
   CUdeviceptr dA = 0;
   CUdeviceptr dB = 0;
@@ -2060,6 +2166,7 @@ extern "C" void __fnacc_launch_nd_f32_s1(int32_t kernelId, int32_t rank,
     int32_t blockX, int32_t blockY, int32_t blockZ, float *a, float *b,
     float *c, float scalar0, int32_t extentX, int32_t extentY,
     int32_t extentZ) {
+  FNACC_RUNTIME_GUARD();
   fnaccEnsureCurrentContext();
 
   fnaccValidateHostLaunchAgainstDesc(kernelId, rank, blockX, blockY, blockZ);
@@ -2084,7 +2191,8 @@ extern "C" void __fnacc_launch_nd_f32_s1(int32_t kernelId, int32_t rank,
   unsigned cudaBlockX = fnaccCudaThreadsPerCTA(kernelId);
 
   std::size_t numElems = static_cast<std::size_t>(extentX);
-  std::size_t numBytes = numElems * sizeof(float);
+  std::size_t numBytes =
+      fnaccCheckedMul(numElems, sizeof(float), "f32 launch byte count");
 
   CUdeviceptr dA = 0;
   CUdeviceptr dB = 0;
@@ -2160,6 +2268,7 @@ extern "C" void __fnacc_launch_nd_f32_s2(int32_t kernelId, int32_t rank,
     int32_t blockX, int32_t blockY, int32_t blockZ, float *a, float *b,
     float *c, float scalar0, float scalar1, int32_t extentX, int32_t extentY,
     int32_t extentZ) {
+  FNACC_RUNTIME_GUARD();
   fnaccEnsureCurrentContext();
 
   fnaccValidateHostLaunchAgainstDesc(kernelId, rank, blockX, blockY, blockZ);
@@ -2184,7 +2293,8 @@ extern "C" void __fnacc_launch_nd_f32_s2(int32_t kernelId, int32_t rank,
   unsigned cudaBlockX = fnaccCudaThreadsPerCTA(kernelId);
 
   std::size_t numElems = static_cast<std::size_t>(extentX);
-  std::size_t numBytes = numElems * sizeof(float);
+  std::size_t numBytes =
+      fnaccCheckedMul(numElems, sizeof(float), "f32 launch byte count");
 
   CUdeviceptr dA = 0;
   CUdeviceptr dB = 0;
@@ -2279,6 +2389,7 @@ extern "C" void __fnacc_launch_f32_v1(int32_t kernelId, int32_t rank,
     int32_t numScalars, float *read0, float *read1, float *read2, float *write,
     float scalar0, float scalar1, float scalar2, int32_t extentX,
     int32_t extentY, int32_t extentZ) {
+  FNACC_RUNTIME_GUARD();
   fnaccEnsureCurrentContext();
 
   fnaccValidateHostLaunchAgainstDesc(kernelId, rank, blockX, blockY, blockZ);
@@ -2343,7 +2454,8 @@ extern "C" void __fnacc_launch_f32_v1(int32_t kernelId, int32_t rank,
 
   std::size_t elemCount = fnaccElementCount(rank, extentX, extentY, extentZ);
 
-  std::size_t numBytes = elemCount * sizeof(float);
+  std::size_t numBytes =
+      fnaccCheckedMul(elemCount, sizeof(float), "f32 launch byte count");
 
   const FNACCKernelDesc *desc = fnaccLookupKernelDesc(kernelId);
 
@@ -2523,6 +2635,7 @@ extern "C" void __fnacc_launch_f64_v1(int32_t kernelId, int32_t rank,
     int32_t numScalars, double *read0, double *read1, double *read2,
     double *write, double scalar0, double scalar1, double scalar2,
     int32_t extentX, int32_t extentY, int32_t extentZ) {
+  FNACC_RUNTIME_GUARD();
   fnaccEnsureCurrentContext();
 
   fnaccValidateHostLaunchAgainstDesc(kernelId, rank, blockX, blockY, blockZ);
@@ -2586,7 +2699,8 @@ extern "C" void __fnacc_launch_f64_v1(int32_t kernelId, int32_t rank,
   unsigned cudaBlockX = fnaccCudaThreadsPerCTA(kernelId);
 
   std::size_t elemCount = fnaccElementCount(rank, extentX, extentY, extentZ);
-  std::size_t numBytes = elemCount * sizeof(double);
+  std::size_t numBytes =
+      fnaccCheckedMul(elemCount, sizeof(double), "f64 launch byte count");
 
   const FNACCKernelDesc *desc = fnaccLookupKernelDesc(kernelId);
 
@@ -2725,6 +2839,7 @@ extern "C" void __fnacc_launch_f64_v1(int32_t kernelId, int32_t rank,
 extern "C" void __fnacc_launch_matmul_f32_v1(int32_t kernelId, int32_t blockX,
     int32_t blockY, int32_t blockK, float *a, float *b, float *c, int32_t n,
     int32_t m, int32_t k) {
+  FNACC_RUNTIME_GUARD();
   fnaccEnsureCurrentContext();
 
   fnaccValidateHostLaunchAgainstDesc(kernelId, 2, blockX, blockY, blockK);
@@ -2874,6 +2989,7 @@ extern "C" void __fnacc_launch_matmul_f32_v1(int32_t kernelId, int32_t blockX,
 extern "C" void __fnacc_launch_matmul_f64_v1(int32_t kernelId, int32_t blockX,
     int32_t blockY, int32_t blockK, double *a, double *b, double *c, int32_t n,
     int32_t m, int32_t k) {
+  FNACC_RUNTIME_GUARD();
   fnaccEnsureCurrentContext();
 
   fnaccValidateHostLaunchAgainstDesc(kernelId, 2, blockX, blockY, blockK);
@@ -3018,6 +3134,7 @@ extern "C" void __fnacc_launch_matmul_f64_v1(int32_t kernelId, int32_t blockX,
 extern "C" void __fnacc_launch_reduce_f32_v1(int32_t kernelId, int32_t blockX,
     int32_t numReadArrays, float *read0, float *read1, float *result,
     int32_t extentX) {
+  FNACC_RUNTIME_GUARD();
   fnaccEnsureCurrentContext();
 
   if (!read0 || !result) {
@@ -3113,6 +3230,7 @@ extern "C" void __fnacc_launch_reduce_f32_v1(int32_t kernelId, int32_t blockX,
 extern "C" void __fnacc_launch_reduce_f64_v1(int32_t kernelId, int32_t blockX,
     int32_t numReadArrays, double *read0, double *read1, double *result,
     int32_t extentX) {
+  FNACC_RUNTIME_GUARD();
   fnaccEnsureCurrentContext();
 
   if (!read0 || !result) {
@@ -3207,6 +3325,7 @@ extern "C" void __fnacc_launch_reduce_f64_v1(int32_t kernelId, int32_t blockX,
 
 // Memory management functions to help with cached data and data lifetimes
 extern "C" void __fnacc_update_host(void *hostPtr) {
+  FNACC_RUNTIME_GUARD();
   fnaccEnsureCurrentContext();
 
   if (!hostPtr) {
@@ -3217,11 +3336,11 @@ extern "C" void __fnacc_update_host(void *hostPtr) {
 
   auto it = fnaccRegistry.deviceCache.find(hostPtr);
   if (it == fnaccRegistry.deviceCache.end()) {
-    if (fnaccDebugEnabled()) {
-      std::fprintf(stderr,
-          "FNACC: update_host ignored; no cached allocation for %p\n", hostPtr);
-    }
-    return;
+    std::fprintf(stderr,
+        "FNACC error: update_host has no cached allocation for %p; "
+        "use create/copyin/update_device first\n",
+        hostPtr);
+    std::abort();
   }
 
   FNACC_CUDA_CHECK(cuMemcpyDtoH(hostPtr, it->second.ptr, it->second.bytes));
@@ -3234,6 +3353,7 @@ extern "C" void __fnacc_update_host(void *hostPtr) {
 }
 
 extern "C" void __fnacc_update_device(void *hostPtr) {
+  FNACC_RUNTIME_GUARD();
   fnaccEnsureCurrentContext();
 
   if (!hostPtr) {
@@ -3244,12 +3364,11 @@ extern "C" void __fnacc_update_device(void *hostPtr) {
 
   auto it = fnaccRegistry.deviceCache.find(hostPtr);
   if (it == fnaccRegistry.deviceCache.end()) {
-    if (fnaccDebugEnabled()) {
-      std::fprintf(stderr,
-          "FNACC: update_device ignored; no cached allocation for %p\n",
-          hostPtr);
-    }
-    return;
+    std::fprintf(stderr,
+        "FNACC error: update_device has no cached allocation for %p; "
+        "use a sized update/create directive first\n",
+        hostPtr);
+    std::abort();
   }
 
   FNACC_CUDA_CHECK(cuMemcpyHtoD(it->second.ptr, hostPtr, it->second.bytes));
@@ -3262,6 +3381,7 @@ extern "C" void __fnacc_update_device(void *hostPtr) {
 }
 
 extern "C" void __fnacc_release(void *hostPtr) {
+  FNACC_RUNTIME_GUARD();
   fnaccEnsureCurrentContext();
 
   if (!hostPtr) {
@@ -3293,6 +3413,7 @@ extern "C" void __fnacc_release(void *hostPtr) {
 }
 
 extern "C" void __fnacc_release_all() {
+  FNACC_RUNTIME_GUARD();
   fnaccEnsureCurrentContext();
 
   if (fnaccDebugEnabled()) {
@@ -3320,20 +3441,46 @@ extern "C" void __fnacc_release_all() {
 extern "C" void __fnacc_register_embedded_kernel_bundle(
     const char *const *ptxData, std::size_t const *ptxSizes,
     std::size_t ptxCount, const char *jsonData, std::size_t jsonSize) {
+  FNACC_RUNTIME_GUARD();
+  if (fnaccEmbeddedBundleRegistered) {
+    std::fprintf(stderr,
+        "FNACC error: multiple embedded kernel bundles were registered. "
+        "Compile all FNACC kernels as one bundle so kernel IDs stay unique.\n");
+    std::abort();
+  }
+  if (!ptxData || !ptxSizes || ptxCount == 0 || !jsonData || jsonSize == 0) {
+    std::fprintf(stderr, "FNACC error: invalid embedded kernel bundle\n");
+    std::abort();
+  }
   fnaccEmbeddedPtxData.clear();
   fnaccEmbeddedPtxSize.clear();
 
   for (std::size_t i = 0; i < ptxCount; ++i) {
+    if (!ptxData[i] || ptxSizes[i] == 0) {
+      std::fprintf(stderr, "FNACC error: invalid embedded PTX entry %zu\n", i);
+      std::abort();
+    }
     fnaccEmbeddedPtxData.push_back(ptxData[i]);
     fnaccEmbeddedPtxSize.push_back(ptxSizes[i]);
   }
 
   fnaccEmbeddedJsonData = jsonData;
   fnaccEmbeddedJsonSize = jsonSize;
+  fnaccEmbeddedBundleRegistered = true;
 }
 
 extern "C" void __fnacc_register_embedded_kernels(const char *ptxData,
     std::size_t ptxSize, const char *jsonData, std::size_t jsonSize) {
+  FNACC_RUNTIME_GUARD();
+  if (fnaccEmbeddedBundleRegistered) {
+    std::fprintf(stderr,
+        "FNACC error: multiple embedded kernel bundles were registered\n");
+    std::abort();
+  }
+  if (!ptxData || ptxSize == 0 || !jsonData || jsonSize == 0) {
+    std::fprintf(stderr, "FNACC error: invalid embedded kernel bundle\n");
+    std::abort();
+  }
   fnaccEmbeddedPtxData.clear();
   fnaccEmbeddedPtxSize.clear();
 
@@ -3342,4 +3489,5 @@ extern "C" void __fnacc_register_embedded_kernels(const char *ptxData,
 
   fnaccEmbeddedJsonData = jsonData;
   fnaccEmbeddedJsonSize = jsonSize;
+  fnaccEmbeddedBundleRegistered = true;
 }
