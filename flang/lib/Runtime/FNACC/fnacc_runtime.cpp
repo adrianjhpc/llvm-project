@@ -578,8 +578,18 @@ static bool fnaccDebugEnabled() {
 }
 
 static bool fnaccHasEmbeddedPtxBundle() {
-  return !fnaccEmbeddedPtxData.empty() &&
-      fnaccEmbeddedPtxData.size() == fnaccEmbeddedPtxSize.size();
+  if (fnaccEmbeddedPtxData.empty())
+    return false;
+
+  if (fnaccEmbeddedPtxData.size() != fnaccEmbeddedPtxSize.size())
+    return false;
+
+  for (std::size_t i = 0; i < fnaccEmbeddedPtxData.size(); ++i) {
+    if (!fnaccEmbeddedPtxData[i] || fnaccEmbeddedPtxSize[i] == 0)
+      return false;
+  }
+
+  return true;
 }
 
 static std::vector<std::string> fnaccGetPtxTextsFromEmbeddedBundle() {

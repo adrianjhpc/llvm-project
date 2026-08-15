@@ -1,5 +1,5 @@
 ! RUN: %flang_fc1 -emit-fir %s -o %t.fir
-! RUN: fir-opt --fnacc-pipeline="ttir-output=%t.ttir json-output=%t.json" %t.fir -o %t.host.fir
+! RUN: fir-opt --fnacc-pipeline="ttir-output=%t.ttir json-output=%t.json f64-matmul-strategy=fma" %t.fir -o %t.host.fir
 ! RUN: FileCheck %s --check-prefix=HOST --input-file=%t.host.fir
 ! RUN: FileCheck %s --check-prefix=TTIR --input-file=%t.ttir
 ! RUN: FileCheck %s --check-prefix=JSON --input-file=%t.json

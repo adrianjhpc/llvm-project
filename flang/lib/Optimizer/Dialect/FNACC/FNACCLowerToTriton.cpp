@@ -713,15 +713,17 @@ static void emitTritonExpr2D(const fir::fnacc::ElementwiseKernel &k,
   os << "}\n\n";
 }
 
-static void emitTritonMatMul2DF32(const fir::fnacc::ElementwiseKernel &k,
+static void emitTritonMatMul2DDot(const fir::fnacc::ElementwiseKernel &k,
                                   int64_t blockM, int64_t blockN,
                                   int64_t blockK, StringRef kernelName,
                                   llvm::raw_ostream &os) {
-  assert(k.elementType == fir::fnacc::ElementType::F32 &&
-         "matmul TTIR emitter is currently f32-only");
 
-  os << "tt.func @" << kernelName
-     << "(%a: !tt.ptr<f32>, %b: !tt.ptr<f32>, %c: !tt.ptr<f32>, "
+  std::string ptrTy = ptrType(k.elementType);
+  std::string elemTy = ttElementType(k.elementType).str();
+
+  os << "tt.func @" << kernelName << "(%a: " << ptrTy << ", %b: " << ptrTy
+     << ", %c: " << ptrTy
+     << ", "
         "%n: i32, %m: i32, %k: i32) attributes {noinline = false} {\n";
 
   os << "  %pid_m = tt.get_program_id x : i32\n";
@@ -755,9 +757,9 @@ static void emitTritonMatMul2DF32(const fir::fnacc::ElementwiseKernel &k,
   os << "  %mask_n = arith.cmpi slt, %offs_n, %m_s_n : tensor<" << blockN
      << "xi32>\n";
 
-  os << "  %zero = arith.constant 0.000000e+00 : f32\n";
-  os << "  %acc0 = tt.splat %zero : f32 -> tensor<" << blockM << "x" << blockN
-     << "xf32>\n";
+  os << "  %zero = arith.constant 0.000000e+00 : " << elemTy << "\n";
+  os << "  %acc0 = tt.splat %zero : " << elemTy << " -> tensor<" << blockM
+     << "x" << blockN << "x" << elemTy << ">\n";
 
   os << "  %c0_idx = arith.constant 0 : index\n";
   os << "  %bk_idx = arith.constant " << blockK << " : index\n";
@@ -765,7 +767,7 @@ static void emitTritonMatMul2DF32(const fir::fnacc::ElementwiseKernel &k,
 
   os << "  %acc = scf.for %kk_idx = %c0_idx to %k_idx step %bk_idx "
         "iter_args(%acc_body = %acc0) -> (tensor<"
-     << blockM << "x" << blockN << "xf32>) {\n";
+     << blockM << "x" << blockN << "x" << elemTy << ">) {\n";
 
   os << "    %kk_body = arith.index_cast %kk_idx : index to i32\n";
   os << "    %kk_s = tt.splat %kk_body : i32 -> tensor<" << blockK << "xi32>\n";
@@ -828,27 +830,28 @@ static void emitTritonMatMul2DF32(const fir::fnacc::ElementwiseKernel &k,
   os << "    %mask_b = arith.andi %mask_k_b_b, %mask_n_b : tensor<" << blockK
      << "x" << blockN << "xi1>\n";
 
-  os << "    %a_base = tt.splat %a : !tt.ptr<f32> -> tensor<" << blockM << "x"
-     << blockK << "x!tt.ptr<f32>>\n";
-  os << "    %b_base = tt.splat %b : !tt.ptr<f32> -> tensor<" << blockK << "x"
-     << blockN << "x!tt.ptr<f32>>\n";
+  os << "    %a_base = tt.splat %a : " << ptrTy << " -> tensor<" << blockM
+     << "x" << blockK << "x" << ptrTy << ">\n";
+  os << "    %b_base = tt.splat %b : " << ptrTy << " -> tensor<" << blockK
+     << "x" << blockN << "x" << ptrTy << ">\n";
   os << "    %a_ptrs = tt.addptr %a_base, %a_offsets : tensor<" << blockM << "x"
-     << blockK << "x!tt.ptr<f32>>, tensor<" << blockM << "x" << blockK
+     << blockK << "x" << ptrTy << ">, tensor<" << blockM << "x" << blockK
      << "xi32>\n";
   os << "    %b_ptrs = tt.addptr %b_base, %b_offsets : tensor<" << blockK << "x"
-     << blockN << "x!tt.ptr<f32>>, tensor<" << blockK << "x" << blockN
+     << blockN << "x" << ptrTy << ">, tensor<" << blockK << "x" << blockN
      << "xi32>\n";
   os << "    %a_tile = tt.load %a_ptrs, %mask_a : tensor<" << blockM << "x"
-     << blockK << "x!tt.ptr<f32>>\n";
+     << blockK << "x" << ptrTy << ">\n";
   os << "    %b_tile = tt.load %b_ptrs, %mask_b : tensor<" << blockK << "x"
-     << blockN << "x!tt.ptr<f32>>\n";
+     << blockN << "x" << ptrTy << ">\n";
 
   os << "    %acc_next = tt.dot %a_tile, %b_tile, %acc_body "
         "{inputPrecision = 0 : i32} : tensor<"
-     << blockM << "x" << blockK << "xf32> * tensor<" << blockK << "x" << blockN
-     << "xf32> -> tensor<" << blockM << "x" << blockN << "xf32>\n";
-  os << "    scf.yield %acc_next : tensor<" << blockM << "x" << blockN
-     << "xf32>\n";
+     << blockM << "x" << blockK << "x" << elemTy << "> * tensor<" << blockK
+     << "x" << blockN << "x" << elemTy << "> -> tensor<" << blockM << "x"
+     << blockN << "x" << elemTy << ">\n";
+  os << "    scf.yield %acc_next : tensor<" << blockM << "x" << blockN << "x"
+     << elemTy << ">\n";
   os << "  }\n";
 
   os << "  %offs_m_e_c = tt.expand_dims %offs_m {axis = 1 : i32} : tensor<"
@@ -877,22 +880,277 @@ static void emitTritonMatMul2DF32(const fir::fnacc::ElementwiseKernel &k,
   os << "  %mask_c = arith.andi %mask_m_b_c, %mask_n_b_c : tensor<" << blockM
      << "x" << blockN << "xi1>\n";
 
-  os << "  %c_base = tt.splat %c : !tt.ptr<f32> -> tensor<" << blockM << "x"
-     << blockN << "x!tt.ptr<f32>>\n";
+  os << "  %c_base = tt.splat %c : " << ptrTy << " -> tensor<" << blockM << "x"
+     << blockN << "x" << ptrTy << ">\n";
   os << "  %c_ptrs = tt.addptr %c_base, %c_offsets : tensor<" << blockM << "x"
-     << blockN << "x!tt.ptr<f32>>, tensor<" << blockM << "x" << blockN
+     << blockN << "x" << ptrTy << ">, tensor<" << blockM << "x" << blockN
      << "xi32>\n";
   os << "  tt.store %c_ptrs, %acc, %mask_c : tensor<" << blockM << "x" << blockN
-     << "x!tt.ptr<f32>>\n";
+     << "x" << ptrTy << ">\n";
 
   os << "  tt.return\n";
   os << "}\n\n";
 }
 
-static void emitTritonMatMul2DF64(const fir::fnacc::ElementwiseKernel &k,
+
+static void emitTritonMatMul2DF32(const fir::fnacc::ElementwiseKernel &k,
                                   int64_t blockM, int64_t blockN,
                                   int64_t blockK, StringRef kernelName,
                                   llvm::raw_ostream &os) {
+  assert(k.elementType == fir::fnacc::ElementType::F32);
+  emitTritonMatMul2DDot(k, blockM, blockN, blockK, kernelName, os);
+}
+
+static void emitTritonMatMul2DF64Dot(const fir::fnacc::ElementwiseKernel &k,
+                                     int64_t blockM, int64_t blockN,
+                                     int64_t blockK, StringRef kernelName,
+                                     llvm::raw_ostream &os) {
+  assert(k.elementType == fir::fnacc::ElementType::F64);
+  emitTritonMatMul2DDot(k, blockM, blockN, blockK, kernelName, os);
+}
+
+static void emitTritonMatMul2DF64Reduce(const fir::fnacc::ElementwiseKernel &k,
+                                        int64_t blockM, int64_t blockN,
+                                        int64_t blockK, StringRef kernelName,
+                                        llvm::raw_ostream &os) {
+  assert(k.elementType == fir::fnacc::ElementType::F64 &&
+         "f64 matmul emitter requires f64 kernel");
+
+  std::string ptrTy = ptrType(k.elementType);
+  std::string elemTy = ttElementType(k.elementType).str();
+
+  os << "tt.func @" << kernelName << "(%a: " << ptrTy << ", %b: " << ptrTy
+     << ", %c: " << ptrTy
+     << ", %n: i32, %m: i32, %k: i32) attributes {noinline = false} {\n";
+
+  os << "  %pid_m = tt.get_program_id x : i32\n";
+  os << "  %pid_n = tt.get_program_id y : i32\n";
+
+  os << "  %bm = arith.constant " << blockM << " : i32\n";
+  os << "  %bn = arith.constant " << blockN << " : i32\n";
+  os << "  %bk = arith.constant " << blockK << " : i32\n";
+
+  os << "  %base_m = arith.muli %pid_m, %bm : i32\n";
+  os << "  %base_n = arith.muli %pid_n, %bn : i32\n";
+
+  os << "  %offs_m0 = tt.make_range {start = 0 : i32, end = " << blockM
+     << " : i32} : tensor<" << blockM << "xi32>\n";
+  os << "  %offs_n0 = tt.make_range {start = 0 : i32, end = " << blockN
+     << " : i32} : tensor<" << blockN << "xi32>\n";
+  os << "  %offs_k0 = tt.make_range {start = 0 : i32, end = " << blockK
+     << " : i32} : tensor<" << blockK << "xi32>\n";
+
+  os << "  %base_m_s = tt.splat %base_m : i32 -> tensor<" << blockM
+     << "xi32>\n";
+  os << "  %base_n_s = tt.splat %base_n : i32 -> tensor<" << blockN
+     << "xi32>\n";
+
+  os << "  %offs_m = arith.addi %base_m_s, %offs_m0 : tensor<" << blockM
+     << "xi32>\n";
+  os << "  %offs_n = arith.addi %base_n_s, %offs_n0 : tensor<" << blockN
+     << "xi32>\n";
+
+  os << "  %n_s_m = tt.splat %n : i32 -> tensor<" << blockM << "xi32>\n";
+  os << "  %m_s_n = tt.splat %m : i32 -> tensor<" << blockN << "xi32>\n";
+
+  os << "  %mask_m = arith.cmpi slt, %offs_m, %n_s_m : tensor<" << blockM
+     << "xi32>\n";
+  os << "  %mask_n = arith.cmpi slt, %offs_n, %m_s_n : tensor<" << blockN
+     << "xi32>\n";
+
+  os << "  %zero = arith.constant 0.000000e+00 : f64\n";
+  os << "  %acc0 = tt.splat %zero : f64 -> tensor<" << blockM << "x" << blockN
+     << "xf64>\n";
+
+  os << "  %c0_idx = arith.constant 0 : index\n";
+  os << "  %bk_idx = arith.constant " << blockK << " : index\n";
+  os << "  %k_idx = arith.index_cast %k : i32 to index\n";
+
+  os << "  %acc = scf.for %kk_idx = %c0_idx to %k_idx step %bk_idx "
+        "iter_args(%acc_body = %acc0) -> (tensor<"
+     << blockM << "x" << blockN << "xf64>) {\n";
+
+  os << "    %kk = arith.index_cast %kk_idx : index to i32\n";
+  os << "    %kk_s = tt.splat %kk : i32 -> tensor<" << blockK << "xi32>\n";
+  os << "    %offs_k = arith.addi %kk_s, %offs_k0 : tensor<" << blockK
+     << "xi32>\n";
+
+  os << "    %k_s_k = tt.splat %k : i32 -> tensor<" << blockK << "xi32>\n";
+  os << "    %mask_k = arith.cmpi slt, %offs_k, %k_s_k : tensor<" << blockK
+     << "xi32>\n";
+
+  // A offsets: A(i, p), column-major offset = i + p * n.
+  os << "    %offs_m_e_a = tt.expand_dims %offs_m {axis = 1 : i32} "
+        ": tensor<"
+     << blockM << "xi32> -> tensor<" << blockM << "x1xi32>\n";
+  os << "    %offs_k_e_a = tt.expand_dims %offs_k {axis = 0 : i32} "
+        ": tensor<"
+     << blockK << "xi32> -> tensor<1x" << blockK << "xi32>\n";
+  os << "    %offs_m_b_a = tt.broadcast %offs_m_e_a : tensor<" << blockM
+     << "x1xi32> -> tensor<" << blockM << "x" << blockK << "xi32>\n";
+  os << "    %offs_k_b_a = tt.broadcast %offs_k_e_a : tensor<1x" << blockK
+     << "xi32> -> tensor<" << blockM << "x" << blockK << "xi32>\n";
+  os << "    %n_s_a = tt.splat %n : i32 -> tensor<" << blockM << "x" << blockK
+     << "xi32>\n";
+  os << "    %a_col = arith.muli %offs_k_b_a, %n_s_a : tensor<" << blockM << "x"
+     << blockK << "xi32>\n";
+  os << "    %a_offsets = arith.addi %offs_m_b_a, %a_col : tensor<" << blockM
+     << "x" << blockK << "xi32>\n";
+
+  // B offsets emitted as B(j, p) logical tensor N x K:
+  // B(p,j), column-major offset = p + j * k.
+  os << "    %offs_n_e_b = tt.expand_dims %offs_n {axis = 1 : i32} "
+        ": tensor<"
+     << blockN << "xi32> -> tensor<" << blockN << "x1xi32>\n";
+  os << "    %offs_k_e_b = tt.expand_dims %offs_k {axis = 0 : i32} "
+        ": tensor<"
+     << blockK << "xi32> -> tensor<1x" << blockK << "xi32>\n";
+  os << "    %offs_n_b_b = tt.broadcast %offs_n_e_b : tensor<" << blockN
+     << "x1xi32> -> tensor<" << blockN << "x" << blockK << "xi32>\n";
+  os << "    %offs_k_b_b = tt.broadcast %offs_k_e_b : tensor<1x" << blockK
+     << "xi32> -> tensor<" << blockN << "x" << blockK << "xi32>\n";
+  os << "    %k_s_b = tt.splat %k : i32 -> tensor<" << blockN << "x" << blockK
+     << "xi32>\n";
+  os << "    %b_col = arith.muli %offs_n_b_b, %k_s_b : tensor<" << blockN << "x"
+     << blockK << "xi32>\n";
+  os << "    %b_offsets = arith.addi %offs_k_b_b, %b_col : tensor<" << blockN
+     << "x" << blockK << "xi32>\n";
+
+  // Masks.
+  os << "    %mask_m_e_a = tt.expand_dims %mask_m {axis = 1 : i32} "
+        ": tensor<"
+     << blockM << "xi1> -> tensor<" << blockM << "x1xi1>\n";
+  os << "    %mask_k_e_a = tt.expand_dims %mask_k {axis = 0 : i32} "
+        ": tensor<"
+     << blockK << "xi1> -> tensor<1x" << blockK << "xi1>\n";
+  os << "    %mask_m_b_a = tt.broadcast %mask_m_e_a : tensor<" << blockM
+     << "x1xi1> -> tensor<" << blockM << "x" << blockK << "xi1>\n";
+  os << "    %mask_k_b_a = tt.broadcast %mask_k_e_a : tensor<1x" << blockK
+     << "xi1> -> tensor<" << blockM << "x" << blockK << "xi1>\n";
+  os << "    %mask_a = arith.andi %mask_m_b_a, %mask_k_b_a : tensor<" << blockM
+     << "x" << blockK << "xi1>\n";
+
+  os << "    %mask_n_e_b = tt.expand_dims %mask_n {axis = 1 : i32} "
+        ": tensor<"
+     << blockN << "xi1> -> tensor<" << blockN << "x1xi1>\n";
+  os << "    %mask_k_e_b = tt.expand_dims %mask_k {axis = 0 : i32} "
+        ": tensor<"
+     << blockK << "xi1> -> tensor<1x" << blockK << "xi1>\n";
+  os << "    %mask_n_b_b = tt.broadcast %mask_n_e_b : tensor<" << blockN
+     << "x1xi1> -> tensor<" << blockN << "x" << blockK << "xi1>\n";
+  os << "    %mask_k_b_b = tt.broadcast %mask_k_e_b : tensor<1x" << blockK
+     << "xi1> -> tensor<" << blockN << "x" << blockK << "xi1>\n";
+  os << "    %mask_b = arith.andi %mask_n_b_b, %mask_k_b_b : tensor<" << blockN
+     << "x" << blockK << "xi1>\n";
+
+  // Loads.
+  os << "    %a_base = tt.splat %a : " << ptrTy << " -> tensor<" << blockM
+     << "x" << blockK << "x" << ptrTy << ">\n";
+  os << "    %b_base = tt.splat %b : " << ptrTy << " -> tensor<" << blockN
+     << "x" << blockK << "x" << ptrTy << ">\n";
+
+  os << "    %a_ptrs = tt.addptr %a_base, %a_offsets : tensor<" << blockM << "x"
+     << blockK << "x" << ptrTy << ">, tensor<" << blockM << "x" << blockK
+     << "xi32>\n";
+  os << "    %b_ptrs = tt.addptr %b_base, %b_offsets : tensor<" << blockN << "x"
+     << blockK << "x" << ptrTy << ">, tensor<" << blockN << "x" << blockK
+     << "xi32>\n";
+
+  os << "    %a_tile = tt.load %a_ptrs, %mask_a : tensor<" << blockM << "x"
+     << blockK << "x" << ptrTy << ">\n";
+  os << "    %b_tile = tt.load %b_ptrs, %mask_b : tensor<" << blockN << "x"
+     << blockK << "x" << ptrTy << ">\n";
+
+  // A: M x K -> M x 1 x K -> M x N x K.
+  os << "    %a_e = tt.expand_dims %a_tile {axis = 1 : i32} : tensor<" << blockM
+     << "x" << blockK << "xf64> -> tensor<" << blockM << "x1x" << blockK
+     << "xf64>\n";
+  os << "    %a_b = tt.broadcast %a_e : tensor<" << blockM << "x1x" << blockK
+     << "xf64> -> tensor<" << blockM << "x" << blockN << "x" << blockK
+     << "xf64>\n";
+
+  // B: N x K -> 1 x N x K -> M x N x K.
+  os << "    %b_e = tt.expand_dims %b_tile {axis = 0 : i32} : tensor<" << blockN
+     << "x" << blockK << "xf64> -> tensor<1x" << blockN << "x" << blockK
+     << "xf64>\n";
+  os << "    %b_b = tt.broadcast %b_e : tensor<1x" << blockN << "x" << blockK
+     << "xf64> -> tensor<" << blockM << "x" << blockN << "x" << blockK
+     << "xf64>\n";
+
+  os << "    %prod = arith.mulf %a_b, %b_b : tensor<" << blockM << "x" << blockN
+     << "x" << blockK << "xf64>\n";
+
+  // Reduce over K dimension.
+  os << "    %partial = \"tt.reduce\"(%prod) ({\n";
+  os << "    ^bb0(%lhs: f64, %rhs: f64):\n";
+  os << "      %r = arith.addf %lhs, %rhs : f64\n";
+  os << "      \"tt.reduce.return\"(%r) : (f64) -> ()\n";
+  os << "    }) {axis = 2 : i32} : (tensor<" << blockM << "x" << blockN << "x"
+     << blockK << "xf64>) -> tensor<" << blockM << "x" << blockN << "xf64>\n";
+
+  os << "    %acc_next = arith.addf %acc_body, %partial : tensor<" << blockM
+     << "x" << blockN << "xf64>\n";
+
+  os << "    scf.yield %acc_next : tensor<" << blockM << "x" << blockN
+     << "xf64>\n";
+
+  os << "  }\n";
+
+  // Store C(i,j), offset = i + j * n
+  os << "  %offs_m_e_c = tt.expand_dims %offs_m {axis = 1 : i32} : tensor<"
+     << blockM << "xi32> -> tensor<" << blockM << "x1xi32>\n";
+
+  os << "  %offs_n_e_c = tt.expand_dims %offs_n {axis = 0 : i32} : tensor<"
+     << blockN << "xi32> -> tensor<1x" << blockN << "xi32>\n";
+
+  os << "  %offs_m_b_c = tt.broadcast %offs_m_e_c : tensor<" << blockM
+     << "x1xi32> -> tensor<" << blockM << "x" << blockN << "xi32>\n";
+
+  os << "  %offs_n_b_c = tt.broadcast %offs_n_e_c : tensor<1x" << blockN
+     << "xi32> -> tensor<" << blockM << "x" << blockN << "xi32>\n";
+
+  os << "  %n_s_c = tt.splat %n : i32 -> tensor<" << blockM << "x" << blockN
+     << "xi32>\n";
+
+  os << "  %c_j_n = arith.muli %offs_n_b_c, %n_s_c : tensor<" << blockM << "x"
+     << blockN << "xi32>\n";
+
+  os << "  %c_offsets = arith.addi %offs_m_b_c, %c_j_n : tensor<" << blockM
+     << "x" << blockN << "xi32>\n";
+
+  os << "  %mask_m_e_c = tt.expand_dims %mask_m {axis = 1 : i32} : tensor<"
+     << blockM << "xi1> -> tensor<" << blockM << "x1xi1>\n";
+
+  os << "  %mask_n_e_c = tt.expand_dims %mask_n {axis = 0 : i32} : tensor<"
+     << blockN << "xi1> -> tensor<1x" << blockN << "xi1>\n";
+
+  os << "  %mask_m_b_c = tt.broadcast %mask_m_e_c : tensor<" << blockM
+     << "x1xi1> -> tensor<" << blockM << "x" << blockN << "xi1>\n";
+
+  os << "  %mask_n_b_c = tt.broadcast %mask_n_e_c : tensor<1x" << blockN
+     << "xi1> -> tensor<" << blockM << "x" << blockN << "xi1>\n";
+
+  os << "  %mask_c = arith.andi %mask_m_b_c, %mask_n_b_c : tensor<" << blockM
+     << "x" << blockN << "xi1>\n";
+
+  os << "  %c_base = tt.splat %c : " << ptrTy << " -> tensor<" << blockM << "x"
+     << blockN << "x" << ptrTy << ">\n";
+
+  os << "  %c_ptrs = tt.addptr %c_base, %c_offsets : tensor<" << blockM << "x"
+     << blockN << "x" << ptrTy << ">, tensor<" << blockM << "x" << blockN
+     << "xi32>\n";
+
+  os << "  tt.store %c_ptrs, %acc, %mask_c : tensor<" << blockM << "x" << blockN
+     << "x" << ptrTy << ">\n";
+
+  os << "  tt.return\n";
+  os << "}\n\n";
+}
+
+static void emitTritonMatMul2DF64FMA(const fir::fnacc::ElementwiseKernel &k,
+                                     int64_t blockM, int64_t blockN,
+                                     int64_t blockK, StringRef kernelName,
+                                     llvm::raw_ostream &os) {
   assert(k.elementType == fir::fnacc::ElementType::F64 &&
          "f64 matmul emitter requires f64 kernel");
 
@@ -937,8 +1195,8 @@ static void emitTritonMatMul2DF64(const fir::fnacc::ElementwiseKernel &k,
      << "xi32>\n";
 
   os << "  %zero = arith.constant 0.000000e+00 : f64\n";
-  os << "  %acc0 = tt.splat %zero : f64 -> tensor<" << blockM << "x"
-     << blockN << "xf64>\n";
+  os << "  %acc0 = tt.splat %zero : f64 -> tensor<" << blockM << "x" << blockN
+     << "xf64>\n";
 
   os << "  %c0_idx = arith.constant 0 : index\n";
   os << "  %bk_idx = arith.constant " << blockK << " : index\n";
@@ -963,8 +1221,8 @@ static void emitTritonMatMul2DF64(const fir::fnacc::ElementwiseKernel &k,
     // Scalar K mask for this unrolled K lane:
     //
     //   kk + q < k
-    os << "    %mask_k_scalar" << suffix
-       << " = arith.cmpi slt, %kk" << suffix << ", %k : i32\n";
+    os << "    %mask_k_scalar" << suffix << " = arith.cmpi slt, %kk" << suffix
+       << ", %k : i32\n";
 
     os << "    %mask_k_m" << suffix << " = tt.splat %mask_k_scalar" << suffix
        << " : i1 -> tensor<" << blockM << "xi1>\n";
@@ -1021,11 +1279,11 @@ static void emitTritonMatMul2DF64(const fir::fnacc::ElementwiseKernel &k,
 
     // Broadcast A(:, kk+q) and B(kk+q, :) to an M x N tile.
     os << "    %a_e" << suffix << " = tt.expand_dims %a_vec" << suffix
-       << " {axis = 1 : i32} : tensor<" << blockM
-       << "xf64> -> tensor<" << blockM << "x1xf64>\n";
+       << " {axis = 1 : i32} : tensor<" << blockM << "xf64> -> tensor<"
+       << blockM << "x1xf64>\n";
     os << "    %b_e" << suffix << " = tt.expand_dims %b_vec" << suffix
-       << " {axis = 0 : i32} : tensor<" << blockN
-       << "xf64> -> tensor<1x" << blockN << "xf64>\n";
+       << " {axis = 0 : i32} : tensor<" << blockN << "xf64> -> tensor<1x"
+       << blockN << "xf64>\n";
 
     os << "    %a_b" << suffix << " = tt.broadcast %a_e" << suffix
        << " : tensor<" << blockM << "x1xf64> -> tensor<" << blockM << "x"
@@ -1042,14 +1300,14 @@ static void emitTritonMatMul2DF64(const fir::fnacc::ElementwiseKernel &k,
     //
     // This avoids materialising tensor<MxNxKxf64> and avoids tt.reduce.
     os << "    " << accNext << " = math.fma %a_b" << suffix << ", %b_b"
-       << suffix << ", " << accPrev << " : tensor<" << blockM << "x"
-       << blockN << "xf64>\n";
+       << suffix << ", " << accPrev << " : tensor<" << blockM << "x" << blockN
+       << "xf64>\n";
 
     accPrev = accNext;
   }
 
-  os << "    scf.yield " << accPrev << " : tensor<" << blockM << "x"
-     << blockN << "xf64>\n";
+  os << "    scf.yield " << accPrev << " : tensor<" << blockM << "x" << blockN
+     << "xf64>\n";
 
   os << "  }\n";
 
@@ -1099,8 +1357,8 @@ static void emitTritonMatMul2DF64(const fir::fnacc::ElementwiseKernel &k,
      << blockN << "x" << ptrTy << ">, tensor<" << blockM << "x" << blockN
      << "xi32>\n";
 
-  os << "  tt.store %c_ptrs, %acc, %mask_c : tensor<" << blockM << "x"
-     << blockN << "x" << ptrTy << ">\n";
+  os << "  tt.store %c_ptrs, %acc, %mask_c : tensor<" << blockM << "x" << blockN
+     << "x" << ptrTy << ">\n";
 
   os << "  tt.return\n";
   os << "}\n\n";
@@ -1337,12 +1595,13 @@ struct FNACCLowerToTritonPass
 
   FNACCLowerToTritonPass(llvm::StringRef ttirOutput, llvm::StringRef jsonOutput,
                          int32_t numWarps, int32_t threadsPerWarp,
-                         int32_t numStages) {
+                         int32_t numStages, llvm::StringRef f64MatmulStrategy) {
     this->ttirOutput = ttirOutput.str();
     this->jsonOutput = jsonOutput.str();
     this->numWarps = numWarps;
     this->threadsPerWarp = threadsPerWarp;
     this->numStages = numStages;
+    this->f64MatmulStrategy = f64MatmulStrategy;
   }
 
   void runOnOperation() override {
@@ -1481,8 +1740,21 @@ struct FNACCLowerToTritonPass
                   : (k.elementType == fir::fnacc::ElementType::F64 ? 8 : 32);
 
           if (k.elementType == fir::fnacc::ElementType::F64) {
-            emitTritonMatMul2DF64(k, blockX, blockY, blockZ, kernelName,
-                                  ttirOs);
+            if (this->f64MatmulStrategy == "dot") {
+              emitTritonMatMul2DF64Dot(k, blockX, blockY, blockZ, kernelName,
+                                       ttirOs);
+            } else if (this->f64MatmulStrategy == "fma") {
+              emitTritonMatMul2DF64FMA(k, blockX, blockY, blockZ, kernelName,
+                                       ttirOs);
+            } else if (this->f64MatmulStrategy == "reduce") {
+              emitTritonMatMul2DF64Reduce(k, blockX, blockY, blockZ, kernelName,
+                                          ttirOs);
+            } else {
+              launchOp.emitError("unknown FNACC f64 matmul strategy: ")
+                  << this->f64MatmulStrategy;
+              failed = true;
+              return;
+            }
           } else {
             emitTritonMatMul2DF32(k, blockX, blockY, blockZ, kernelName,
                                   ttirOs);
@@ -1547,7 +1819,7 @@ std::unique_ptr<mlir::Pass> fir::fnacc::createFNACCLowerToTritonPass() {
 
 std::unique_ptr<mlir::Pass> fir::fnacc::createFNACCLowerToTritonPass(
     llvm::StringRef ttirOutput, llvm::StringRef jsonOutput, int32_t numWarps,
-    int32_t threadsPerWarp, int32_t numStages) {
+    int32_t threadsPerWarp, int32_t numStages, llvm::StringRef f64MatmulStrategy) {
   return std::make_unique<FNACCLowerToTritonPass>(
-      ttirOutput, jsonOutput, numWarps, threadsPerWarp, numStages);
+      ttirOutput, jsonOutput, numWarps, threadsPerWarp, numStages, f64MatmulStrategy);
 }

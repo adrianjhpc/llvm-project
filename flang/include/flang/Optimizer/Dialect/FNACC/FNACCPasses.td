@@ -65,7 +65,10 @@ def FNACCLowerToTriton : Pass<"fnacc-lower-to-triton", "mlir::ModuleOp"> {
            "Number of CUDA threads per warp">,
     Option<"numStages", "num-stages", "int32_t",
            "3",
-           "Number of Triton pipeline stages">
+           "Number of Triton pipeline stages">,
+    Option<"f64MatmulStrategy", "f64-matmul-strategy", "std::string",
+           "\"reduce\"",
+           "Strategy for f64 matmul lowering: reduce or fma">
   ];
 
   let dependentDialects = [

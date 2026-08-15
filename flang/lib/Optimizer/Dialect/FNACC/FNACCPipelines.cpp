@@ -34,6 +34,12 @@ struct FNACCPipelineOptions
   Option<int32_t> numStages{*this, "num-stages",
                             llvm::cl::desc("Number of Triton pipeline stages"),
                             llvm::cl::init(3)};
+
+  Option<std::string> f64MatmulStrategy{
+      *this, "f64-matmul-strategy",
+      llvm::cl::desc("Strategy for f64 matmul lowering: reduce or fma"),
+      llvm::cl::init("reduce")};
+
 };
 
 void buildFNACCPipeline(mlir::OpPassManager &pm,
@@ -42,7 +48,7 @@ void buildFNACCPipeline(mlir::OpPassManager &pm,
 
   pm.addPass(createFNACCLowerToTritonPass(
       options.ttirOutput, options.jsonOutput, options.numWarps,
-      options.threadsPerWarp, options.numStages));
+      options.threadsPerWarp, options.numStages, options.f64MatmulStrategy));
 
   pm.addPass(createFNACCLowerToRuntimePass());
 
