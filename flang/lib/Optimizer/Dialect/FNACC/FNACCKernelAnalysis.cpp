@@ -263,24 +263,40 @@ static fir::fnacc::ElementType getScalarRealRefElementType(Value memref) {
   return fir::fnacc::ElementType::Unknown;
 }
 
-static fir::fnacc::ElementType getRealArrayElementType(Value v) {
-  Type type = v.getType();
+static Type unwrapArrayStorageType(Type type) {
+  while (true) {
+    if (auto refTy = dyn_cast<fir::ReferenceType>(type)) {
+      type = refTy.getEleTy();
+      continue;
+    }
 
-  Type eleTy;
+    if (auto boxTy = dyn_cast<fir::BoxType>(type)) {
+      type = boxTy.getEleTy();
+      continue;
+    }
 
-  if (auto refTy = dyn_cast<fir::ReferenceType>(type)) {
-    auto arrTy = dyn_cast<fir::SequenceType>(refTy.getEleTy());
-    if (!arrTy)
-      return fir::fnacc::ElementType::Unknown;
-    eleTy = arrTy.getEleTy();
-  } else if (auto boxTy = dyn_cast<fir::BoxType>(type)) {
-    auto arrTy = dyn_cast<fir::SequenceType>(boxTy.getEleTy());
-    if (!arrTy)
-      return fir::fnacc::ElementType::Unknown;
-    eleTy = arrTy.getEleTy();
-  } else {
-    return fir::fnacc::ElementType::Unknown;
+    if (auto heapTy = dyn_cast<fir::HeapType>(type)) {
+      type = heapTy.getEleTy();
+      continue;
+    }
+
+    if (auto ptrTy = dyn_cast<fir::PointerType>(type)) {
+      type = ptrTy.getEleTy();
+      continue;
+    }
+
+    return type;
   }
+}
+
+static fir::fnacc::ElementType getRealArrayElementType(Value v) {
+  Type type = unwrapArrayStorageType(v.getType());
+  auto arrTy = dyn_cast<fir::SequenceType>(type);
+
+  if (!arrTy)
+    return fir::fnacc::ElementType::Unknown;
+
+  Type eleTy = arrTy.getEleTy();
 
   if (eleTy.isF32())
     return fir::fnacc::ElementType::F32;

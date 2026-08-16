@@ -17,9 +17,15 @@
 
 namespace {
 
-static std::recursive_mutex fnaccRuntimeMutex;
+// Embedded payload constructors can run before this translation unit's dynamic
+// initialization.  Construct the mutex on first use so registration is safe
+// regardless of final link order.
+static std::recursive_mutex &fnaccGetRuntimeMutex() {
+  static std::recursive_mutex mutex;
+  return mutex;
+}
 #define FNACC_RUNTIME_GUARD() \
-  std::lock_guard<std::recursive_mutex> fnaccRuntimeLock(fnaccRuntimeMutex)
+  std::lock_guard<std::recursive_mutex> fnaccRuntimeLock(fnaccGetRuntimeMutex())
 
 static void fnaccCudaCheck(
     CUresult result, const char *expr, const char *file, int line) {
@@ -601,12 +607,21 @@ struct FNACCKernelRegistry {
   std::unordered_map<void *, FNACCDeviceAllocation> deviceCache;
 };
 
-static std::vector<const char *> fnaccEmbeddedPtxData;
-static std::vector<std::size_t> fnaccEmbeddedPtxSize;
+struct FNACCEmbeddedKernelBundle {
+  std::vector<const char *> ptxData;
+  std::vector<std::size_t> ptxSize;
+  const char *jsonData = nullptr;
+  std::size_t jsonSize = 0;
+  bool registered = false;
+};
 
-static const char *fnaccEmbeddedJsonData = nullptr;
-static std::size_t fnaccEmbeddedJsonSize = 0;
-static bool fnaccEmbeddedBundleRegistered = false;
+// The generated bundle is registered from a constructor in another
+// translation unit.  A function-local static prevents that constructor from
+// writing into namespace-scope vectors before their constructors have run.
+static FNACCEmbeddedKernelBundle &fnaccGetEmbeddedKernelBundle() {
+  static FNACCEmbeddedKernelBundle bundle;
+  return bundle;
+}
 
 static FNACCKernelRegistry fnaccRegistry;
 
@@ -623,14 +638,15 @@ static bool fnaccDebugEnabled() {
 }
 
 static bool fnaccHasEmbeddedPtxBundle() {
-  if (fnaccEmbeddedPtxData.empty())
+  const FNACCEmbeddedKernelBundle &bundle = fnaccGetEmbeddedKernelBundle();
+  if (bundle.ptxData.empty())
     return false;
 
-  if (fnaccEmbeddedPtxData.size() != fnaccEmbeddedPtxSize.size())
+  if (bundle.ptxData.size() != bundle.ptxSize.size())
     return false;
 
-  for (std::size_t i = 0; i < fnaccEmbeddedPtxData.size(); ++i) {
-    if (!fnaccEmbeddedPtxData[i] || fnaccEmbeddedPtxSize[i] == 0)
+  for (std::size_t i = 0; i < bundle.ptxData.size(); ++i) {
+    if (!bundle.ptxData[i] || bundle.ptxSize[i] == 0)
       return false;
   }
 
@@ -643,13 +659,14 @@ static std::vector<std::string> fnaccGetPtxTextsFromEmbeddedBundle() {
   if (!fnaccHasEmbeddedPtxBundle())
     return result;
 
-  for (std::size_t i = 0; i < fnaccEmbeddedPtxData.size(); ++i) {
-    result.emplace_back(fnaccEmbeddedPtxData[i], fnaccEmbeddedPtxSize[i]);
+  const FNACCEmbeddedKernelBundle &bundle = fnaccGetEmbeddedKernelBundle();
+  for (std::size_t i = 0; i < bundle.ptxData.size(); ++i) {
+    result.emplace_back(bundle.ptxData[i], bundle.ptxSize[i]);
 
     if (fnaccDebugEnabled()) {
       std::fprintf(stderr,
           "FNACC: loading embedded PTX bundle entry %zu, bytes=%zu\n", i,
-          fnaccEmbeddedPtxSize[i]);
+          bundle.ptxSize[i]);
     }
   }
 
@@ -657,7 +674,8 @@ static std::vector<std::string> fnaccGetPtxTextsFromEmbeddedBundle() {
 }
 
 static bool fnaccHasEmbeddedJson() {
-  return fnaccEmbeddedJsonData && fnaccEmbeddedJsonSize > 0;
+  const FNACCEmbeddedKernelBundle &bundle = fnaccGetEmbeddedKernelBundle();
+  return bundle.jsonData && bundle.jsonSize > 0;
 }
 
 static std::string fnaccReadTextFile(const char *path) {
@@ -742,12 +760,13 @@ static std::string fnaccGetJsonText() {
   }
 
   if (fnaccHasEmbeddedJson()) {
+    const FNACCEmbeddedKernelBundle &bundle = fnaccGetEmbeddedKernelBundle();
     if (fnaccDebugEnabled()) {
-      std::fprintf(stderr, "FNACC: loading embedded JSON, bytes=%zu\n",
-          fnaccEmbeddedJsonSize);
+      std::fprintf(
+          stderr, "FNACC: loading embedded JSON, bytes=%zu\n", bundle.jsonSize);
     }
 
-    return std::string(fnaccEmbeddedJsonData, fnaccEmbeddedJsonSize);
+    return std::string(bundle.jsonData, bundle.jsonSize);
   }
 
   const char *fallback = "fnacc_kernels.json";
@@ -3442,7 +3461,8 @@ extern "C" void __fnacc_register_embedded_kernel_bundle(
     const char *const *ptxData, std::size_t const *ptxSizes,
     std::size_t ptxCount, const char *jsonData, std::size_t jsonSize) {
   FNACC_RUNTIME_GUARD();
-  if (fnaccEmbeddedBundleRegistered) {
+  FNACCEmbeddedKernelBundle &bundle = fnaccGetEmbeddedKernelBundle();
+  if (bundle.registered) {
     std::fprintf(stderr,
         "FNACC error: multiple embedded kernel bundles were registered. "
         "Compile all FNACC kernels as one bundle so kernel IDs stay unique.\n");
@@ -3452,27 +3472,25 @@ extern "C" void __fnacc_register_embedded_kernel_bundle(
     std::fprintf(stderr, "FNACC error: invalid embedded kernel bundle\n");
     std::abort();
   }
-  fnaccEmbeddedPtxData.clear();
-  fnaccEmbeddedPtxSize.clear();
-
   for (std::size_t i = 0; i < ptxCount; ++i) {
     if (!ptxData[i] || ptxSizes[i] == 0) {
       std::fprintf(stderr, "FNACC error: invalid embedded PTX entry %zu\n", i);
       std::abort();
     }
-    fnaccEmbeddedPtxData.push_back(ptxData[i]);
-    fnaccEmbeddedPtxSize.push_back(ptxSizes[i]);
   }
 
-  fnaccEmbeddedJsonData = jsonData;
-  fnaccEmbeddedJsonSize = jsonSize;
-  fnaccEmbeddedBundleRegistered = true;
+  bundle.ptxData.assign(ptxData, ptxData + ptxCount);
+  bundle.ptxSize.assign(ptxSizes, ptxSizes + ptxCount);
+  bundle.jsonData = jsonData;
+  bundle.jsonSize = jsonSize;
+  bundle.registered = true;
 }
 
 extern "C" void __fnacc_register_embedded_kernels(const char *ptxData,
     std::size_t ptxSize, const char *jsonData, std::size_t jsonSize) {
   FNACC_RUNTIME_GUARD();
-  if (fnaccEmbeddedBundleRegistered) {
+  FNACCEmbeddedKernelBundle &bundle = fnaccGetEmbeddedKernelBundle();
+  if (bundle.registered) {
     std::fprintf(stderr,
         "FNACC error: multiple embedded kernel bundles were registered\n");
     std::abort();
@@ -3481,13 +3499,9 @@ extern "C" void __fnacc_register_embedded_kernels(const char *ptxData,
     std::fprintf(stderr, "FNACC error: invalid embedded kernel bundle\n");
     std::abort();
   }
-  fnaccEmbeddedPtxData.clear();
-  fnaccEmbeddedPtxSize.clear();
-
-  fnaccEmbeddedPtxData.push_back(ptxData);
-  fnaccEmbeddedPtxSize.push_back(ptxSize);
-
-  fnaccEmbeddedJsonData = jsonData;
-  fnaccEmbeddedJsonSize = jsonSize;
-  fnaccEmbeddedBundleRegistered = true;
+  bundle.ptxData.assign(1, ptxData);
+  bundle.ptxSize.assign(1, ptxSize);
+  bundle.jsonData = jsonData;
+  bundle.jsonSize = jsonSize;
+  bundle.registered = true;
 }
