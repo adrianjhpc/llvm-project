@@ -51,7 +51,7 @@ static void fnaccCudaCheck(
   } while (false)
 
 static constexpr const char *FNACC_RUNTIME_BUILD_ID =
-    "FNACC_RUNTIME_BUILD_ID_matmul_cdiv_grid_v2";
+    "FNACC_RUNTIME_BUILD_ID_hierarchical_reduction_v3";
 
 static std::size_t fnaccCheckedMul(
     std::size_t a, std::size_t b, const char *what) {
@@ -581,6 +581,10 @@ struct FNACCKernelDesc {
   // Number of hidden pointer parameters appended by Triton/NVVM PTX.
   int32_t tritonHiddenPtrArgs = 2;
 
+  // Synthetic kernel used to recursively reduce a partials buffer. A negative
+  // value denotes older metadata that requires the host-side fallback.
+  int32_t reductionStageId = -1;
+
   // PACK metadata from JSON.
   std::vector<FNACCPackEntry> pack;
 
@@ -841,6 +845,7 @@ fnaccParseKernelDescsFromJson(const std::string &json) {
     jsonFindInt(objectText, "triton_hidden_ptr_args", desc.tritonHiddenPtrArgs);
 
     desc.pack = jsonParsePackEntries(objectText);
+    jsonFindInt(objectText, "reduction_stage_id", desc.reductionStageId);
 
     int64_t expectedCudaThreads =
         static_cast<int64_t>(desc.numWarps) * desc.threadsPerWarp;
@@ -1142,11 +1147,11 @@ static void fnaccEnsureInitialized() {
           "kind=%s rank=%d tile=(%d,%d,%d) "
           "warps=%d threads_per_warp=%d "
           "cuda_threads_per_cta=%d hidden_ptr_args=%d "
-          "ptx_index=%d ptx_file=%s\n",
+          "reduction_stage_id=%d ptx_index=%d ptx_file=%s\n",
           desc.id, desc.name.c_str(), desc.kind.c_str(), desc.rank, desc.tileX,
           desc.tileY, desc.tileZ, desc.numWarps, desc.threadsPerWarp,
-          desc.cudaThreadsPerCTA, desc.tritonHiddenPtrArgs, desc.ptxIndex,
-          desc.ptxFile.c_str());
+          desc.cudaThreadsPerCTA, desc.tritonHiddenPtrArgs,
+          desc.reductionStageId, desc.ptxIndex, desc.ptxFile.c_str());
     }
   }
 
@@ -3150,6 +3155,99 @@ extern "C" void __fnacc_launch_matmul_f64_v1(int32_t kernelId, int32_t blockX,
   fnaccReleaseDeviceArg(cDev);
 }
 
+template <typename Real>
+static bool fnaccFinalizeReductionOnDevice(const FNACCKernelDesc *primaryDesc,
+    CUdeviceptr dPartials, unsigned partialCount, Real *result) {
+  if (!primaryDesc || primaryDesc->reductionStageId < 0)
+    return false;
+
+  int32_t stageKernelId = primaryDesc->reductionStageId;
+  const FNACCKernelDesc *stageDesc = fnaccLookupKernelDesc(stageKernelId);
+
+  if (!stageDesc) {
+    std::fprintf(stderr,
+        "FNACC error: reduction kernel id %d references missing stage "
+        "kernel id %d\n",
+        primaryDesc->id, stageKernelId);
+    std::abort();
+  }
+
+  if (stageDesc->kind != "reduction_stage1d") {
+    std::fprintf(stderr,
+        "FNACC error: reduction stage kernel id %d has unexpected kind "
+        "'%s'\n",
+        stageKernelId, stageDesc->kind.c_str());
+    std::abort();
+  }
+
+  int32_t stageBlock = stageDesc->tileX;
+  if (stageBlock <= 1) {
+    std::fprintf(stderr,
+        "FNACC error: reduction stage kernel id %d requires tile_x > 1, "
+        "got %d\n",
+        stageKernelId, stageBlock);
+    std::abort();
+  }
+
+  CUfunction stageFn = getKernelFunction(stageKernelId);
+  unsigned stageCudaBlockX = fnaccCudaThreadsPerCTA(stageKernelId);
+
+  fnaccValidateSupportedHiddenPtrArgCount(stageKernelId);
+  fnaccValidateCudaBlockSize(stageFn, stageKernelId, stageCudaBlockX);
+
+  CUdeviceptr dScratch = 0;
+  CUdeviceptr current = dPartials;
+  CUdeviceptr next = 0;
+
+  if (partialCount > 1) {
+    unsigned scratchElements =
+        fnaccCdiv(static_cast<int32_t>(partialCount), stageBlock);
+    std::size_t scratchBytes =
+        fnaccCheckedMul(static_cast<std::size_t>(scratchElements), sizeof(Real),
+            "hierarchical reduction scratch buffer");
+    FNACC_CUDA_CHECK(cuMemAlloc(&dScratch, scratchBytes));
+    next = dScratch;
+  }
+
+  while (partialCount > 1) {
+    int32_t stageExtent = static_cast<int32_t>(partialCount);
+    unsigned outputCount = fnaccCdiv(stageExtent, stageBlock);
+    FNACCHiddenTritonArgs hidden;
+
+    void *args[] = {
+        &current,
+        &next,
+        &stageExtent,
+        &hidden.hidden0,
+        &hidden.hidden1,
+    };
+
+    if (fnaccDebugEnabled()) {
+      std::fprintf(stderr,
+          "FNACC: launch reduction stage kernel id=%d input_count=%u "
+          "output_count=%u tile=%d cuda_block=%u\n",
+          stageKernelId, partialCount, outputCount, stageBlock,
+          stageCudaBlockX);
+    }
+
+    FNACC_CUDA_CHECK(cuLaunchKernel(stageFn, outputCount, 1, 1, stageCudaBlockX,
+        1, 1, 0, nullptr, args, nullptr));
+
+    CUdeviceptr oldCurrent = current;
+    current = next;
+    next = oldCurrent;
+    partialCount = outputCount;
+  }
+
+  FNACC_CUDA_CHECK(cuCtxSynchronize());
+  FNACC_CUDA_CHECK(cuMemcpyDtoH(result, current, sizeof(Real)));
+
+  if (dScratch)
+    FNACC_CUDA_CHECK(cuMemFree(dScratch));
+
+  return true;
+}
+
 extern "C" void __fnacc_launch_reduce_f32_v1(int32_t kernelId, int32_t blockX,
     int32_t numReadArrays, float *read0, float *read1, float *result,
     int32_t extentX) {
@@ -3228,16 +3326,20 @@ extern "C" void __fnacc_launch_reduce_f32_v1(int32_t kernelId, int32_t blockX,
   FNACC_CUDA_CHECK(cuLaunchKernel(
       fn, gridX, 1, 1, cudaBlockX, 1, 1, 0, nullptr, args, nullptr));
 
-  FNACC_CUDA_CHECK(cuCtxSynchronize());
+  if (!fnaccFinalizeReductionOnDevice<float>(desc, dPartials, gridX, result)) {
+    // Compatibility path for objects emitted before reduction_stage_id was
+    // added to the JSON descriptor.
+    FNACC_CUDA_CHECK(cuCtxSynchronize());
 
-  std::vector<float> partials(gridX);
-  FNACC_CUDA_CHECK(cuMemcpyDtoH(partials.data(), dPartials, partialBytes));
+    std::vector<float> partials(gridX);
+    FNACC_CUDA_CHECK(cuMemcpyDtoH(partials.data(), dPartials, partialBytes));
 
-  double sum = 0.0;
-  for (float v : partials)
-    sum += static_cast<double>(v);
+    double sum = 0.0;
+    for (float v : partials)
+      sum += static_cast<double>(v);
 
-  *result = static_cast<float>(sum);
+    *result = static_cast<float>(sum);
+  }
 
   FNACC_CUDA_CHECK(cuMemFree(dPartials));
 
@@ -3324,16 +3426,20 @@ extern "C" void __fnacc_launch_reduce_f64_v1(int32_t kernelId, int32_t blockX,
   FNACC_CUDA_CHECK(cuLaunchKernel(
       fn, gridX, 1, 1, cudaBlockX, 1, 1, 0, nullptr, args, nullptr));
 
-  FNACC_CUDA_CHECK(cuCtxSynchronize());
+  if (!fnaccFinalizeReductionOnDevice<double>(desc, dPartials, gridX, result)) {
+    // Compatibility path for objects emitted before reduction_stage_id was
+    // added to the JSON descriptor.
+    FNACC_CUDA_CHECK(cuCtxSynchronize());
 
-  std::vector<double> partials(gridX);
-  FNACC_CUDA_CHECK(cuMemcpyDtoH(partials.data(), dPartials, partialBytes));
+    std::vector<double> partials(gridX);
+    FNACC_CUDA_CHECK(cuMemcpyDtoH(partials.data(), dPartials, partialBytes));
 
-  double sum = 0.0f;
-  for (double v : partials)
-    sum += v;
+    double sum = 0.0;
+    for (double v : partials)
+      sum += v;
 
-  *result = sum;
+    *result = sum;
+  }
 
   FNACC_CUDA_CHECK(cuMemFree(dPartials));
 

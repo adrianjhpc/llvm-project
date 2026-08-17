@@ -11,6 +11,7 @@
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/raw_ostream.h"
 
+#include <algorithm>
 #include <cassert>
 #include <string>
 
@@ -443,6 +444,56 @@ static void emitTritonReductionSum1D(const fir::fnacc::ElementwiseKernel &k,
   os << "}\n\n";
 }
 
+/// Emit the generic follow-up kernel used by hierarchical reductions.
+/// Each program reduces one contiguous block of the previous stage's partial
+/// sums and writes one value for the next stage. The runtime repeatedly invokes
+/// this kernel until only a single device value remains.
+static void emitTritonReductionStage1D(fir::fnacc::ElementType type,
+                                       int64_t block, StringRef kernelName,
+                                       llvm::raw_ostream &os) {
+  std::string ptrTy = ptrType(type);
+  std::string elemTy = ttElementType(type).str();
+
+  os << "tt.func @" << kernelName << "(%input: " << ptrTy
+     << ", %output: " << ptrTy
+     << ", %n: i32) attributes {noinline = false} {\n";
+
+  os << "  %pid  = tt.get_program_id x : i32\n";
+  os << "  %blk  = arith.constant " << block << " : i32\n";
+  os << "  %base = arith.muli %pid, %blk : i32\n";
+  os << "  %rng  = tt.make_range {start = 0 : i32, end = " << block
+     << " : i32} : tensor<" << block << "xi32>\n";
+  os << "  %base_s = tt.splat %base : i32 -> tensor<" << block << "xi32>\n";
+  os << "  %offs = arith.addi %base_s, %rng : tensor<" << block << "xi32>\n";
+  os << "  %n_s = tt.splat %n : i32 -> tensor<" << block << "xi32>\n";
+  os << "  %mask = arith.cmpi slt, %offs, %n_s : tensor<" << block << "xi32>\n";
+
+  os << "  %input_s = tt.splat %input : " << ptrTy << " -> tensor<" << block
+     << "x" << ptrTy << ">\n";
+  os << "  %input_ptrs = tt.addptr %input_s, %offs : tensor<" << block << "x"
+     << ptrTy << ">, tensor<" << block << "xi32>\n";
+  os << "  %vals = tt.load %input_ptrs, %mask : tensor<" << block << "x"
+     << ptrTy << ">\n";
+
+  os << "  %zero = arith.constant 0.000000e+00 : " << elemTy << "\n";
+  os << "  %zero_s = tt.splat %zero : " << elemTy << " -> tensor<" << block
+     << "x" << elemTy << ">\n";
+  os << "  %safe = arith.select %mask, %vals, %zero_s : tensor<" << block
+     << "xi1>, tensor<" << block << "x" << elemTy << ">\n";
+
+  os << "  %sum = \"tt.reduce\"(%safe) ({\n";
+  os << "  ^bb0(%lhs: " << elemTy << ", %rhs: " << elemTy << "):\n";
+  os << "    %r = arith.addf %lhs, %rhs : " << elemTy << "\n";
+  os << "    \"tt.reduce.return\"(%r) : (" << elemTy << ") -> ()\n";
+  os << "  }) {axis = 0 : i32} : (tensor<" << block << "x" << elemTy << ">) -> "
+     << elemTy << "\n";
+
+  os << "  %outp = tt.addptr %output, %pid : " << ptrTy << ", i32\n";
+  os << "  tt.store %outp, %sum : " << ptrTy << "\n";
+  os << "  tt.return\n";
+  os << "}\n\n";
+}
+
 static void emitTriton2D(const fir::fnacc::ElementwiseKernel &k, int64_t blockX,
                          int64_t blockY, StringRef kernelName,
                          llvm::raw_ostream &os) {
@@ -513,7 +564,8 @@ static void emitTritonReductionDot1D(const fir::fnacc::ElementwiseKernel &k,
   //   %partials one output scalar per Triton program
   //   %n        number of elements
   //
-  // Runtime performs the final host-side reduction over %partials.
+  // Runtime recursively reduces %partials on the GPU and copies back only the
+  // final scalar.
   //
   // NOTE: the textual tt.reduce form is Triton-version-sensitive. If your
   // Triton build uses a slightly different printed form, adjust this block
@@ -1338,7 +1390,8 @@ static void emitJsonDescriptor(
     int64_t blockX, int64_t blockY, int64_t blockZ, int32_t kernelId,
     int32_t ptxIndex, llvm::StringRef kernelName, int32_t tritonNumWarps,
     int32_t tritonThreadsPerWarp, int32_t tritonNumStages,
-    int32_t cudaThreadsPerCTA, llvm::raw_ostream &os, bool &firstKernel) {
+    int32_t cudaThreadsPerCTA, int32_t reductionStageId, llvm::raw_ostream &os,
+    bool &firstKernel) {
 
   if (!firstKernel)
     os << ",\n";
@@ -1377,6 +1430,9 @@ static void emitJsonDescriptor(
   os << "      \"cuda_threads_per_cta\": " << cudaThreadsPerCTA << ",\n";
   os << "      \"triton_hidden_ptr_args\": " << kTritonHiddenPtrArgs << ",\n";
 
+  if (reductionStageId >= 0)
+    os << "      \"reduction_stage_id\": " << reductionStageId << ",\n";
+
   if (k.rank == 2) {
     os << "      \"grid\": [\"cdiv(extent_x, tile_x)\", "
        << "\"cdiv(extent_y, tile_y)\", \"1\"],\n";
@@ -1402,8 +1458,8 @@ static void emitJsonDescriptor(
     //     read0, read1, partials, extent_x
     //
     // The final scalar result is not a Triton kernel parameter. Runtime
-    // lowering passes the scalar to the host runtime, and the runtime performs
-    // the final host-side reduction over the partials buffer.
+    // lowering passes the scalar to the host runtime, which recursively
+    // reduces the partials buffer with the reduction_stage_id kernel.
     for (unsigned i = 0; i < k.readArrays.size(); ++i) {
       if (i != 0)
         os << ",\n";
@@ -1520,6 +1576,46 @@ static void emitJsonDescriptor(
   }
 
   os << "]\n";
+  os << "    }";
+}
+
+static void emitJsonReductionStageDescriptor(
+    fir::fnacc::ElementType type, int64_t block, int32_t kernelId,
+    int32_t ptxIndex, llvm::StringRef kernelName, int32_t tritonNumWarps,
+    int32_t tritonThreadsPerWarp, int32_t tritonNumStages,
+    int32_t cudaThreadsPerCTA, llvm::raw_ostream &os, bool &firstKernel) {
+  if (!firstKernel)
+    os << ",\n";
+  firstKernel = false;
+
+  std::string ptrJsonTy = jsonPtrType(type);
+
+  os << "    {\n";
+  os << "      \"id\": " << kernelId << ",\n";
+  os << "      \"name\": \"" << kernelName << "\",\n";
+  os << "      \"ptx_index\": " << ptxIndex << ",\n";
+  os << "      \"ptx_file\": \"" << kernelName << ".ptx\",\n";
+  os << "      \"kind\": \"reduction_stage1d\",\n";
+  os << "      \"rank\": 1,\n";
+  os << "      \"tile\": [" << block << ", 1, 1],\n";
+  os << "      \"num_warps\": " << tritonNumWarps << ",\n";
+  os << "      \"threads_per_warp\": " << tritonThreadsPerWarp << ",\n";
+  os << "      \"num_ctas\": 1,\n";
+  os << "      \"num_stages\": " << tritonNumStages << ",\n";
+  os << "      \"cuda_threads_per_cta\": " << cudaThreadsPerCTA << ",\n";
+  os << "      \"triton_hidden_ptr_args\": " << kTritonHiddenPtrArgs << ",\n";
+  os << "      \"grid\": [\"cdiv(extent_x, tile_x)\", \"1\", \"1\"],\n";
+  os << "      \"params\": [\n";
+  os << "        {\"slot\": 0, \"role\": \"read\", "
+        "\"name\": \"input\", \"type\": \""
+     << ptrJsonTy << "\"},\n";
+  os << "        {\"slot\": 1, \"role\": \"partials\", "
+        "\"name\": \"output\", \"type\": \""
+     << ptrJsonTy << "\"},\n";
+  os << "        {\"slot\": 2, \"role\": \"extent_x\", "
+        "\"name\": \"extent_x\", \"type\": \"i32\"}\n";
+  os << "      ],\n";
+  os << "      \"pack\": []\n";
   os << "    }";
 }
 
@@ -1649,6 +1745,13 @@ struct FNACCLowerToTritonPass
     bool failed = false;
 
     int32_t emittedPtxIndex = 0;
+    int32_t nextSyntheticKernelId = 0;
+    int32_t scanFallbackId = 0;
+
+    module.walk([&](fir::fnacc::LaunchOp launchOp) {
+      int32_t kernelId = getKernelId(launchOp, scanFallbackId++);
+      nextSyntheticKernelId = std::max(nextSyntheticKernelId, kernelId + 1);
+    });
 
     module.walk([&](fir::fnacc::LaunchOp launchOp) {
       if (failed)
@@ -1666,6 +1769,12 @@ struct FNACCLowerToTritonPass
 
       int32_t kernelId = getKernelId(launchOp, fallbackId);
       std::string kernelName = getKernelName(launchOp, kernelId);
+
+      bool isReduction =
+          k.kind == fir::fnacc::ElementwiseKernelKind::ReductionSum1D ||
+          k.kind == fir::fnacc::ElementwiseKernelKind::ReductionDot1D;
+      int32_t reductionStageId = isReduction ? nextSyntheticKernelId++ : -1;
+      std::string reductionStageName = kernelName + "_reduce_stage";
 
       llvm::ArrayRef<int64_t> tiles = launchOp.getTileSizes();
 
@@ -1730,15 +1839,29 @@ struct FNACCLowerToTritonPass
         }
       }
 
+      if (isReduction) {
+        emitTritonReductionStage1D(k.elementType, blockX, reductionStageName,
+                                   ttirOs);
+      }
+
       int32_t kernelNumWarps = getKernelNumWarps(k, tritonNumWarps);
       int32_t kernelCudaThreadsPerCTA = kernelNumWarps * tritonThreadsPerWarp;
 
-      emitJsonDescriptor(launchOp, k, blockX, blockY, blockZ, kernelId,
-                         emittedPtxIndex, kernelName, kernelNumWarps,
-                         tritonThreadsPerWarp, tritonNumStages,
-                         kernelCudaThreadsPerCTA, jsonOs, firstKernel);
+      emitJsonDescriptor(
+          launchOp, k, blockX, blockY, blockZ, kernelId, emittedPtxIndex,
+          kernelName, kernelNumWarps, tritonThreadsPerWarp, tritonNumStages,
+          kernelCudaThreadsPerCTA, reductionStageId, jsonOs, firstKernel);
 
       ++emittedPtxIndex;
+
+      if (isReduction) {
+        emitJsonReductionStageDescriptor(
+            k.elementType, blockX, reductionStageId, emittedPtxIndex,
+            reductionStageName, kernelNumWarps, tritonThreadsPerWarp,
+            tritonNumStages, kernelCudaThreadsPerCTA, jsonOs, firstKernel);
+        ++emittedPtxIndex;
+      }
+
       ++fallbackId;
     });
 

@@ -33,9 +33,19 @@ end subroutine
 ! TTIR: tt.reduce
 ! TTIR: tt.store
 
+! TTIR-LABEL: tt.func @fnacc_kernel_0_reduce_stage
+! TTIR-SAME: %input: !tt.ptr<f32>
+! TTIR-SAME: %output: !tt.ptr<f32>
+! TTIR-SAME: %n: i32
+! TTIR: tt.load
+! TTIR: tt.reduce
+! TTIR: tt.store
+
 ! JSON: "fnacc_schema_version": 1
 ! JSON-DAG: "kind": "reduction_sum1d"
+! JSON-DAG: "reduction_stage_id": 1
 ! JSON-DAG: "rank": 1
 ! JSON-DAG: "tile": [256, 1, 1]
 ! JSON-DAG: "role": "partials"
-
+! JSON-DAG: "name": "fnacc_kernel_0_reduce_stage"
+! JSON-DAG: "kind": "reduction_stage1d"
