@@ -16,7 +16,12 @@
 
 namespace fir::fnacc {
 
-enum class ElementwiseExtentSourceKind { Unknown, Value, LoadI32Ref, BoxDim };
+enum class ElementwiseExtentSourceKind {
+  Unknown,
+  Value,
+  LoadIntegerRef,
+  BoxDim
+};
 
 struct ElementwiseExtentSource {
   ElementwiseExtentSourceKind kind = ElementwiseExtentSourceKind::Unknown;
@@ -26,9 +31,9 @@ struct ElementwiseExtentSource {
   // Value:
   //   An SSA value usable directly as an extent.
   //
-  // LoadI32Ref:
-  //   An !fir.ref<i32> or equivalent scalar reference. Runtime lowering will
-  //   emit fir.load outside the launch.
+  // LoadIntegerRef:
+  //   An !fir.ref<iN> or equivalent scalar reference. Runtime lowering will
+  //   emit fir.load outside the launch and convert the extent to i32.
   //
   // BoxDim:
   //   A !fir.box<!fir.array<...>>. Runtime lowering will emit fir.box_dims

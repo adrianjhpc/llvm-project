@@ -36,7 +36,48 @@ static Value stripFirConvert(Value v) {
   return v;
 }
 
-static std::optional<Value> getI32RefFromLoadLike(Value v) {
+/// Return a runtime-visible array base for a reduction.
+///
+/// Flang commonly lowers an allocatable array access inside fnacc.launch as:
+///
+///   %box = fir.load %descriptor
+///   %addr = fir.box_addr %box
+///   %element = fir.array_coor %addr ...
+///
+/// `%addr` is local to the launch region and becomes invalid when runtime
+/// lowering erases that region.  The descriptor reference is the stable host
+/// value from which runtime lowering can rematerialize the load and box_addr.
+static std::optional<Value>
+getRuntimeVisibleReductionArrayBase(fir::fnacc::LaunchOp launchOp,
+                                    Value arrayBase) {
+  Value original = stripFirConvert(arrayBase);
+  Operation *originalDef = original.getDefiningOp();
+
+  if (!originalDef || !launchOp->isProperAncestor(originalDef))
+    return original;
+
+  auto boxAddr = original.getDefiningOp<fir::BoxAddrOp>();
+  if (!boxAddr)
+    return std::nullopt;
+
+  Value box = stripFirConvert(boxAddr->getOperand(0));
+  auto load = box.getDefiningOp<fir::LoadOp>();
+  if (!load)
+    return std::nullopt;
+
+  Value descriptorRef = stripFirConvert(load.getMemref());
+  auto refTy = dyn_cast<fir::ReferenceType>(descriptorRef.getType());
+  if (!refTy || !isa<fir::BoxType>(refTy.getEleTy()))
+    return std::nullopt;
+
+  Operation *descriptorDef = descriptorRef.getDefiningOp();
+  if (!descriptorDef || launchOp->isProperAncestor(descriptorDef))
+    return std::nullopt;
+
+  return descriptorRef;
+}
+
+static std::optional<Value> getIntegerRefFromLoadLike(Value v) {
   while (auto cvt = v.getDefiningOp<fir::ConvertOp>())
     v = cvt.getValue();
 
@@ -50,7 +91,9 @@ static std::optional<Value> getI32RefFromLoadLike(Value v) {
   if (!refTy)
     return std::nullopt;
 
-  if (!refTy.getEleTy().isInteger(32))
+  Type elementType = refTy.getEleTy();
+  if (!elementType.isInteger(8) && !elementType.isInteger(16) &&
+      !elementType.isInteger(32) && !elementType.isInteger(64))
     return std::nullopt;
 
   return memref;
@@ -101,9 +144,9 @@ static fir::fnacc::ElementwiseExtentSource
 getLoopExtentSource(fir::DoLoopOp loop) {
   Value ub = loop.getUpperBound();
 
-  if (auto ref = getI32RefFromLoadLike(ub)) {
+  if (auto ref = getIntegerRefFromLoadLike(ub)) {
     fir::fnacc::ElementwiseExtentSource source;
-    source.kind = fir::fnacc::ElementwiseExtentSourceKind::LoadI32Ref;
+    source.kind = fir::fnacc::ElementwiseExtentSourceKind::LoadIntegerRef;
     source.value = *ref;
     return source;
   }
@@ -901,7 +944,7 @@ static bool allReductionOpsAreAdd(fir::fnacc::LaunchOp launchOp) {
 }
 
 static bool collectReductionArrayLoads1D(
-    fir::DoLoopOp loop, Value indMemref,
+    fir::fnacc::LaunchOp launchOp, fir::DoLoopOp loop, Value indMemref,
     llvm::SmallVectorImpl<ReductionArrayLoadInfo> &loads, std::string &reason) {
   Block *body = loop.getBody();
 
@@ -928,12 +971,18 @@ static bool collectReductionArrayLoads1D(
       return false;
     }
 
-    Value base = ac.getMemref();
+    std::optional<Value> base =
+        getRuntimeVisibleReductionArrayBase(launchOp, ac.getMemref());
+    if (!base) {
+      reason = "reduction array address cannot be materialized outside "
+               "fnacc.launch";
+      return false;
+    }
 
     for (Operation *user : ac.getResult().getUsers()) {
       if (auto load = dyn_cast<fir::LoadOp>(user)) {
         ReductionArrayLoadInfo info;
-        info.arrayBase = base;
+        info.arrayBase = *base;
         info.loadedValue = load.getResult();
         loads.push_back(info);
       } else {
@@ -1152,7 +1201,7 @@ recognizeReduction1D(fir::fnacc::LaunchOp launchOp) {
   llvm::SmallVector<ReductionArrayLoadInfo> loads;
   std::string reason;
 
-  if (!collectReductionArrayLoads1D(loop, indMemref, loads, reason))
+  if (!collectReductionArrayLoads1D(launchOp, loop, indMemref, loads, reason))
     return fail(loop.getOperation(), reason);
 
   fir::StoreOp reductionStore;

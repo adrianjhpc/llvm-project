@@ -2,27 +2,24 @@
 ! RUN: fir-opt --fnacc-pipeline="ttir-output=%t.ttir json-output=%t.json" %t.fir -o %t.host.fir
 ! RUN: FileCheck %s --check-prefix=HOST --input-file=%t.host.fir
 ! RUN: FileCheck %s --check-prefix=TTIR --input-file=%t.ttir
-! RUN: FileCheck %s --check-prefix=JSON --input-file=%t.json
 ! RUN: python3 -m json.tool %t.json > /dev/null
 
-subroutine fnacc_dot_reduce_allocatable_f64(n, a, b, sum)
+subroutine fnacc_add_allocatable_f64(n, a, b, c)
   use, intrinsic :: iso_fortran_env, only : int64, real64
   integer(kind=int64), intent(in) :: n
   real(kind=real64), allocatable, intent(in) :: a(:), b(:)
-  real(kind=real64), intent(out) :: sum
+  real(kind=real64), allocatable, intent(inout) :: c(:)
   integer(kind=int64) :: i
 
-  sum = 0.0_real64
-
-  !$fnacc parallel tile(256) reduction(+:sum)
+  !$fnacc parallel tile(256)
   do i = 1, n
-    sum = sum + a(i) * b(i)
+    c(i) = a(i) + b(i)
   end do
 end subroutine
 
-! HOST-DAG: func.func private @__fnacc_launch_reduce_f64_v1
+! HOST-DAG: func.func private @__fnacc_launch_f64_v1
 
-! HOST-LABEL: func.func @_QPfnacc_dot_reduce_allocatable_f64
+! HOST-LABEL: func.func @_QPfnacc_add_allocatable_f64
 ! HOST-NOT: fnacc.launch
 ! HOST: %[[N64:.*]] = fir.load {{.*}} : !fir.ref<i64>
 ! HOST: %[[N32:.*]] = fir.convert %[[N64]] : (i64) -> i32
@@ -30,20 +27,16 @@ end subroutine
 ! HOST: %[[A_ADDR:.*]] = fir.box_addr %[[A_BOX]] : (!fir.box<!fir.heap<!fir.array<?xf64>>>) -> !fir.heap<!fir.array<?xf64>>
 ! HOST: %[[B_BOX:.*]] = fir.load {{.*}} : !fir.ref<!fir.box<!fir.heap<!fir.array<?xf64>>>>
 ! HOST: %[[B_ADDR:.*]] = fir.box_addr %[[B_BOX]] : (!fir.box<!fir.heap<!fir.array<?xf64>>>) -> !fir.heap<!fir.array<?xf64>>
-! HOST: call @__fnacc_launch_reduce_f64_v1
+! HOST: %[[C_BOX:.*]] = fir.load {{.*}} : !fir.ref<!fir.box<!fir.heap<!fir.array<?xf64>>>>
+! HOST: %[[C_ADDR:.*]] = fir.box_addr %[[C_BOX]] : (!fir.box<!fir.heap<!fir.array<?xf64>>>) -> !fir.heap<!fir.array<?xf64>>
+! HOST: call @__fnacc_launch_f64_v1
 ! HOST-NOT: fnacc.launch
 
 ! TTIR-LABEL: tt.func @fnacc_kernel_0
 ! TTIR-SAME: %a: !tt.ptr<f64>
 ! TTIR-SAME: %b: !tt.ptr<f64>
-! TTIR-SAME: %partials: !tt.ptr<f64>
+! TTIR-SAME: %c: !tt.ptr<f64>
 ! TTIR-SAME: %n: i32
-! TTIR: arith.mulf
+! TTIR: arith.addf
 ! TTIR-SAME: f64
-! TTIR: tt.reduce
 ! TTIR: tt.store
-
-! JSON: "fnacc_schema_version": 1
-! JSON-DAG: "kind": "reduction_dot1d"
-! JSON-DAG: "type": "ptr<f64>"
-! JSON-DAG: "role": "partials"

@@ -119,10 +119,34 @@ static Type getI8RefType(OpBuilder &builder) {
   return fir::ReferenceType::get(builder.getI8Type());
 }
 
+static std::optional<fir::BoxType> getBoxTypeFromBoxLike(Type type) {
+  if (auto boxTy = dyn_cast<fir::BoxType>(type))
+    return boxTy;
+
+  if (auto refTy = dyn_cast<fir::ReferenceType>(type)) {
+    if (auto boxTy = dyn_cast<fir::BoxType>(refTy.getEleTy()))
+      return boxTy;
+  }
+
+  return std::nullopt;
+}
+
+static Value loadBoxIfNeeded(OpBuilder &builder, Location loc, Value value) {
+  auto refTy = dyn_cast<fir::ReferenceType>(value.getType());
+  if (refTy && isa<fir::BoxType>(refTy.getEleTy()))
+    return fir::LoadOp::create(builder, loc, value);
+
+  return value;
+}
+
 static Value getAddressOfBoxIfNeeded(OpBuilder &builder, Location loc,
                                      Value value) {
+  value = loadBoxIfNeeded(builder, loc, value);
+
   if (auto boxTy = dyn_cast<fir::BoxType>(value.getType())) {
-    Type addrTy = fir::ReferenceType::get(boxTy.getEleTy());
+    Type addrTy = boxTy.getEleTy();
+    if (!isa<fir::HeapType, fir::PointerType>(addrTy))
+      addrTy = fir::ReferenceType::get(addrTy);
     return fir::BoxAddrOp::create(builder, loc, addrTy, value);
   }
 
@@ -163,18 +187,92 @@ static Value convertToI32(OpBuilder &builder, Location loc, Value value) {
   return fir::ConvertOp::create(builder, loc, builder.getI32Type(), value);
 }
 
+static bool isDefinedInsideLaunch(fir::fnacc::LaunchOp launchOp, Value value) {
+  if (Operation *definingOp = value.getDefiningOp())
+    return launchOp->isProperAncestor(definingOp);
+
+  auto blockArgument = dyn_cast<BlockArgument>(value);
+  if (!blockArgument)
+    return false;
+
+  Operation *parentOp = blockArgument.getOwner()->getParentOp();
+  return parentOp && (parentOp == launchOp.getOperation() ||
+                      launchOp->isProperAncestor(parentOp));
+}
+
+static Value stripLaunchLocalFirConverts(fir::fnacc::LaunchOp launchOp,
+                                         Value value) {
+  while (auto convert = value.getDefiningOp<fir::ConvertOp>()) {
+    if (!launchOp->isProperAncestor(convert.getOperation()))
+      break;
+    value = convert.getValue();
+  }
+
+  return value;
+}
+
+/// Return an array-like value that remains valid after `launchOp` is erased.
+///
+/// Kernel analysis deliberately retains the exact FIR array base used inside
+/// fnacc.launch. For allocatables, that base is commonly a launch-local
+/// fir.box_addr(fir.load(%descriptor)). Runtime lowering must rematerialize
+/// that chain outside the launch instead of retaining an operand owned by the
+/// region that it is about to erase.
+static std::optional<Value>
+getRuntimeVisibleArrayLike(fir::fnacc::LaunchOp launchOp, Value arrayLike) {
+  if (!arrayLike)
+    return std::nullopt;
+
+  arrayLike = stripLaunchLocalFirConverts(launchOp, arrayLike);
+  if (!isDefinedInsideLaunch(launchOp, arrayLike))
+    return arrayLike;
+
+  auto boxAddr = arrayLike.getDefiningOp<fir::BoxAddrOp>();
+  if (!boxAddr)
+    return std::nullopt;
+
+  Value box = stripLaunchLocalFirConverts(launchOp, boxAddr->getOperand(0));
+  if (!isDefinedInsideLaunch(launchOp, box))
+    return box;
+
+  auto load = box.getDefiningOp<fir::LoadOp>();
+  if (!load)
+    return std::nullopt;
+
+  Value descriptorRef = stripLaunchLocalFirConverts(launchOp, load.getMemref());
+  if (isDefinedInsideLaunch(launchOp, descriptorRef))
+    return std::nullopt;
+
+  auto refTy = dyn_cast<fir::ReferenceType>(descriptorRef.getType());
+  if (!refTy || !isa<fir::BoxType>(refTy.getEleTy()))
+    return std::nullopt;
+
+  return descriptorRef;
+}
+
 static Value
 materializeExtentValue(OpBuilder &builder, Location loc,
+                       fir::fnacc::LaunchOp launchOp,
                        const fir::fnacc::ElementwiseExtentSource &source) {
   using Kind = fir::fnacc::ElementwiseExtentSourceKind;
 
   switch (source.kind) {
-  case Kind::LoadI32Ref: {
+  case Kind::LoadIntegerRef: {
+    if (isDefinedInsideLaunch(launchOp, source.value)) {
+      launchOp.emitError(
+          "FNACC loop extent reference is defined inside fnacc.launch");
+      return {};
+    }
     Value loaded = fir::LoadOp::create(builder, loc, source.value);
     return convertToI32(builder, loc, loaded);
   }
 
   case Kind::BoxDim: {
+    if (isDefinedInsideLaunch(launchOp, source.value)) {
+      launchOp.emitError(
+          "FNACC loop extent descriptor is defined inside fnacc.launch");
+      return {};
+    }
     Value dim = arith::ConstantIndexOp::create(builder, loc, source.dim);
 
     // fir.box_dims returns lower bound, extent, stride.
@@ -185,6 +283,29 @@ materializeExtentValue(OpBuilder &builder, Location loc,
   }
 
   case Kind::Value:
+    if (isDefinedInsideLaunch(launchOp, source.value)) {
+      Value value = stripLaunchLocalFirConverts(launchOp, source.value);
+      if (auto load = value.getDefiningOp<fir::LoadOp>()) {
+        Value memref = stripLaunchLocalFirConverts(launchOp, load.getMemref());
+        auto refTy = dyn_cast<fir::ReferenceType>(memref.getType());
+        if (refTy) {
+          Type elementType = refTy.getEleTy();
+          bool supportedInteger =
+              elementType.isInteger(8) || elementType.isInteger(16) ||
+              elementType.isInteger(32) || elementType.isInteger(64);
+
+          if (!isDefinedInsideLaunch(launchOp, memref) && supportedInteger) {
+            Value loaded = fir::LoadOp::create(builder, loc, memref);
+            return convertToI32(builder, loc, loaded);
+          }
+        }
+      }
+
+      launchOp.emitError(
+          "FNACC loop extent value cannot be rematerialized outside "
+          "fnacc.launch");
+      return {};
+    }
     return convertToI32(builder, loc, source.value);
 
   case Kind::Unknown:
@@ -211,20 +332,25 @@ static std::optional<int64_t> getElementByteSize(Type elementType) {
 }
 
 static Value getRuntimeRealPointer(OpBuilder &builder, Location loc,
+                                   fir::fnacc::LaunchOp launchOp,
                                    Value arrayLike,
                                    fir::fnacc::ElementType type) {
   if (!arrayLike) {
     mlir::emitError(loc) << "FNACC internal error: null array-like value";
     return {};
   }
+  std::optional<Value> runtimeVisible =
+      getRuntimeVisibleArrayLike(launchOp, arrayLike);
+  if (!runtimeVisible) {
+    launchOp.emitError(
+        "FNACC array address cannot be rematerialized outside fnacc.launch");
+    return {};
+  }
+
   FloatType realTy = getMLIRFloatType(builder, type);
   Type realRefTy = fir::ReferenceType::get(realTy);
 
-  if (auto boxTy = dyn_cast<fir::BoxType>(arrayLike.getType())) {
-    Type addrTy = fir::ReferenceType::get(boxTy.getEleTy());
-    Value baseAddr = fir::BoxAddrOp::create(builder, loc, addrTy, arrayLike);
-    return fir::ConvertOp::create(builder, loc, realRefTy, baseAddr);
-  }
+  arrayLike = getAddressOfBoxIfNeeded(builder, loc, *runtimeVisible);
 
   return fir::ConvertOp::create(builder, loc, realRefTy, arrayLike);
 }
@@ -272,11 +398,27 @@ createDescriptorRuntimeCall(ModuleOp module, OpBuilder &builder, Location loc,
 static std::optional<FNACCContiguousArrayDescriptorArgs>
 tryCreateContiguousArrayDescriptorArgs(OpBuilder &builder, Location loc,
                                        Value arrayLike) {
-  auto boxTy = dyn_cast<fir::BoxType>(arrayLike.getType());
+  std::optional<fir::BoxType> boxTy =
+      getBoxTypeFromBoxLike(arrayLike.getType());
   if (!boxTy)
     return std::nullopt;
 
-  auto seqTy = dyn_cast<fir::SequenceType>(boxTy.getEleTy());
+  Type storageType = boxTy->getEleTy();
+  while (true) {
+    if (auto heapTy = dyn_cast<fir::HeapType>(storageType)) {
+      storageType = heapTy.getEleTy();
+      continue;
+    }
+
+    if (auto pointerTy = dyn_cast<fir::PointerType>(storageType)) {
+      storageType = pointerTy.getEleTy();
+      continue;
+    }
+
+    break;
+  }
+
+  auto seqTy = dyn_cast<fir::SequenceType>(storageType);
   if (!seqTy)
     return std::nullopt;
 
@@ -292,7 +434,8 @@ tryCreateContiguousArrayDescriptorArgs(OpBuilder &builder, Location loc,
 
   FNACCContiguousArrayDescriptorArgs desc;
 
-  Value ptr = convertToOpaqueRuntimePtr(builder, loc, arrayLike);
+  Value boxValue = loadBoxIfNeeded(builder, loc, arrayLike);
+  Value ptr = convertToOpaqueRuntimePtr(builder, loc, boxValue);
   Value elementBytesValue = constantI64(builder, loc, *elementBytes);
   Value rankValue = constantI32(builder, loc, static_cast<int32_t>(rank));
 
@@ -306,7 +449,7 @@ tryCreateContiguousArrayDescriptorArgs(OpBuilder &builder, Location loc,
   for (unsigned dim = 0; dim < rank; ++dim) {
     Value dimValue = arith::ConstantIndexOp::create(builder, loc, dim);
 
-    auto dims = fir::BoxDimsOp::create(builder, loc, arrayLike, dimValue);
+    auto dims = fir::BoxDimsOp::create(builder, loc, boxValue, dimValue);
 
     // fir.box_dims returns:
     //   result #0 = lower bound
@@ -475,8 +618,6 @@ tryCreateByteSizedRuntimeArgs(OpBuilder &builder, Location loc, Value var) {
 
   FNACCByteSizedArgs args;
 
-  Value ptr = convertToOpaqueRuntimePtr(builder, loc, baseAddress);
-
   // Scalar case.
   if (!isa<fir::SequenceType>(*objectType)) {
     if (!isSupportedScalarByteSizedType(*objectType))
@@ -486,6 +627,7 @@ tryCreateByteSizedRuntimeArgs(OpBuilder &builder, Location loc, Value var) {
     if (!bytes)
       return std::nullopt;
 
+    Value ptr = convertToOpaqueRuntimePtr(builder, loc, baseAddress);
     args.values.push_back(ptr);
     args.values.push_back(constantI64(builder, loc, *bytes));
     return args;
@@ -522,6 +664,7 @@ tryCreateByteSizedRuntimeArgs(OpBuilder &builder, Location loc, Value var) {
   if (extents.size() != rank)
     return std::nullopt;
 
+  Value ptr = convertToOpaqueRuntimePtr(builder, loc, baseAddress);
   Value bytesValue = constantI64(builder, loc, *elementBytes);
 
   for (Value extent : extents) {
@@ -620,7 +763,7 @@ static LogicalResult lowerFNACCDataOpsToRuntime(ModuleOp module,
 
     Value ptr = convertToOpaqueRuntimePtr(builder, loc, var);
 
-    if (isa<fir::BoxType>(var.getType())) {
+    if (getBoxTypeFromBoxLike(var.getType())) {
       createRuntimeCall(module, builder, loc, "__fnacc_release_desc",
                         ValueRange{ptr});
     } else {
@@ -762,20 +905,28 @@ struct FNACCLowerToRuntimePass
       Value blockZValue =
           arith::ConstantIntOp::create(builder, loc, blockShape.z, 32);
 
-      Value extentXValue = materializeExtentValue(builder, loc, k.extentX);
+      Value extentXValue =
+          materializeExtentValue(builder, loc, launchOp, k.extentX);
 
       Value extentYValue;
       if (k.rank == 2) {
-        extentYValue = materializeExtentValue(builder, loc, k.extentY);
+        extentYValue =
+            materializeExtentValue(builder, loc, launchOp, k.extentY);
       } else {
         extentYValue = arith::ConstantIntOp::create(builder, loc, 1, 32);
       }
 
       Value extentZValue;
       if (k.kind == fir::fnacc::ElementwiseKernelKind::MatMul2D) {
-        extentZValue = materializeExtentValue(builder, loc, k.extentZ);
+        extentZValue =
+            materializeExtentValue(builder, loc, launchOp, k.extentZ);
       } else {
         extentZValue = arith::ConstantIntOp::create(builder, loc, 1, 32);
+      }
+
+      if (!extentXValue || !extentYValue || !extentZValue) {
+        signalPassFailure();
+        return;
       }
 
       if (k.kind == fir::fnacc::ElementwiseKernelKind::ReductionSum1D ||
@@ -801,13 +952,18 @@ struct FNACCLowerToRuntimePass
         Value numReadArraysValue = arith::ConstantIntOp::create(
             builder, loc, static_cast<int32_t>(k.readArrays.size()), 32);
 
-        Value read0Ptr =
-            getRuntimeRealPointer(builder, loc, k.readArrays[0], k.elementType);
+        Value read0Ptr = getRuntimeRealPointer(builder, loc, launchOp,
+                                               k.readArrays[0], k.elementType);
 
         Value read1Ptr = read0Ptr;
         if (k.readArrays.size() >= 2) {
-          read1Ptr = getRuntimeRealPointer(builder, loc, k.readArrays[1],
-                                           k.elementType);
+          read1Ptr = getRuntimeRealPointer(builder, loc, launchOp,
+                                           k.readArrays[1], k.elementType);
+        }
+
+        if (!read0Ptr || !read1Ptr) {
+          signalPassFailure();
+          return;
         }
 
         Value resultPtr = getRuntimeScalarRealPointer(
@@ -858,21 +1014,26 @@ struct FNACCLowerToRuntimePass
         return;
       }
 
-      Value read0Ptr =
-          getRuntimeRealPointer(builder, loc, k.readArrays[0], k.elementType);
+      Value read0Ptr = getRuntimeRealPointer(builder, loc, launchOp,
+                                             k.readArrays[0], k.elementType);
 
       Value read1Ptr = read0Ptr;
       if (k.readArrays.size() >= 2)
-        read1Ptr =
-            getRuntimeRealPointer(builder, loc, k.readArrays[1], k.elementType);
+        read1Ptr = getRuntimeRealPointer(builder, loc, launchOp,
+                                         k.readArrays[1], k.elementType);
 
       Value read2Ptr = read0Ptr;
       if (k.readArrays.size() >= 3)
-        read2Ptr =
-            getRuntimeRealPointer(builder, loc, k.readArrays[2], k.elementType);
+        read2Ptr = getRuntimeRealPointer(builder, loc, launchOp,
+                                         k.readArrays[2], k.elementType);
 
-      Value writePtr =
-          getRuntimeRealPointer(builder, loc, k.writeArray, k.elementType);
+      Value writePtr = getRuntimeRealPointer(builder, loc, launchOp,
+                                             k.writeArray, k.elementType);
+
+      if (!read0Ptr || !read1Ptr || !read2Ptr || !writePtr) {
+        signalPassFailure();
+        return;
+      }
 
       if (k.kind == fir::fnacc::ElementwiseKernelKind::MatMul2D) {
 
