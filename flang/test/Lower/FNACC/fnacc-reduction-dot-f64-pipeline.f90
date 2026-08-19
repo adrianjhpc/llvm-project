@@ -45,6 +45,7 @@ end subroutine
 
 ! JSON: "fnacc_schema_version": 1
 ! JSON-DAG: "kind": "reduction_dot1d"
+! JSON-DAG: "reduction_op": "add"
 ! JSON-DAG: "reduction_stage_id": 1
 ! JSON-DAG: "type": "ptr<f64>"
 ! JSON-DAG: "role": "partials"

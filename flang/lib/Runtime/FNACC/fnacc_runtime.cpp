@@ -13,13 +13,15 @@
 #include <sstream>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace {
 
-// Embedded payload constructors can run before this translation unit's dynamic
-// initialization.  Construct the mutex on first use so registration is safe
-// regardless of final link order.
+// This lock protects embedded registration, context selection, loaded-module
+// and function caches, device allocations, and reduction workspaces. Embedded
+// payload constructors can run before this translation unit's dynamic
+// initialization, so construct it on first use regardless of final link order.
 static std::recursive_mutex &fnaccGetRuntimeMutex() {
   static std::recursive_mutex mutex;
   return mutex;
@@ -51,7 +53,7 @@ static void fnaccCudaCheck(
   } while (false)
 
 static constexpr const char *FNACC_RUNTIME_BUILD_ID =
-    "FNACC_RUNTIME_BUILD_ID_hierarchical_reduction_v3";
+    "FNACC_RUNTIME_BUILD_ID_context_stream_reductions_v6";
 
 static std::size_t fnaccCheckedMul(
     std::size_t a, std::size_t b, const char *what) {
@@ -585,6 +587,9 @@ struct FNACCKernelDesc {
   // value denotes older metadata that requires the host-side fallback.
   int32_t reductionStageId = -1;
 
+  enum class ReductionOperator { Add, Multiply, Min, Max };
+  ReductionOperator reductionOp = ReductionOperator::Add;
+
   // PACK metadata from JSON.
   std::vector<FNACCPackEntry> pack;
 
@@ -597,18 +602,56 @@ struct FNACCDeviceAllocation {
   std::size_t bytes = 0;
 };
 
+struct FNACCReductionBufferStats {
+  // Number of cuMemAlloc calls. Growth allocations are included here and are
+  // also counted separately below.
+  uint64_t allocations = 0;
+  uint64_t growths = 0;
+  uint64_t reuses = 0;
+};
+
+struct FNACCReductionWorkspace {
+  CUdevice device = 0;
+  CUcontext context = nullptr;
+  CUstream stream = nullptr;
+  CUevent completionEvent = nullptr;
+
+  // The primary kernel writes one partial per Triton program to this buffer.
+  FNACCDeviceAllocation partials;
+  FNACCReductionBufferStats partialStats;
+
+  // Hierarchical stages ping-pong between partials and this buffer.
+  FNACCDeviceAllocation scratch;
+  FNACCReductionBufferStats scratchStats;
+
+  uint64_t primaryLaunches = 0;
+  uint64_t stageLaunches = 0;
+};
+
+struct FNACCContextState {
+  CUdevice device = 0;
+  CUcontext context = nullptr;
+  bool retainedPrimaryContext = false;
+  CUstream stream = nullptr;
+  CUevent completionEvent = nullptr;
+  std::vector<CUmodule> modules;
+  std::unordered_map<int32_t, CUfunction> functionCache;
+  std::unordered_map<void *, FNACCDeviceAllocation> deviceCache;
+  FNACCReductionWorkspace reductionWorkspace;
+};
+
 struct FNACCKernelRegistry {
   bool initialized = false;
 
-  CUdevice device = 0;
-  CUcontext context = nullptr;
-  std::vector<CUmodule> modules;
-
   std::unordered_map<int32_t, FNACCKernelDesc> kernels;
-  std::unordered_map<int32_t, CUfunction> functionCache;
+  std::vector<std::string> ptxTexts;
 
-  // Device cache keyed by host pointer.
-  std::unordered_map<void *, FNACCDeviceAllocation> deviceCache;
+  // CUDA modules, functions, allocations, streams and reduction buffers are
+  // all context-owned. Never reuse any of them in a different context, even
+  // when two contexts select the same CUDA device.
+  std::unordered_map<CUcontext, FNACCContextState> contexts;
+  std::unordered_map<int, CUcontext> primaryContexts;
+  CUcontext activeContext = nullptr;
 };
 
 struct FNACCEmbeddedKernelBundle {
@@ -629,6 +672,15 @@ static FNACCEmbeddedKernelBundle &fnaccGetEmbeddedKernelBundle() {
 
 static FNACCKernelRegistry fnaccRegistry;
 
+static FNACCContextState &fnaccActiveContextState() {
+  auto it = fnaccRegistry.contexts.find(fnaccRegistry.activeContext);
+  if (it == fnaccRegistry.contexts.end()) {
+    std::fprintf(stderr, "FNACC error: no active CUDA context state\n");
+    std::abort();
+  }
+  return it->second;
+}
+
 struct FNACCDeviceArg {
   CUdeviceptr ptr = 0;
   bool cached = false;
@@ -636,9 +688,55 @@ struct FNACCDeviceArg {
   int32_t slot = -1;
 };
 
-static bool fnaccDebugEnabled() {
-  const char *value = std::getenv("FNACC_DEBUG");
+static bool fnaccEnvFlagEnabled(const char *name) {
+  const char *value = std::getenv(name);
   return value && value[0] != '\0' && std::strcmp(value, "0") != 0;
+}
+
+static bool fnaccDebugEnabled() { return fnaccEnvFlagEnabled("FNACC_DEBUG"); }
+
+static bool fnaccReductionStatsEnabled() {
+  return fnaccEnvFlagEnabled("FNACC_REDUCTION_STATS");
+}
+
+static FNACCReductionWorkspace fnaccAggregateReductionWorkspaceStats() {
+  FNACCReductionWorkspace total;
+  for (const auto &entry : fnaccRegistry.contexts) {
+    const FNACCReductionWorkspace &workspace = entry.second.reductionWorkspace;
+    total.primaryLaunches += workspace.primaryLaunches;
+    total.stageLaunches += workspace.stageLaunches;
+    total.partialStats.allocations += workspace.partialStats.allocations;
+    total.partialStats.growths += workspace.partialStats.growths;
+    total.partialStats.reuses += workspace.partialStats.reuses;
+    total.partials.bytes += workspace.partials.bytes;
+    total.scratchStats.allocations += workspace.scratchStats.allocations;
+    total.scratchStats.growths += workspace.scratchStats.growths;
+    total.scratchStats.reuses += workspace.scratchStats.reuses;
+    total.scratch.bytes += workspace.scratch.bytes;
+  }
+  return total;
+}
+
+static void fnaccPrintReductionWorkspaceStats() {
+  FNACCReductionWorkspace workspace = fnaccAggregateReductionWorkspaceStats();
+  std::fprintf(stderr,
+      "FNACC reduction workspace: primary_launches=%llu "
+      "stage_launches=%llu "
+      "contexts=%zu "
+      "partials={allocations=%llu,growths=%llu,reuses=%llu,capacity_bytes=%zu} "
+      "scratch={allocations=%llu,growths=%llu,reuses=%llu,capacity_bytes=%zu}"
+      "\n",
+      static_cast<unsigned long long>(workspace.primaryLaunches),
+      static_cast<unsigned long long>(workspace.stageLaunches),
+      fnaccRegistry.contexts.size(),
+      static_cast<unsigned long long>(workspace.partialStats.allocations),
+      static_cast<unsigned long long>(workspace.partialStats.growths),
+      static_cast<unsigned long long>(workspace.partialStats.reuses),
+      workspace.partials.bytes,
+      static_cast<unsigned long long>(workspace.scratchStats.allocations),
+      static_cast<unsigned long long>(workspace.scratchStats.growths),
+      static_cast<unsigned long long>(workspace.scratchStats.reuses),
+      workspace.scratch.bytes);
 }
 
 static bool fnaccHasEmbeddedPtxBundle() {
@@ -847,6 +945,24 @@ fnaccParseKernelDescsFromJson(const std::string &json) {
     desc.pack = jsonParsePackEntries(objectText);
     jsonFindInt(objectText, "reduction_stage_id", desc.reductionStageId);
 
+    std::string reductionOp;
+    if (jsonFindString(objectText, "reduction_op", reductionOp)) {
+      if (reductionOp == "add")
+        desc.reductionOp = FNACCKernelDesc::ReductionOperator::Add;
+      else if (reductionOp == "multiply")
+        desc.reductionOp = FNACCKernelDesc::ReductionOperator::Multiply;
+      else if (reductionOp == "min")
+        desc.reductionOp = FNACCKernelDesc::ReductionOperator::Min;
+      else if (reductionOp == "max")
+        desc.reductionOp = FNACCKernelDesc::ReductionOperator::Max;
+      else {
+        std::fprintf(stderr,
+            "FNACC error: kernel id %d has unknown reduction_op '%s'\n",
+            desc.id, reductionOp.c_str());
+        std::abort();
+      }
+    }
+
     int64_t expectedCudaThreads =
         static_cast<int64_t>(desc.numWarps) * desc.threadsPerWarp;
     if (desc.rank < 1 || desc.rank > 3 || desc.tileX <= 0 || desc.tileY <= 0 ||
@@ -898,28 +1014,51 @@ static void fnaccCleanup() {
   if (!fnaccRegistry.initialized)
     return;
 
-  if (fnaccRegistry.context)
-    cuCtxSetCurrent(fnaccRegistry.context);
+  if (fnaccReductionStatsEnabled())
+    fnaccPrintReductionWorkspaceStats();
 
-  for (auto &entry : fnaccRegistry.deviceCache) {
-    if (entry.second.ptr)
-      cuMemFree(entry.second.ptr);
+  for (auto &entry : fnaccRegistry.contexts) {
+    FNACCContextState &state = entry.second;
+    FNACCReductionWorkspace &workspace = state.reductionWorkspace;
+    if (state.context)
+      cuCtxSetCurrent(state.context);
+    if (workspace.stream)
+      cuStreamSynchronize(workspace.stream);
+    if (workspace.partials.ptr)
+      cuMemFree(workspace.partials.ptr);
+    if (workspace.scratch.ptr)
+      cuMemFree(workspace.scratch.ptr);
+    if (workspace.completionEvent)
+      cuEventDestroy(workspace.completionEvent);
+    if (workspace.stream)
+      cuStreamDestroy(workspace.stream);
+
+    if (state.stream)
+      cuStreamSynchronize(state.stream);
+    for (auto &allocation : state.deviceCache)
+      if (allocation.second.ptr)
+        cuMemFree(allocation.second.ptr);
+    state.deviceCache.clear();
+    state.functionCache.clear();
+    for (CUmodule module : state.modules)
+      if (module)
+        cuModuleUnload(module);
+    state.modules.clear();
+    if (state.completionEvent)
+      cuEventDestroy(state.completionEvent);
+    if (state.stream)
+      cuStreamDestroy(state.stream);
   }
 
-  fnaccRegistry.deviceCache.clear();
-  fnaccRegistry.functionCache.clear();
+  for (auto &entry : fnaccRegistry.contexts)
+    if (entry.second.retainedPrimaryContext)
+      cuDevicePrimaryCtxRelease(entry.second.device);
+
+  fnaccRegistry.contexts.clear();
+  fnaccRegistry.primaryContexts.clear();
+  fnaccRegistry.activeContext = nullptr;
+  fnaccRegistry.ptxTexts.clear();
   fnaccRegistry.kernels.clear();
-
-  for (CUmodule module : fnaccRegistry.modules) {
-    if (module)
-      cuModuleUnload(module);
-  }
-  fnaccRegistry.modules.clear();
-
-  if (fnaccRegistry.context) {
-    cuDevicePrimaryCtxRelease(fnaccRegistry.device);
-    fnaccRegistry.context = nullptr;
-  }
 
   fnaccRegistry.initialized = false;
 }
@@ -1076,25 +1215,11 @@ static void fnaccEnsureInitialized() {
   if (fnaccRegistry.initialized)
     return;
 
-  if (fnaccDebugEnabled()) {
+  if (fnaccDebugEnabled())
     std::fprintf(
         stderr, "FNACC: runtime build id: %s\n", FNACC_RUNTIME_BUILD_ID);
-  }
 
   FNACC_CUDA_CHECK(cuInit(0));
-
-  int ordinal = fnaccGetCudaDeviceOrdinal();
-
-  FNACC_CUDA_CHECK(cuDeviceGet(&fnaccRegistry.device, ordinal));
-
-  if (fnaccDebugEnabled())
-    std::fprintf(stderr, "FNACC: using CUDA device ordinal %d\n", ordinal);
-
-  FNACC_CUDA_CHECK(
-      cuDevicePrimaryCtxRetain(&fnaccRegistry.context, fnaccRegistry.device));
-
-  FNACC_CUDA_CHECK(cuCtxSetCurrent(fnaccRegistry.context));
-
   std::string json = fnaccGetJsonText();
 
   int32_t schemaVersion = 0;
@@ -1114,27 +1239,18 @@ static void fnaccEnsureInitialized() {
 
   fnaccRegistry.kernels = fnaccParseKernelDescsFromJson(json);
 
-  std::vector<std::string> ptxTexts = fnaccGetPtxTexts(fnaccRegistry.kernels);
+  fnaccRegistry.ptxTexts = fnaccGetPtxTexts(fnaccRegistry.kernels);
 
-  if (ptxTexts.empty()) {
+  if (fnaccRegistry.ptxTexts.empty()) {
     std::fprintf(stderr, "FNACC error: no PTX modules were available\n");
     std::abort();
   }
 
-  fnaccRegistry.modules.resize(ptxTexts.size(), nullptr);
-
-  for (std::size_t i = 0; i < ptxTexts.size(); ++i) {
-    if (ptxTexts[i].empty()) {
+  for (std::size_t i = 0; i < fnaccRegistry.ptxTexts.size(); ++i) {
+    if (fnaccRegistry.ptxTexts[i].empty()) {
       std::fprintf(
           stderr, "FNACC error: PTX bundle entry %zu is empty or missing\n", i);
       std::abort();
-    }
-
-    FNACC_CUDA_CHECK(cuModuleLoadDataEx(
-        &fnaccRegistry.modules[i], ptxTexts[i].c_str(), 0, nullptr, nullptr));
-
-    if (fnaccDebugEnabled()) {
-      std::fprintf(stderr, "FNACC: loaded CUDA module %zu\n", i);
     }
   }
 
@@ -1159,25 +1275,113 @@ static void fnaccEnsureInitialized() {
   std::atexit(fnaccCleanup);
 }
 
+static FNACCContextState &fnaccCreateContextState(
+    CUdevice device, CUcontext context, bool retainedPrimaryContext) {
+  FNACCContextState state;
+  state.device = device;
+  state.context = context;
+  state.retainedPrimaryContext = retainedPrimaryContext;
+  FNACC_CUDA_CHECK(cuCtxSetCurrent(state.context));
+  FNACC_CUDA_CHECK(cuStreamCreate(&state.stream, CU_STREAM_NON_BLOCKING));
+  FNACC_CUDA_CHECK(
+      cuEventCreate(&state.completionEvent, CU_EVENT_DISABLE_TIMING));
+
+  state.modules.resize(fnaccRegistry.ptxTexts.size(), nullptr);
+  for (std::size_t i = 0; i < fnaccRegistry.ptxTexts.size(); ++i) {
+    FNACC_CUDA_CHECK(cuModuleLoadDataEx(&state.modules[i],
+        fnaccRegistry.ptxTexts[i].c_str(), 0, nullptr, nullptr));
+    if (fnaccDebugEnabled())
+      std::fprintf(stderr,
+          "FNACC: loaded CUDA module %zu on device=%d context=%p\n", i,
+          static_cast<int>(device), static_cast<void *>(state.context));
+  }
+
+  auto inserted = fnaccRegistry.contexts.emplace(context, std::move(state));
+  if (!inserted.second) {
+    std::fprintf(stderr,
+        "FNACC error: duplicate CUDA context state for context %p\n",
+        static_cast<void *>(context));
+    std::abort();
+  }
+  return inserted.first->second;
+}
+
+static FNACCContextState &fnaccGetOrCreatePrimaryContextState(int ordinal) {
+  auto known = fnaccRegistry.primaryContexts.find(ordinal);
+  if (known != fnaccRegistry.primaryContexts.end())
+    return fnaccRegistry.contexts.at(known->second);
+
+  CUdevice device = 0;
+  CUcontext context = nullptr;
+  FNACC_CUDA_CHECK(cuDeviceGet(&device, ordinal));
+  FNACC_CUDA_CHECK(cuDevicePrimaryCtxRetain(&context, device));
+
+  FNACCContextState &state =
+      fnaccCreateContextState(device, context, /*retainedPrimaryContext=*/true);
+  fnaccRegistry.primaryContexts.emplace(ordinal, context);
+  return state;
+}
+
 static void fnaccEnsureCurrentContext() {
   fnaccEnsureInitialized();
 
-  if (!fnaccRegistry.context) {
-    std::fprintf(stderr, "FNACC error: CUDA context is null\n");
+  if (fnaccEnvFlagEnabled("FNACC_USE_CURRENT_CONTEXT")) {
+    CUcontext context = nullptr;
+    CUdevice device = 0;
+    FNACC_CUDA_CHECK(cuCtxGetCurrent(&context));
+    if (!context) {
+      std::fprintf(stderr,
+          "FNACC error: FNACC_USE_CURRENT_CONTEXT is set but no CUDA context "
+          "is current\n");
+      std::abort();
+    }
+    FNACC_CUDA_CHECK(cuCtxGetDevice(&device));
+    auto known = fnaccRegistry.contexts.find(context);
+    FNACCContextState &state = known != fnaccRegistry.contexts.end()
+        ? known->second
+        : fnaccCreateContextState(
+              device, context, /*retainedPrimaryContext=*/false);
+    fnaccRegistry.activeContext = state.context;
+    return;
+  }
+
+  int ordinal = fnaccGetCudaDeviceOrdinal();
+  FNACCContextState &state = fnaccGetOrCreatePrimaryContextState(ordinal);
+  FNACC_CUDA_CHECK(cuCtxSetCurrent(state.context));
+  fnaccRegistry.activeContext = state.context;
+
+  if (fnaccDebugEnabled())
+    std::fprintf(stderr,
+        "FNACC: active CUDA device ordinal=%d device=%d context=%p\n", ordinal,
+        static_cast<int>(state.device), static_cast<void *>(state.context));
+}
+
+static void fnaccWaitForStream(CUstream stream, CUevent completionEvent) {
+  if (!stream || !completionEvent) {
+    std::fprintf(stderr, "FNACC error: runtime stream is not initialized\n");
     std::abort();
   }
+  FNACC_CUDA_CHECK(cuEventRecord(completionEvent, stream));
+  FNACC_CUDA_CHECK(cuEventSynchronize(completionEvent));
+}
 
-  FNACC_CUDA_CHECK(cuCtxSetCurrent(fnaccRegistry.context));
+static void fnaccWaitForRuntimeStream() {
+  FNACCContextState &state = fnaccActiveContextState();
+  fnaccWaitForStream(state.stream, state.completionEvent);
+}
 
-  if (fnaccDebugEnabled()) {
-    CUcontext current = nullptr;
-    FNACC_CUDA_CHECK(cuCtxGetCurrent(&current));
-
-    std::fprintf(stderr,
-        "FNACC: current CUDA context = %p, registry context = %p\n",
-        static_cast<void *>(current),
-        static_cast<void *>(fnaccRegistry.context));
+static FNACCReductionWorkspace &fnaccGetReductionWorkspace() {
+  fnaccEnsureCurrentContext();
+  FNACCContextState &state = fnaccActiveContextState();
+  FNACCReductionWorkspace &workspace = state.reductionWorkspace;
+  if (!workspace.context) {
+    workspace.device = state.device;
+    workspace.context = state.context;
+    FNACC_CUDA_CHECK(cuStreamCreate(&workspace.stream, CU_STREAM_NON_BLOCKING));
+    FNACC_CUDA_CHECK(
+        cuEventCreate(&workspace.completionEvent, CU_EVENT_DISABLE_TIMING));
   }
+  return workspace;
 }
 
 static const FNACCKernelDesc *fnaccLookupKernelDesc(int32_t kernelId) {
@@ -1229,8 +1433,8 @@ static bool fnaccHostPointerIsPresentOnDevice(void *hostPtr) {
   if (!hostPtr)
     return false;
 
-  return fnaccRegistry.deviceCache.find(hostPtr) !=
-      fnaccRegistry.deviceCache.end();
+  auto &cache = fnaccActiveContextState().deviceCache;
+  return cache.find(hostPtr) != cache.end();
 }
 
 static int32_t fnaccEffectivePackTargetForSlot(
@@ -1295,11 +1499,12 @@ static FNACCDeviceArg fnaccGetCachedDeviceBuffer(void *hostPtr,
   arg.target = FNACC_PACK_TARGET_DEVICE;
   arg.slot = slot;
 
-  auto it = fnaccRegistry.deviceCache.find(hostPtr);
+  auto &cache = fnaccActiveContextState().deviceCache;
+  auto it = cache.find(hostPtr);
 
   bool needAllocate = false;
 
-  if (it == fnaccRegistry.deviceCache.end()) {
+  if (it == cache.end()) {
     needAllocate = true;
   } else if (it->second.bytes != bytes) {
     if (fnaccDebugEnabled()) {
@@ -1310,7 +1515,7 @@ static FNACCDeviceArg fnaccGetCachedDeviceBuffer(void *hostPtr,
     }
 
     FNACC_CUDA_CHECK(cuMemFree(it->second.ptr));
-    fnaccRegistry.deviceCache.erase(it);
+    cache.erase(it);
     needAllocate = true;
   }
 
@@ -1322,7 +1527,7 @@ static FNACCDeviceArg fnaccGetCachedDeviceBuffer(void *hostPtr,
     if (copyHostToDeviceOnMiss)
       FNACC_CUDA_CHECK(cuMemcpyHtoD(allocation.ptr, hostPtr, bytes));
 
-    auto inserted = fnaccRegistry.deviceCache.emplace(hostPtr, allocation);
+    auto inserted = cache.emplace(hostPtr, allocation);
     arg.ptr = inserted.first->second.ptr;
 
     if (fnaccDebugEnabled()) {
@@ -1436,9 +1641,10 @@ static void fnaccDebugFunctionAttributes(CUfunction fn, int32_t kernelId) {
 
 static CUfunction getKernelFunction(int32_t kernelId) {
   fnaccEnsureCurrentContext();
+  FNACCContextState &state = fnaccActiveContextState();
 
-  auto cacheIt = fnaccRegistry.functionCache.find(kernelId);
-  if (cacheIt != fnaccRegistry.functionCache.end())
+  auto cacheIt = state.functionCache.find(kernelId);
+  if (cacheIt != state.functionCache.end())
     return cacheIt->second;
 
   std::string kernelName;
@@ -1462,20 +1668,19 @@ static CUfunction getKernelFunction(int32_t kernelId) {
   if (desc)
     moduleIndex = static_cast<std::size_t>(desc->ptxIndex);
 
-  if (moduleIndex >= fnaccRegistry.modules.size() ||
-      !fnaccRegistry.modules[moduleIndex]) {
+  if (moduleIndex >= state.modules.size() || !state.modules[moduleIndex]) {
     std::fprintf(stderr,
         "FNACC error: kernel id %d requests PTX module index %zu, "
         "but only %zu module(s) are loaded\n",
-        kernelId, moduleIndex, fnaccRegistry.modules.size());
+        kernelId, moduleIndex, state.modules.size());
     std::abort();
   }
 
   CUfunction fn = nullptr;
-  FNACC_CUDA_CHECK(cuModuleGetFunction(
-      &fn, fnaccRegistry.modules[moduleIndex], kernelName.c_str()));
+  FNACC_CUDA_CHECK(
+      cuModuleGetFunction(&fn, state.modules[moduleIndex], kernelName.c_str()));
 
-  fnaccRegistry.functionCache[kernelId] = fn;
+  state.functionCache[kernelId] = fn;
   return fn;
 }
 
@@ -1661,9 +1866,10 @@ static std::size_t fnaccBytesFromDescriptor(int64_t elementBytes, int32_t rank,
 static FNACCDeviceAllocation &fnaccGetOrCreateCachedAllocation(void *hostPtr,
     std::size_t bytes, bool copyHostToDeviceOnCreateOrResize,
     const char *operationName) {
-  auto it = fnaccRegistry.deviceCache.find(hostPtr);
+  auto &cache = fnaccActiveContextState().deviceCache;
+  auto it = cache.find(hostPtr);
 
-  if (it != fnaccRegistry.deviceCache.end()) {
+  if (it != cache.end()) {
     if (it->second.bytes == bytes)
       return it->second;
 
@@ -1675,7 +1881,7 @@ static FNACCDeviceAllocation &fnaccGetOrCreateCachedAllocation(void *hostPtr,
     }
 
     FNACC_CUDA_CHECK(cuMemFree(it->second.ptr));
-    fnaccRegistry.deviceCache.erase(it);
+    cache.erase(it);
   }
 
   FNACCDeviceAllocation allocation;
@@ -1688,7 +1894,7 @@ static FNACCDeviceAllocation &fnaccGetOrCreateCachedAllocation(void *hostPtr,
       FNACC_CUDA_CHECK(cuMemcpyHtoD(allocation.ptr, hostPtr, bytes));
   }
 
-  auto inserted = fnaccRegistry.deviceCache.emplace(hostPtr, allocation);
+  auto inserted = cache.emplace(hostPtr, allocation);
 
   if (fnaccDebugEnabled()) {
     std::fprintf(stderr,
@@ -1847,8 +2053,9 @@ extern "C" void __fnacc_update_host_bytes(void *hostPtr, int64_t bytesValue) {
     return;
   }
 
-  auto it = fnaccRegistry.deviceCache.find(hostPtr);
-  if (it == fnaccRegistry.deviceCache.end()) {
+  auto &cache = fnaccActiveContextState().deviceCache;
+  auto it = cache.find(hostPtr);
+  if (it == cache.end()) {
     std::fprintf(stderr,
         "FNACC error: update_host_bytes has no cached allocation for "
         "host=%p bytes=%zu; use create/copyin/update_device first\n",
@@ -1944,8 +2151,9 @@ extern "C" void __fnacc_update_host_desc(void *hostPtr, int64_t elementBytes,
     return;
   }
 
-  auto it = fnaccRegistry.deviceCache.find(hostPtr);
-  if (it == fnaccRegistry.deviceCache.end()) {
+  auto &cache = fnaccActiveContextState().deviceCache;
+  auto it = cache.find(hostPtr);
+  if (it == cache.end()) {
     std::fprintf(stderr,
         "FNACC error: update_host_desc has no cached allocation for host=%p; "
         "use create/copyin/update_device first\n",
@@ -1984,8 +2192,9 @@ extern "C" void __fnacc_release_desc(void *hostPtr) {
     return;
   }
 
-  auto it = fnaccRegistry.deviceCache.find(hostPtr);
-  if (it == fnaccRegistry.deviceCache.end()) {
+  auto &cache = fnaccActiveContextState().deviceCache;
+  auto it = cache.find(hostPtr);
+  if (it == cache.end()) {
     if (fnaccDebugEnabled()) {
       std::fprintf(stderr,
           "FNACC: release_desc ignored; no cached allocation for host=%p\n",
@@ -1998,7 +2207,7 @@ extern "C" void __fnacc_release_desc(void *hostPtr) {
   std::size_t bytes = it->second.bytes;
 
   FNACC_CUDA_CHECK(cuMemFree(devicePtr));
-  fnaccRegistry.deviceCache.erase(it);
+  cache.erase(it);
 
   if (fnaccDebugEnabled()) {
     std::fprintf(stderr,
@@ -2096,8 +2305,8 @@ extern "C" void __fnacc_launch_nd_f32(int32_t kernelId, int32_t rank,
 
     fnaccValidateCudaBlockSize(fn, kernelId, cudaBlockX);
 
-    FNACC_CUDA_CHECK(cuLaunchKernel(
-        fn, gridX, 1, 1, cudaBlockX, 1, 1, 0, nullptr, args, nullptr));
+    FNACC_CUDA_CHECK(cuLaunchKernel(fn, gridX, 1, 1, cudaBlockX, 1, 1, 0,
+        fnaccActiveContextState().stream, args, nullptr));
     if (fnaccDebugEnabled()) {
       std::fprintf(stderr, "FNACC: cuLaunchKernel rank1 returned\n");
       std::fflush(stderr);
@@ -2138,8 +2347,8 @@ extern "C" void __fnacc_launch_nd_f32(int32_t kernelId, int32_t rank,
 
     fnaccValidateCudaBlockSize(fn, kernelId, cudaBlockX);
 
-    FNACC_CUDA_CHECK(cuLaunchKernel(
-        fn, gridX, gridY, 1, cudaBlockX, 1, 1, 0, nullptr, args, nullptr));
+    FNACC_CUDA_CHECK(cuLaunchKernel(fn, gridX, gridY, 1, cudaBlockX, 1, 1, 0,
+        fnaccActiveContextState().stream, args, nullptr));
     if (fnaccDebugEnabled()) {
       std::fprintf(stderr, "FNACC: cuLaunchKernel rank2 returned\n");
       std::fflush(stderr);
@@ -2147,14 +2356,14 @@ extern "C" void __fnacc_launch_nd_f32(int32_t kernelId, int32_t rank,
   }
 
   if (fnaccDebugEnabled()) {
-    std::fprintf(stderr, "FNACC: about to cuCtxSynchronize\n");
+    std::fprintf(stderr, "FNACC: waiting for runtime stream\n");
     std::fflush(stderr);
   }
 
-  FNACC_CUDA_CHECK(cuCtxSynchronize());
+  fnaccWaitForRuntimeStream();
 
   if (fnaccDebugEnabled()) {
-    std::fprintf(stderr, "FNACC: cuCtxSynchronize returned\n");
+    std::fprintf(stderr, "FNACC: runtime stream completed\n");
     std::fflush(stderr);
   }
 
@@ -2271,15 +2480,15 @@ extern "C" void __fnacc_launch_nd_f32_s1(int32_t kernelId, int32_t rank,
 
   fnaccValidateCudaBlockSize(fn, kernelId, cudaBlockX);
 
-  FNACC_CUDA_CHECK(cuLaunchKernel(
-      fn, gridX, 1, 1, cudaBlockX, 1, 1, 0, nullptr, args, nullptr));
+  FNACC_CUDA_CHECK(cuLaunchKernel(fn, gridX, 1, 1, cudaBlockX, 1, 1, 0,
+      fnaccActiveContextState().stream, args, nullptr));
 
   if (fnaccDebugEnabled()) {
     std::fprintf(stderr, "FNACC: cuLaunchKernel SAXPY returned\n");
     std::fflush(stderr);
   }
 
-  FNACC_CUDA_CHECK(cuCtxSynchronize());
+  fnaccWaitForRuntimeStream();
 
   FNACC_CUDA_CHECK(cuMemcpyDtoH(c, dC, numBytes));
 
@@ -2376,15 +2585,15 @@ extern "C" void __fnacc_launch_nd_f32_s2(int32_t kernelId, int32_t rank,
 
   fnaccValidateCudaBlockSize(fn, kernelId, cudaBlockX);
 
-  FNACC_CUDA_CHECK(cuLaunchKernel(
-      fn, gridX, 1, 1, cudaBlockX, 1, 1, 0, nullptr, args, nullptr));
+  FNACC_CUDA_CHECK(cuLaunchKernel(fn, gridX, 1, 1, cudaBlockX, 1, 1, 0,
+      fnaccActiveContextState().stream, args, nullptr));
 
   if (fnaccDebugEnabled()) {
     std::fprintf(stderr, "FNACC: cuLaunchKernel s2 returned\n");
     std::fflush(stderr);
   }
 
-  FNACC_CUDA_CHECK(cuCtxSynchronize());
+  fnaccWaitForRuntimeStream();
 
   FNACC_CUDA_CHECK(cuMemcpyDtoH(c, dC, numBytes));
 
@@ -2612,10 +2821,10 @@ extern "C" void __fnacc_launch_f32_v1(int32_t kernelId, int32_t rank,
 
   fnaccValidateCudaBlockSize(fn, kernelId, cudaBlockX);
 
-  FNACC_CUDA_CHECK(cuLaunchKernel(
-      fn, gridX, gridY, 1, cudaBlockX, 1, 1, 0, nullptr, args, nullptr));
+  FNACC_CUDA_CHECK(cuLaunchKernel(fn, gridX, gridY, 1, cudaBlockX, 1, 1, 0,
+      fnaccActiveContextState().stream, args, nullptr));
 
-  FNACC_CUDA_CHECK(cuCtxSynchronize());
+  fnaccWaitForRuntimeStream();
 
   if (writeDev.target == FNACC_PACK_TARGET_HOST) {
     fnaccCopyBackWriteBuffer(write, writeDev, numBytes);
@@ -2833,10 +3042,10 @@ extern "C" void __fnacc_launch_f64_v1(int32_t kernelId, int32_t rank,
 
   fnaccValidateCudaBlockSize(fn, kernelId, cudaBlockX);
 
-  FNACC_CUDA_CHECK(cuLaunchKernel(
-      fn, gridX, gridY, 1, cudaBlockX, 1, 1, 0, nullptr, args, nullptr));
+  FNACC_CUDA_CHECK(cuLaunchKernel(fn, gridX, gridY, 1, cudaBlockX, 1, 1, 0,
+      fnaccActiveContextState().stream, args, nullptr));
 
-  FNACC_CUDA_CHECK(cuCtxSynchronize());
+  fnaccWaitForRuntimeStream();
 
   if (writeDev.target == FNACC_PACK_TARGET_HOST) {
     fnaccCopyBackWriteBuffer(write, writeDev, numBytes);
@@ -2990,9 +3199,9 @@ extern "C" void __fnacc_launch_matmul_f32_v1(int32_t kernelId, int32_t blockX,
   fnaccConfigureDynamicSharedMemory(fn, kernelId, dynamicSharedBytes);
 
   FNACC_CUDA_CHECK(cuLaunchKernel(fn, gridX, gridY, gridZ, cudaBlockX, 1, 1,
-      dynamicSharedBytes, nullptr, args, nullptr));
+      dynamicSharedBytes, fnaccActiveContextState().stream, args, nullptr));
 
-  FNACC_CUDA_CHECK(cuCtxSynchronize());
+  fnaccWaitForRuntimeStream();
 
   if (cDev.target == FNACC_PACK_TARGET_HOST) {
     fnaccCopyBackWriteBuffer(c, cDev, bytesC);
@@ -3135,9 +3344,9 @@ extern "C" void __fnacc_launch_matmul_f64_v1(int32_t kernelId, int32_t blockX,
   fnaccConfigureDynamicSharedMemory(fn, kernelId, dynamicSharedBytes);
 
   FNACC_CUDA_CHECK(cuLaunchKernel(fn, gridX, gridY, gridZ, cudaBlockX, 1, 1,
-      dynamicSharedBytes, nullptr, args, nullptr));
+      dynamicSharedBytes, fnaccActiveContextState().stream, args, nullptr));
 
-  FNACC_CUDA_CHECK(cuCtxSynchronize());
+  fnaccWaitForRuntimeStream();
 
   if (cDev.target == FNACC_PACK_TARGET_HOST) {
     fnaccCopyBackWriteBuffer(c, cDev, bytesC);
@@ -3155,9 +3364,85 @@ extern "C" void __fnacc_launch_matmul_f64_v1(int32_t kernelId, int32_t blockX,
   fnaccReleaseDeviceArg(cDev);
 }
 
+static CUdeviceptr fnaccReserveReductionBuffer(
+    FNACCDeviceAllocation &allocation, std::size_t requiredBytes,
+    FNACCReductionBufferStats &stats, const char *bufferName) {
+  if (requiredBytes == 0) {
+    std::fprintf(stderr,
+        "FNACC error: requested zero bytes for reduction %s buffer\n",
+        bufferName);
+    std::abort();
+  }
+
+  if (allocation.ptr && allocation.bytes >= requiredBytes) {
+    ++stats.reuses;
+    if (fnaccDebugEnabled()) {
+      std::fprintf(stderr,
+          "FNACC: reusing reduction %s buffer device=0x%llx "
+          "capacity=%zu required=%zu\n",
+          bufferName, static_cast<unsigned long long>(allocation.ptr),
+          allocation.bytes, requiredBytes);
+    }
+    return allocation.ptr;
+  }
+
+  std::size_t oldBytes = allocation.bytes;
+  if (allocation.ptr)
+    FNACC_CUDA_CHECK(cuMemFree(allocation.ptr));
+
+  allocation = {};
+  FNACC_CUDA_CHECK(cuMemAlloc(&allocation.ptr, requiredBytes));
+  allocation.bytes = requiredBytes;
+  ++stats.allocations;
+  if (oldBytes != 0)
+    ++stats.growths;
+
+  if (fnaccDebugEnabled()) {
+    std::fprintf(stderr,
+        "FNACC: %s reduction %s buffer device=0x%llx "
+        "capacity=%zu\n",
+        oldBytes == 0 ? "allocated" : "grew", bufferName,
+        static_cast<unsigned long long>(allocation.ptr), allocation.bytes);
+  }
+
+  return allocation.ptr;
+}
+
+template <typename Real>
+static Real fnaccReductionIdentity(FNACCKernelDesc::ReductionOperator op) {
+  switch (op) {
+  case FNACCKernelDesc::ReductionOperator::Add:
+    return Real{0};
+  case FNACCKernelDesc::ReductionOperator::Multiply:
+    return Real{1};
+  case FNACCKernelDesc::ReductionOperator::Min:
+    return std::numeric_limits<Real>::infinity();
+  case FNACCKernelDesc::ReductionOperator::Max:
+    return -std::numeric_limits<Real>::infinity();
+  }
+  std::abort();
+}
+
+template <typename Real>
+static Real fnaccApplyReduction(
+    FNACCKernelDesc::ReductionOperator op, Real lhs, Real rhs) {
+  switch (op) {
+  case FNACCKernelDesc::ReductionOperator::Add:
+    return lhs + rhs;
+  case FNACCKernelDesc::ReductionOperator::Multiply:
+    return lhs * rhs;
+  case FNACCKernelDesc::ReductionOperator::Min:
+    return rhs < lhs ? rhs : lhs;
+  case FNACCKernelDesc::ReductionOperator::Max:
+    return rhs > lhs ? rhs : lhs;
+  }
+  std::abort();
+}
+
 template <typename Real>
 static bool fnaccFinalizeReductionOnDevice(const FNACCKernelDesc *primaryDesc,
-    CUdeviceptr dPartials, unsigned partialCount, Real *result) {
+    FNACCReductionWorkspace &workspace, CUdeviceptr dPartials,
+    unsigned partialCount, Real *result) {
   if (!primaryDesc || primaryDesc->reductionStageId < 0)
     return false;
 
@@ -3180,6 +3465,14 @@ static bool fnaccFinalizeReductionOnDevice(const FNACCKernelDesc *primaryDesc,
     std::abort();
   }
 
+  if (stageDesc->reductionOp != primaryDesc->reductionOp) {
+    std::fprintf(stderr,
+        "FNACC error: primary reduction kernel id %d and stage kernel id %d "
+        "use different reduction operators\n",
+        primaryDesc->id, stageKernelId);
+    std::abort();
+  }
+
   int32_t stageBlock = stageDesc->tileX;
   if (stageBlock <= 1) {
     std::fprintf(stderr,
@@ -3195,7 +3488,6 @@ static bool fnaccFinalizeReductionOnDevice(const FNACCKernelDesc *primaryDesc,
   fnaccValidateSupportedHiddenPtrArgCount(stageKernelId);
   fnaccValidateCudaBlockSize(stageFn, stageKernelId, stageCudaBlockX);
 
-  CUdeviceptr dScratch = 0;
   CUdeviceptr current = dPartials;
   CUdeviceptr next = 0;
 
@@ -3205,8 +3497,8 @@ static bool fnaccFinalizeReductionOnDevice(const FNACCKernelDesc *primaryDesc,
     std::size_t scratchBytes =
         fnaccCheckedMul(static_cast<std::size_t>(scratchElements), sizeof(Real),
             "hierarchical reduction scratch buffer");
-    FNACC_CUDA_CHECK(cuMemAlloc(&dScratch, scratchBytes));
-    next = dScratch;
+    next = fnaccReserveReductionBuffer(
+        workspace.scratch, scratchBytes, workspace.scratchStats, "scratch");
   }
 
   while (partialCount > 1) {
@@ -3231,7 +3523,8 @@ static bool fnaccFinalizeReductionOnDevice(const FNACCKernelDesc *primaryDesc,
     }
 
     FNACC_CUDA_CHECK(cuLaunchKernel(stageFn, outputCount, 1, 1, stageCudaBlockX,
-        1, 1, 0, nullptr, args, nullptr));
+        1, 1, 0, workspace.stream, args, nullptr));
+    ++workspace.stageLaunches;
 
     CUdeviceptr oldCurrent = current;
     current = next;
@@ -3239,11 +3532,8 @@ static bool fnaccFinalizeReductionOnDevice(const FNACCKernelDesc *primaryDesc,
     partialCount = outputCount;
   }
 
-  FNACC_CUDA_CHECK(cuCtxSynchronize());
+  fnaccWaitForStream(workspace.stream, workspace.completionEvent);
   FNACC_CUDA_CHECK(cuMemcpyDtoH(result, current, sizeof(Real)));
-
-  if (dScratch)
-    FNACC_CUDA_CHECK(cuMemFree(dScratch));
 
   return true;
 }
@@ -3267,11 +3557,6 @@ extern "C" void __fnacc_launch_reduce_f32_v1(int32_t kernelId, int32_t blockX,
     std::abort();
   }
 
-  if (extentX <= 0) {
-    *result = 0.0f;
-    return;
-  }
-
   CUfunction fn = getKernelFunction(kernelId);
   const FNACCKernelDesc *desc = fnaccLookupKernelDesc(kernelId);
   if (!desc) {
@@ -3280,6 +3565,13 @@ extern "C" void __fnacc_launch_reduce_f32_v1(int32_t kernelId, int32_t blockX,
         kernelId);
     std::abort();
   }
+
+  if (extentX <= 0) {
+    *result = fnaccReductionIdentity<float>(desc->reductionOp);
+    return;
+  }
+
+  FNACCReductionWorkspace &workspace = fnaccGetReductionWorkspace();
 
   unsigned gridX = fnaccCdiv(extentX, blockX);
   unsigned cudaBlockX = fnaccCudaThreadsPerCTA(kernelId);
@@ -3301,9 +3593,9 @@ extern "C" void __fnacc_launch_reduce_f32_v1(int32_t kernelId, int32_t blockX,
   CUdeviceptr dRead0 = read0Dev.ptr;
   CUdeviceptr dRead1 = read1Dev.ptr;
 
-  CUdeviceptr dPartials = 0;
   std::size_t partialBytes = static_cast<std::size_t>(gridX) * sizeof(float);
-  FNACC_CUDA_CHECK(cuMemAlloc(&dPartials, partialBytes));
+  CUdeviceptr dPartials = fnaccReserveReductionBuffer(
+      workspace.partials, partialBytes, workspace.partialStats, "partials");
 
   fnaccValidateSupportedHiddenPtrArgCount(kernelId);
   FNACCHiddenTritonArgs hidden;
@@ -3324,24 +3616,24 @@ extern "C" void __fnacc_launch_reduce_f32_v1(int32_t kernelId, int32_t blockX,
   fnaccValidateCudaBlockSize(fn, kernelId, cudaBlockX);
 
   FNACC_CUDA_CHECK(cuLaunchKernel(
-      fn, gridX, 1, 1, cudaBlockX, 1, 1, 0, nullptr, args, nullptr));
+      fn, gridX, 1, 1, cudaBlockX, 1, 1, 0, workspace.stream, args, nullptr));
+  ++workspace.primaryLaunches;
 
-  if (!fnaccFinalizeReductionOnDevice<float>(desc, dPartials, gridX, result)) {
+  if (!fnaccFinalizeReductionOnDevice<float>(
+          desc, workspace, dPartials, gridX, result)) {
     // Compatibility path for objects emitted before reduction_stage_id was
     // added to the JSON descriptor.
-    FNACC_CUDA_CHECK(cuCtxSynchronize());
+    fnaccWaitForStream(workspace.stream, workspace.completionEvent);
 
     std::vector<float> partials(gridX);
     FNACC_CUDA_CHECK(cuMemcpyDtoH(partials.data(), dPartials, partialBytes));
 
-    double sum = 0.0;
+    float reduced = fnaccReductionIdentity<float>(desc->reductionOp);
     for (float v : partials)
-      sum += static_cast<double>(v);
+      reduced = fnaccApplyReduction(desc->reductionOp, reduced, v);
 
-    *result = static_cast<float>(sum);
+    *result = reduced;
   }
-
-  FNACC_CUDA_CHECK(cuMemFree(dPartials));
 
   fnaccReleaseDeviceArg(read0Dev);
   if (numReadArrays >= 2)
@@ -3367,11 +3659,6 @@ extern "C" void __fnacc_launch_reduce_f64_v1(int32_t kernelId, int32_t blockX,
     std::abort();
   }
 
-  if (extentX <= 0) {
-    *result = 0.0f;
-    return;
-  }
-
   CUfunction fn = getKernelFunction(kernelId);
   const FNACCKernelDesc *desc = fnaccLookupKernelDesc(kernelId);
   if (!desc) {
@@ -3380,6 +3667,13 @@ extern "C" void __fnacc_launch_reduce_f64_v1(int32_t kernelId, int32_t blockX,
         kernelId);
     std::abort();
   }
+
+  if (extentX <= 0) {
+    *result = fnaccReductionIdentity<double>(desc->reductionOp);
+    return;
+  }
+
+  FNACCReductionWorkspace &workspace = fnaccGetReductionWorkspace();
 
   unsigned gridX = fnaccCdiv(extentX, blockX);
   unsigned cudaBlockX = fnaccCudaThreadsPerCTA(kernelId);
@@ -3401,9 +3695,9 @@ extern "C" void __fnacc_launch_reduce_f64_v1(int32_t kernelId, int32_t blockX,
   CUdeviceptr dRead0 = read0Dev.ptr;
   CUdeviceptr dRead1 = read1Dev.ptr;
 
-  CUdeviceptr dPartials = 0;
   std::size_t partialBytes = static_cast<std::size_t>(gridX) * sizeof(double);
-  FNACC_CUDA_CHECK(cuMemAlloc(&dPartials, partialBytes));
+  CUdeviceptr dPartials = fnaccReserveReductionBuffer(
+      workspace.partials, partialBytes, workspace.partialStats, "partials");
 
   fnaccValidateSupportedHiddenPtrArgCount(kernelId);
   FNACCHiddenTritonArgs hidden;
@@ -3424,28 +3718,59 @@ extern "C" void __fnacc_launch_reduce_f64_v1(int32_t kernelId, int32_t blockX,
   fnaccValidateCudaBlockSize(fn, kernelId, cudaBlockX);
 
   FNACC_CUDA_CHECK(cuLaunchKernel(
-      fn, gridX, 1, 1, cudaBlockX, 1, 1, 0, nullptr, args, nullptr));
+      fn, gridX, 1, 1, cudaBlockX, 1, 1, 0, workspace.stream, args, nullptr));
+  ++workspace.primaryLaunches;
 
-  if (!fnaccFinalizeReductionOnDevice<double>(desc, dPartials, gridX, result)) {
+  if (!fnaccFinalizeReductionOnDevice<double>(
+          desc, workspace, dPartials, gridX, result)) {
     // Compatibility path for objects emitted before reduction_stage_id was
     // added to the JSON descriptor.
-    FNACC_CUDA_CHECK(cuCtxSynchronize());
+    fnaccWaitForStream(workspace.stream, workspace.completionEvent);
 
     std::vector<double> partials(gridX);
     FNACC_CUDA_CHECK(cuMemcpyDtoH(partials.data(), dPartials, partialBytes));
 
-    double sum = 0.0;
+    double reduced = fnaccReductionIdentity<double>(desc->reductionOp);
     for (double v : partials)
-      sum += v;
+      reduced = fnaccApplyReduction(desc->reductionOp, reduced, v);
 
-    *result = sum;
+    *result = reduced;
   }
-
-  FNACC_CUDA_CHECK(cuMemFree(dPartials));
 
   fnaccReleaseDeviceArg(read0Dev);
   if (numReadArrays >= 2)
     fnaccReleaseDeviceArg(read1Dev);
+}
+
+extern "C" void __fnacc_get_reduction_workspace_stats_v1(
+    uint64_t *primaryLaunches, uint64_t *stageLaunches,
+    uint64_t *partialAllocations, uint64_t *partialGrowths,
+    uint64_t *partialReuses, uint64_t *partialCapacityBytes,
+    uint64_t *scratchAllocations, uint64_t *scratchGrowths,
+    uint64_t *scratchReuses, uint64_t *scratchCapacityBytes) {
+  FNACC_RUNTIME_GUARD();
+
+  FNACCReductionWorkspace workspace = fnaccAggregateReductionWorkspaceStats();
+  if (primaryLaunches)
+    *primaryLaunches = workspace.primaryLaunches;
+  if (stageLaunches)
+    *stageLaunches = workspace.stageLaunches;
+  if (partialAllocations)
+    *partialAllocations = workspace.partialStats.allocations;
+  if (partialGrowths)
+    *partialGrowths = workspace.partialStats.growths;
+  if (partialReuses)
+    *partialReuses = workspace.partialStats.reuses;
+  if (partialCapacityBytes)
+    *partialCapacityBytes = static_cast<uint64_t>(workspace.partials.bytes);
+  if (scratchAllocations)
+    *scratchAllocations = workspace.scratchStats.allocations;
+  if (scratchGrowths)
+    *scratchGrowths = workspace.scratchStats.growths;
+  if (scratchReuses)
+    *scratchReuses = workspace.scratchStats.reuses;
+  if (scratchCapacityBytes)
+    *scratchCapacityBytes = static_cast<uint64_t>(workspace.scratch.bytes);
 }
 
 // Memory management functions to help with cached data and data lifetimes
@@ -3459,8 +3784,9 @@ extern "C" void __fnacc_update_host(void *hostPtr) {
     return;
   }
 
-  auto it = fnaccRegistry.deviceCache.find(hostPtr);
-  if (it == fnaccRegistry.deviceCache.end()) {
+  auto &cache = fnaccActiveContextState().deviceCache;
+  auto it = cache.find(hostPtr);
+  if (it == cache.end()) {
     std::fprintf(stderr,
         "FNACC error: update_host has no cached allocation for %p; "
         "use create/copyin/update_device first\n",
@@ -3487,8 +3813,9 @@ extern "C" void __fnacc_update_device(void *hostPtr) {
     return;
   }
 
-  auto it = fnaccRegistry.deviceCache.find(hostPtr);
-  if (it == fnaccRegistry.deviceCache.end()) {
+  auto &cache = fnaccActiveContextState().deviceCache;
+  auto it = cache.find(hostPtr);
+  if (it == cache.end()) {
     std::fprintf(stderr,
         "FNACC error: update_device has no cached allocation for %p; "
         "use a sized update/create directive first\n",
@@ -3515,8 +3842,9 @@ extern "C" void __fnacc_release(void *hostPtr) {
     return;
   }
 
-  auto it = fnaccRegistry.deviceCache.find(hostPtr);
-  if (it == fnaccRegistry.deviceCache.end()) {
+  auto &cache = fnaccActiveContextState().deviceCache;
+  auto it = cache.find(hostPtr);
+  if (it == cache.end()) {
     if (fnaccDebugEnabled()) {
       std::fprintf(stderr,
           "FNACC: release ignored; no cached allocation for %p\n", hostPtr);
@@ -3529,7 +3857,7 @@ extern "C" void __fnacc_release(void *hostPtr) {
 
   FNACC_CUDA_CHECK(cuMemFree(devicePtr));
 
-  fnaccRegistry.deviceCache.erase(it);
+  cache.erase(it);
 
   if (fnaccDebugEnabled()) {
     std::fprintf(stderr, "FNACC: release host=%p device=0x%llx bytes=%zu\n",
@@ -3541,13 +3869,13 @@ extern "C" void __fnacc_release_all() {
   FNACC_RUNTIME_GUARD();
   fnaccEnsureCurrentContext();
 
+  auto &cache = fnaccActiveContextState().deviceCache;
   if (fnaccDebugEnabled()) {
     std::fprintf(stderr,
-        "FNACC: release_all releasing %zu cached allocations\n",
-        fnaccRegistry.deviceCache.size());
+        "FNACC: release_all releasing %zu cached allocations\n", cache.size());
   }
 
-  for (auto &entry : fnaccRegistry.deviceCache) {
+  for (auto &entry : cache) {
     void *hostPtr = entry.first;
     FNACCDeviceAllocation &allocation = entry.second;
 
@@ -3560,7 +3888,7 @@ extern "C" void __fnacc_release_all() {
     FNACC_CUDA_CHECK(cuMemFree(allocation.ptr));
   }
 
-  fnaccRegistry.deviceCache.clear();
+  cache.clear();
 }
 
 extern "C" void __fnacc_register_embedded_kernel_bundle(

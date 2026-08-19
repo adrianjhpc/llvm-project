@@ -80,8 +80,10 @@ llvm::LogicalResult fir::fnacc::LaunchOp::verify() {
         return emitOpError("reduction slot is outside the pack variable list");
       if (!seenSlots.insert(slot).second)
         return emitOpError("duplicate reduction slot");
-      if (op != 0)
-        return emitOpError("only SUM reduction operation code 0 is supported");
+      if (op < 0 || op > 3)
+        return emitOpError(
+            "only add, multiply, min, and max reduction operations (codes 0, "
+            "1, 2, 3) are currently supported");
     }
   }
 

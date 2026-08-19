@@ -43,6 +43,7 @@ end subroutine
 
 ! JSON: "fnacc_schema_version": 1
 ! JSON-DAG: "kind": "reduction_sum1d"
+! JSON-DAG: "reduction_op": "add"
 ! JSON-DAG: "reduction_stage_id": 1
 ! JSON-DAG: "rank": 1
 ! JSON-DAG: "tile": [256, 1, 1]

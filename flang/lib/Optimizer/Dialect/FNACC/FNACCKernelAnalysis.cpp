@@ -6,6 +6,8 @@
 #include "mlir/IR/Matchers.h"
 #include "llvm/ADT/APFloat.h"
 
+#include <utility>
+
 using namespace mlir;
 
 namespace fir::fnacc {
@@ -923,24 +925,34 @@ getSingleReductionScalarFromLaunch(fir::fnacc::LaunchOp launchOp) {
   return packVars[slot];
 }
 
-static bool allReductionOpsAreAdd(fir::fnacc::LaunchOp launchOp) {
+static std::optional<ReductionOperator>
+getSingleReductionOperator(fir::fnacc::LaunchOp launchOp) {
   auto opsAttr =
       launchOp->getAttrOfType<DenseI32ArrayAttr>("fnacc.reduction_ops");
 
   if (!opsAttr)
-    return true; // Backwards-compatible default: reduction(+) only.
+    return ReductionOperator::Add; // Backwards-compatible default.
 
   llvm::ArrayRef<int32_t> ops = opsAttr.asArrayRef();
 
   if (ops.empty())
-    return true;
+    return ReductionOperator::Add;
 
-  // 0 = add
-  for (int32_t op : ops)
-    if (op != 0)
-      return false;
+  if (ops.size() != 1)
+    return std::nullopt;
 
-  return true;
+  switch (ops.front()) {
+  case 0:
+    return ReductionOperator::Add;
+  case 1:
+    return ReductionOperator::Multiply;
+  case 2:
+    return ReductionOperator::Min;
+  case 3:
+    return ReductionOperator::Max;
+  default:
+    return std::nullopt;
+  }
 }
 
 static bool collectReductionArrayLoads1D(
@@ -1060,20 +1072,82 @@ static bool valueIsLoadOfMemref(Value v, Value memref) {
   return load && load.getMemref() == memref;
 }
 
-static bool matchReductionSumValue(Value value,
-                                   ArrayRef<ReductionArrayLoadInfo> loads,
-                                   Value reductionScalarRef, Value &arrayBase,
-                                   Operation *&computeOp, std::string &reason) {
+static bool reductionOperationMatches(Operation *op,
+                                      ReductionOperator reductionOp) {
+  if (!op)
+    return false;
+
+  StringRef name = op->getName().getStringRef();
+  switch (reductionOp) {
+  case ReductionOperator::Add:
+    return name == "arith.addf";
+  case ReductionOperator::Multiply:
+    return name == "arith.mulf";
+  case ReductionOperator::Min:
+    if (name == "arith.minimumf" || name == "arith.minnumf")
+      return true;
+    break;
+  case ReductionOperator::Max:
+    if (name == "arith.maximumf" || name == "arith.maxnumf")
+      return true;
+    break;
+  }
+
+  auto select = dyn_cast<arith::SelectOp>(op);
+  if (!select || (reductionOp != ReductionOperator::Min &&
+                  reductionOp != ReductionOperator::Max))
+    return false;
+
+  auto compare = select.getCondition().getDefiningOp<arith::CmpFOp>();
+  if (!compare)
+    return false;
+
+  Value cmpLhs = stripFirConvert(compare.getLhs());
+  Value cmpRhs = stripFirConvert(compare.getRhs());
+  Value trueValue = stripFirConvert(select.getTrueValue());
+  Value falseValue = stripFirConvert(select.getFalseValue());
+
+  bool direct = trueValue == cmpLhs && falseValue == cmpRhs;
+  bool reversed = trueValue == cmpRhs && falseValue == cmpLhs;
+  if (!direct && !reversed)
+    return false;
+
+  using Predicate = arith::CmpFPredicate;
+  Predicate predicate = compare.getPredicate();
+  bool less = predicate == Predicate::OLT || predicate == Predicate::OLE ||
+              predicate == Predicate::ULT || predicate == Predicate::ULE;
+  bool greater = predicate == Predicate::OGT || predicate == Predicate::OGE ||
+                 predicate == Predicate::UGT || predicate == Predicate::UGE;
+
+  if (reversed)
+    std::swap(less, greater);
+
+  return reductionOp == ReductionOperator::Min ? less : greater;
+}
+
+static bool matchSimpleReductionValue(Value value,
+                                      ArrayRef<ReductionArrayLoadInfo> loads,
+                                      Value reductionScalarRef,
+                                      ReductionOperator reductionOp,
+                                      Value &arrayBase, Operation *&computeOp,
+                                      std::string &reason) {
   value = stripFirConvert(value);
 
-  auto add = value.getDefiningOp<arith::AddFOp>();
-  if (!add) {
-    reason = "reduction store value is not arith.addf";
+  Operation *op = value.getDefiningOp();
+  if (!reductionOperationMatches(op, reductionOp)) {
+    reason = "reduction store value does not match directive operator";
     return false;
   }
 
-  Value lhs = stripFirConvert(add.getLhs());
-  Value rhs = stripFirConvert(add.getRhs());
+  unsigned lhsIndex = op->getName().getStringRef() == "arith.select" ? 1 : 0;
+  unsigned rhsIndex = lhsIndex + 1;
+  if (op->getNumOperands() <= rhsIndex) {
+    reason = "reduction operation has too few operands";
+    return false;
+  }
+
+  Value lhs = stripFirConvert(op->getOperand(lhsIndex));
+  Value rhs = stripFirConvert(op->getOperand(rhsIndex));
 
   Value candidate;
 
@@ -1082,18 +1156,18 @@ static bool matchReductionSumValue(Value value,
   } else if (valueIsLoadOfMemref(rhs, reductionScalarRef)) {
     candidate = lhs;
   } else {
-    reason = "reduction add does not include previous scalar value";
+    reason = "reduction operation does not include previous scalar value";
     return false;
   }
 
   int loadIndex = findReductionLoadedValueIndex(loads, candidate);
   if (loadIndex < 0) {
-    reason = "reduction sum term is not an array element load";
+    reason = "reduction term is not an array element load";
     return false;
   }
 
   arrayBase = loads[loadIndex].arrayBase;
-  computeOp = add.getOperation();
+  computeOp = op;
   return true;
 }
 
@@ -1154,8 +1228,10 @@ recognizeReduction1D(fir::fnacc::LaunchOp launchOp) {
   if (!launchOp->hasAttr("fnacc.reduction_slots"))
     return fail(launchOp, "launch has no FNACC reduction metadata");
 
-  if (!allReductionOpsAreAdd(launchOp))
-    return fail(launchOp, "only reduction(+) is currently supported");
+  std::optional<ReductionOperator> reductionOp =
+      getSingleReductionOperator(launchOp);
+  if (!reductionOp)
+    return fail(launchOp, "reduction requires one supported operator");
 
   std::optional<Value> reductionScalar =
       getSingleReductionScalarFromLaunch(launchOp);
@@ -1229,6 +1305,7 @@ recognizeReduction1D(fir::fnacc::LaunchOp launchOp) {
   k.extentX = extentX;
   k.innerIndMemref = indMemref;
   k.reductionScalarRef = *reductionScalar;
+  k.reductionOperator = *reductionOp;
   k.writeArray = {};
   k.scalarRefs.clear();
 
@@ -1238,7 +1315,8 @@ recognizeReduction1D(fir::fnacc::LaunchOp launchOp) {
   Operation *computeOp = nullptr;
 
   std::string dotReason;
-  if (matchReductionDotValue(reductionStore.getValue(), loads, *reductionScalar,
+  if (*reductionOp == ReductionOperator::Add &&
+      matchReductionDotValue(reductionStore.getValue(), loads, *reductionScalar,
                              arrayA, arrayB, computeOp, dotReason)) {
     k.kind = ElementwiseKernelKind::ReductionDot1D;
     k.readArrays.push_back(arrayA);
@@ -1254,10 +1332,24 @@ recognizeReduction1D(fir::fnacc::LaunchOp launchOp) {
   Value arrayBase;
   computeOp = nullptr;
 
-  std::string sumReason;
-  if (matchReductionSumValue(reductionStore.getValue(), loads, *reductionScalar,
-                             arrayBase, computeOp, sumReason)) {
-    k.kind = ElementwiseKernelKind::ReductionSum1D;
+  std::string simpleReason;
+  if (matchSimpleReductionValue(reductionStore.getValue(), loads,
+                                *reductionScalar, *reductionOp, arrayBase,
+                                computeOp, simpleReason)) {
+    switch (*reductionOp) {
+    case ReductionOperator::Add:
+      k.kind = ElementwiseKernelKind::ReductionSum1D;
+      break;
+    case ReductionOperator::Multiply:
+      k.kind = ElementwiseKernelKind::ReductionProduct1D;
+      break;
+    case ReductionOperator::Min:
+      k.kind = ElementwiseKernelKind::ReductionMin1D;
+      break;
+    case ReductionOperator::Max:
+      k.kind = ElementwiseKernelKind::ReductionMax1D;
+      break;
+    }
     k.readArrays.push_back(arrayBase);
     k.computeOp = computeOp;
 
@@ -1269,8 +1361,8 @@ recognizeReduction1D(fir::fnacc::LaunchOp launchOp) {
 
   reason = "unsupported reduction expression; dot failure: ";
   reason += dotReason;
-  reason += "; sum failure: ";
-  reason += sumReason;
+  reason += "; simple reduction failure: ";
+  reason += simpleReason;
 
   return fail(loop.getOperation(), reason);
 }

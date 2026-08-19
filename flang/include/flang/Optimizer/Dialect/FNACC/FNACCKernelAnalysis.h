@@ -51,7 +51,18 @@ enum class ElementwiseKernelKind {
   Expr2D,
   MatMul2D,
   ReductionSum1D,
-  ReductionDot1D
+  ReductionDot1D,
+  ReductionProduct1D,
+  ReductionMin1D,
+  ReductionMax1D
+};
+
+/// Stable values written to fnacc.reduction_ops and kernel JSON.
+enum class ReductionOperator : int32_t {
+  Add = 0,
+  Multiply = 1,
+  Min = 2,
+  Max = 3
 };
 
 enum class ElementwiseExprKind {
@@ -130,6 +141,8 @@ struct ElementwiseKernel {
   llvm::SmallVector<mlir::Value> scalarRefs;
 
   mlir::Operation *computeOp = nullptr;
+
+  ReductionOperator reductionOperator = ReductionOperator::Add;
 
   std::unique_ptr<ElementwiseExpr> expression;
 

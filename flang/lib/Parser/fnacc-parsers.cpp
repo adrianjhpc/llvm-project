@@ -26,7 +26,10 @@ TYPE_PARSER(construct<FnACCPackClause::Item>(
 TYPE_PARSER(construct<FnACCPackClause>(
     "PACK"_tok >> parenthesized(nonemptyList(Parser<FnACCPackClause::Item>{}))))
 
-TYPE_PARSER("+"_tok >> pure(FnACCReductionOperator::Add))
+TYPE_PARSER("+"_tok >> pure(FnACCReductionOperator::Add) ||
+    "*"_tok >> pure(FnACCReductionOperator::Multiply) ||
+    "MIN"_tok >> pure(FnACCReductionOperator::Min) ||
+    "MAX"_tok >> pure(FnACCReductionOperator::Max))
 
 TYPE_PARSER(construct<FnACCReductionClause::Item>(
     Parser<FnACCReductionOperator>{}, ":"_tok >> name))

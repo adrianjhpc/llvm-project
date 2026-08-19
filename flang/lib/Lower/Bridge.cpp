@@ -3594,10 +3594,22 @@ private:
                   if (name.symbol) {
                     reductionVars.push_back(getSymbolAddress(*name.symbol));
 
-                    // 0 = add
-                    reductionOps.push_back(
-                        op == Fortran::parser::FnACCReductionOperator::Add ? 0
-                                                                           : 0);
+                    // Stable runtime/compiler metadata:
+                    //   0 = add, 1 = multiply, 2 = min, 3 = max.
+                    switch (op) {
+                    case Fortran::parser::FnACCReductionOperator::Add:
+                      reductionOps.push_back(0);
+                      break;
+                    case Fortran::parser::FnACCReductionOperator::Multiply:
+                      reductionOps.push_back(1);
+                      break;
+                    case Fortran::parser::FnACCReductionOperator::Min:
+                      reductionOps.push_back(2);
+                      break;
+                    case Fortran::parser::FnACCReductionOperator::Max:
+                      reductionOps.push_back(3);
+                      break;
+                    }
                   }
                 }
               },

@@ -18,7 +18,7 @@ struct FnACCTileClause {
   WRAPPER_CLASS_BOILERPLATE(FnACCTileClause, std::list<ScalarIntConstantExpr>);
 };
 
-ENUM_CLASS(FnACCReductionOperator, Add);
+ENUM_CLASS(FnACCReductionOperator, Add, Multiply, Min, Max);
 
 struct FnACCReductionClause {
   struct Item {

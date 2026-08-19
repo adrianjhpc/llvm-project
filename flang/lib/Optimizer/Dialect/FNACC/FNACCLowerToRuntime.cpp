@@ -930,7 +930,10 @@ struct FNACCLowerToRuntimePass
       }
 
       if (k.kind == fir::fnacc::ElementwiseKernelKind::ReductionSum1D ||
-          k.kind == fir::fnacc::ElementwiseKernelKind::ReductionDot1D) {
+          k.kind == fir::fnacc::ElementwiseKernelKind::ReductionDot1D ||
+          k.kind == fir::fnacc::ElementwiseKernelKind::ReductionProduct1D ||
+          k.kind == fir::fnacc::ElementwiseKernelKind::ReductionMin1D ||
+          k.kind == fir::fnacc::ElementwiseKernelKind::ReductionMax1D) {
         if (!k.reductionScalarRef) {
           launchOp.emitError("FNACC reduction has no reduction scalar ref");
           signalPassFailure();

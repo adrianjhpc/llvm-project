@@ -107,12 +107,20 @@ static int32_t getKernelNumWarps(const fir::fnacc::ElementwiseKernel &k,
     return requestedNumWarps;
 
   switch (k.kind) {
+  case Kind::ReductionSum1D:
+  case Kind::ReductionDot1D:
+  case Kind::ReductionProduct1D:
+  case Kind::ReductionMin1D:
+  case Kind::ReductionMax1D:
+    // The pass default remains one warp. Values greater than one are recorded
+    // for both the primary and hierarchical follow-up kernels; the driver
+    // completes lowering of any residual warp-id query automatically.
+    return requestedNumWarps;
+
   case Kind::BinaryArrayArray:
   case Kind::Saxpy1D:
   case Kind::Expr1D:
   case Kind::Expr2D:
-  case Kind::ReductionSum1D:
-  case Kind::ReductionDot1D:
     return 1;
 
   case Kind::MatMul2D:
@@ -397,9 +405,54 @@ static void emitTritonExpr1D(const fir::fnacc::ElementwiseKernel &k,
   os << "}\n\n";
 }
 
-static void emitTritonReductionSum1D(const fir::fnacc::ElementwiseKernel &k,
-                                     int64_t block, StringRef kernelName,
-                                     llvm::raw_ostream &os) {
+static StringRef reductionOperatorName(fir::fnacc::ReductionOperator op) {
+  switch (op) {
+  case fir::fnacc::ReductionOperator::Add:
+    return "add";
+  case fir::fnacc::ReductionOperator::Multiply:
+    return "multiply";
+  case fir::fnacc::ReductionOperator::Min:
+    return "min";
+  case fir::fnacc::ReductionOperator::Max:
+    return "max";
+  }
+  llvm_unreachable("unknown FNACC reduction operator");
+}
+
+static StringRef reductionArithOp(fir::fnacc::ReductionOperator op) {
+  switch (op) {
+  case fir::fnacc::ReductionOperator::Add:
+    return "arith.addf";
+  case fir::fnacc::ReductionOperator::Multiply:
+    return "arith.mulf";
+  case fir::fnacc::ReductionOperator::Min:
+    return "arith.minimumf";
+  case fir::fnacc::ReductionOperator::Max:
+    return "arith.maximumf";
+  }
+  llvm_unreachable("unknown FNACC reduction operator");
+}
+
+static StringRef reductionIdentity(fir::fnacc::ReductionOperator op,
+                                   fir::fnacc::ElementType type) {
+  switch (op) {
+  case fir::fnacc::ReductionOperator::Add:
+    return "0.000000e+00";
+  case fir::fnacc::ReductionOperator::Multiply:
+    return "1.000000e+00";
+  case fir::fnacc::ReductionOperator::Min:
+    return type == fir::fnacc::ElementType::F64 ? "0x7FF0000000000000"
+                                                : "0x7F800000";
+  case fir::fnacc::ReductionOperator::Max:
+    return type == fir::fnacc::ElementType::F64 ? "0xFFF0000000000000"
+                                                : "0xFF800000";
+  }
+  llvm_unreachable("unknown FNACC reduction operator");
+}
+
+static void emitTritonReduction1D(const fir::fnacc::ElementwiseKernel &k,
+                                  int64_t block, StringRef kernelName,
+                                  llvm::raw_ostream &os) {
   std::string ptrTy = ptrType(k.elementType);
   std::string elemTy = ttElementType(k.elementType).str();
 
@@ -424,21 +477,24 @@ static void emitTritonReductionSum1D(const fir::fnacc::ElementwiseKernel &k,
   os << "  %vals = tt.load %ao, %mask : tensor<" << block << "x" << ptrTy
      << ">\n";
 
-  os << "  %zero = arith.constant 0.000000e+00 : " << elemTy << "\n";
-  os << "  %zero_s = tt.splat %zero : " << elemTy << " -> tensor<" << block
-     << "x" << elemTy << ">\n";
-  os << "  %safe = arith.select %mask, %vals, %zero_s : tensor<" << block
+  os << "  %identity = arith.constant "
+     << reductionIdentity(k.reductionOperator, k.elementType) << " : " << elemTy
+     << "\n";
+  os << "  %identity_s = tt.splat %identity : " << elemTy << " -> tensor<"
+     << block << "x" << elemTy << ">\n";
+  os << "  %safe = arith.select %mask, %vals, %identity_s : tensor<" << block
      << "xi1>, tensor<" << block << "x" << elemTy << ">\n";
 
-  os << "  %sum = \"tt.reduce\"(%safe) ({\n";
+  os << "  %reduced = \"tt.reduce\"(%safe) ({\n";
   os << "  ^bb0(%lhs: " << elemTy << ", %rhs: " << elemTy << "):\n";
-  os << "    %r = arith.addf %lhs, %rhs : " << elemTy << "\n";
+  os << "    %r = " << reductionArithOp(k.reductionOperator)
+     << " %lhs, %rhs : " << elemTy << "\n";
   os << "    \"tt.reduce.return\"(%r) : (" << elemTy << ") -> ()\n";
   os << "  }) {axis = 0 : i32} : (tensor<" << block << "x" << elemTy << ">) -> "
      << elemTy << "\n";
 
   os << "  %outp = tt.addptr %partials, %pid : " << ptrTy << ", i32\n";
-  os << "  tt.store %outp, %sum : " << ptrTy << "\n";
+  os << "  tt.store %outp, %reduced : " << ptrTy << "\n";
 
   os << "  tt.return\n";
   os << "}\n\n";
@@ -449,6 +505,7 @@ static void emitTritonReductionSum1D(const fir::fnacc::ElementwiseKernel &k,
 /// sums and writes one value for the next stage. The runtime repeatedly invokes
 /// this kernel until only a single device value remains.
 static void emitTritonReductionStage1D(fir::fnacc::ElementType type,
+                                       fir::fnacc::ReductionOperator op,
                                        int64_t block, StringRef kernelName,
                                        llvm::raw_ostream &os) {
   std::string ptrTy = ptrType(type);
@@ -475,21 +532,23 @@ static void emitTritonReductionStage1D(fir::fnacc::ElementType type,
   os << "  %vals = tt.load %input_ptrs, %mask : tensor<" << block << "x"
      << ptrTy << ">\n";
 
-  os << "  %zero = arith.constant 0.000000e+00 : " << elemTy << "\n";
-  os << "  %zero_s = tt.splat %zero : " << elemTy << " -> tensor<" << block
-     << "x" << elemTy << ">\n";
-  os << "  %safe = arith.select %mask, %vals, %zero_s : tensor<" << block
+  os << "  %identity = arith.constant " << reductionIdentity(op, type) << " : "
+     << elemTy << "\n";
+  os << "  %identity_s = tt.splat %identity : " << elemTy << " -> tensor<"
+     << block << "x" << elemTy << ">\n";
+  os << "  %safe = arith.select %mask, %vals, %identity_s : tensor<" << block
      << "xi1>, tensor<" << block << "x" << elemTy << ">\n";
 
-  os << "  %sum = \"tt.reduce\"(%safe) ({\n";
+  os << "  %reduced = \"tt.reduce\"(%safe) ({\n";
   os << "  ^bb0(%lhs: " << elemTy << ", %rhs: " << elemTy << "):\n";
-  os << "    %r = arith.addf %lhs, %rhs : " << elemTy << "\n";
+  os << "    %r = " << reductionArithOp(op) << " %lhs, %rhs : " << elemTy
+     << "\n";
   os << "    \"tt.reduce.return\"(%r) : (" << elemTy << ") -> ()\n";
   os << "  }) {axis = 0 : i32} : (tensor<" << block << "x" << elemTy << ">) -> "
      << elemTy << "\n";
 
   os << "  %outp = tt.addptr %output, %pid : " << ptrTy << ", i32\n";
-  os << "  tt.store %outp, %sum : " << ptrTy << "\n";
+  os << "  tt.store %outp, %reduced : " << ptrTy << "\n";
   os << "  tt.return\n";
   os << "}\n\n";
 }
@@ -1410,6 +1469,12 @@ static void emitJsonDescriptor(
     kindName = "reduction_sum1d";
   else if (k.kind == fir::fnacc::ElementwiseKernelKind::ReductionDot1D)
     kindName = "reduction_dot1d";
+  else if (k.kind == fir::fnacc::ElementwiseKernelKind::ReductionProduct1D)
+    kindName = "reduction_product1d";
+  else if (k.kind == fir::fnacc::ElementwiseKernelKind::ReductionMin1D)
+    kindName = "reduction_min1d";
+  else if (k.kind == fir::fnacc::ElementwiseKernelKind::ReductionMax1D)
+    kindName = "reduction_max1d";
 
   std::string ptrJsonTy = jsonPtrType(k.elementType);
   std::string elemJsonTy = jsonElementType(k.elementType);
@@ -1442,7 +1507,14 @@ static void emitJsonDescriptor(
 
   bool isReduction =
       k.kind == fir::fnacc::ElementwiseKernelKind::ReductionSum1D ||
-      k.kind == fir::fnacc::ElementwiseKernelKind::ReductionDot1D;
+      k.kind == fir::fnacc::ElementwiseKernelKind::ReductionDot1D ||
+      k.kind == fir::fnacc::ElementwiseKernelKind::ReductionProduct1D ||
+      k.kind == fir::fnacc::ElementwiseKernelKind::ReductionMin1D ||
+      k.kind == fir::fnacc::ElementwiseKernelKind::ReductionMax1D;
+
+  if (isReduction)
+    os << "      \"reduction_op\": \""
+       << reductionOperatorName(k.reductionOperator) << "\",\n";
 
   os << "      \"params\": [\n";
 
@@ -1580,8 +1652,9 @@ static void emitJsonDescriptor(
 }
 
 static void emitJsonReductionStageDescriptor(
-    fir::fnacc::ElementType type, int64_t block, int32_t kernelId,
-    int32_t ptxIndex, llvm::StringRef kernelName, int32_t tritonNumWarps,
+    fir::fnacc::ElementType type, fir::fnacc::ReductionOperator reductionOp,
+    int64_t block, int32_t kernelId, int32_t ptxIndex,
+    llvm::StringRef kernelName, int32_t tritonNumWarps,
     int32_t tritonThreadsPerWarp, int32_t tritonNumStages,
     int32_t cudaThreadsPerCTA, llvm::raw_ostream &os, bool &firstKernel) {
   if (!firstKernel)
@@ -1596,6 +1669,8 @@ static void emitJsonReductionStageDescriptor(
   os << "      \"ptx_index\": " << ptxIndex << ",\n";
   os << "      \"ptx_file\": \"" << kernelName << ".ptx\",\n";
   os << "      \"kind\": \"reduction_stage1d\",\n";
+  os << "      \"reduction_op\": \"" << reductionOperatorName(reductionOp)
+     << "\",\n";
   os << "      \"rank\": 1,\n";
   os << "      \"tile\": [" << block << ", 1, 1],\n";
   os << "      \"num_warps\": " << tritonNumWarps << ",\n";
@@ -1685,6 +1760,9 @@ struct FNACCLowerToTritonPass
 
       case fir::fnacc::ElementwiseKernelKind::ReductionSum1D:
       case fir::fnacc::ElementwiseKernelKind::ReductionDot1D:
+      case fir::fnacc::ElementwiseKernelKind::ReductionProduct1D:
+      case fir::fnacc::ElementwiseKernelKind::ReductionMin1D:
+      case fir::fnacc::ElementwiseKernelKind::ReductionMax1D:
         hasReductionLaunch = true;
         break;
 
@@ -1772,7 +1850,10 @@ struct FNACCLowerToTritonPass
 
       bool isReduction =
           k.kind == fir::fnacc::ElementwiseKernelKind::ReductionSum1D ||
-          k.kind == fir::fnacc::ElementwiseKernelKind::ReductionDot1D;
+          k.kind == fir::fnacc::ElementwiseKernelKind::ReductionDot1D ||
+          k.kind == fir::fnacc::ElementwiseKernelKind::ReductionProduct1D ||
+          k.kind == fir::fnacc::ElementwiseKernelKind::ReductionMin1D ||
+          k.kind == fir::fnacc::ElementwiseKernelKind::ReductionMax1D;
       int32_t reductionStageId = isReduction ? nextSyntheticKernelId++ : -1;
       std::string reductionStageName = kernelName + "_reduce_stage";
 
@@ -1827,9 +1908,8 @@ struct FNACCLowerToTritonPass
 
         if (k.kind == fir::fnacc::ElementwiseKernelKind::ReductionDot1D) {
           emitTritonReductionDot1D(k, blockX, kernelName, ttirOs);
-        } else if (k.kind ==
-                   fir::fnacc::ElementwiseKernelKind::ReductionSum1D) {
-          emitTritonReductionSum1D(k, blockX, kernelName, ttirOs);
+        } else if (isReduction) {
+          emitTritonReduction1D(k, blockX, kernelName, ttirOs);
         } else if (k.kind == fir::fnacc::ElementwiseKernelKind::Expr1D) {
           emitTritonExpr1D(k, blockX, kernelName, ttirOs);
         } else if (k.kind == fir::fnacc::ElementwiseKernelKind::Saxpy1D) {
@@ -1840,8 +1920,8 @@ struct FNACCLowerToTritonPass
       }
 
       if (isReduction) {
-        emitTritonReductionStage1D(k.elementType, blockX, reductionStageName,
-                                   ttirOs);
+        emitTritonReductionStage1D(k.elementType, k.reductionOperator, blockX,
+                                   reductionStageName, ttirOs);
       }
 
       int32_t kernelNumWarps = getKernelNumWarps(k, tritonNumWarps);
@@ -1856,9 +1936,10 @@ struct FNACCLowerToTritonPass
 
       if (isReduction) {
         emitJsonReductionStageDescriptor(
-            k.elementType, blockX, reductionStageId, emittedPtxIndex,
-            reductionStageName, kernelNumWarps, tritonThreadsPerWarp,
-            tritonNumStages, kernelCudaThreadsPerCTA, jsonOs, firstKernel);
+            k.elementType, k.reductionOperator, blockX, reductionStageId,
+            emittedPtxIndex, reductionStageName, kernelNumWarps,
+            tritonThreadsPerWarp, tritonNumStages, kernelCudaThreadsPerCTA,
+            jsonOs, firstKernel);
         ++emittedPtxIndex;
       }
 
