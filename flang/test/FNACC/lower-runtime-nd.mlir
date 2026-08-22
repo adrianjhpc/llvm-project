@@ -37,7 +37,7 @@ module {
         fir.store %r to %cp : !fir.ref<f32>
       }
 
-      "fir.end"() : () -> ()
+      fnacc.terminator
     } attributes {pack_targets = array<i32: 0, 1>}
 
     return
@@ -92,7 +92,7 @@ module {
         }
       }
 
-      "fir.end"() : () -> ()
+      fnacc.terminator
     } attributes {pack_targets = array<i32: 0, 1>}
 
     return

@@ -1,15 +1,18 @@
 #include "flang/Optimizer/Dialect/FNACC/FNACCDialect.h"
 #include "flang/Optimizer/Dialect/FNACC/FNACCPasses.h"
 
+#include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinOps.h"
 
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/ADT/StringSet.h"
+#include "llvm/ADT/StringRef.h"
 
 #include <cstddef>
 #include <limits>
+#include <string>
 
 namespace fir::fnacc {
 #define GEN_PASS_DEF_FNACCASSIGNKERNELIDS
@@ -53,6 +56,10 @@ struct FNACCAssignKernelIdsPass
         launchOp.emitError("duplicate FNACC kernel id ") << id;
         invalid = true;
       }
+
+      if (auto function = launchOp->getParentOfType<mlir::func::FuncOp>()) {
+        function->setAttr("fnacc.contains_launch", builder.getUnitAttr());
+      }
     });
 
     if (invalid) {
@@ -83,6 +90,10 @@ struct FNACCAssignKernelIdsPass
           ++nextId;
         usedIds.insert(id);
         launchOp->setAttr(kKernelIdAttrName, builder.getI32IntegerAttr(id));
+      }
+
+      if (auto function = launchOp->getParentOfType<mlir::func::FuncOp>()) {
+        function->setAttr("fnacc.contains_launch", builder.getUnitAttr());
       }
 
       if (!launchOp->hasAttr(kKernelNameAttrName)) {

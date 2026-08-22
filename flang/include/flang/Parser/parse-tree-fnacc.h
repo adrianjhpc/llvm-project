@@ -102,11 +102,13 @@ struct FnACCExitDataClause {
 struct FnACCEnterDataDirective {
   TUPLE_CLASS_BOILERPLATE(FnACCEnterDataDirective);
   std::tuple<std::list<FnACCEnterDataClause>> t;
+  CharBlock source;
 };
 
 struct FnACCExitDataDirective {
   TUPLE_CLASS_BOILERPLATE(FnACCExitDataDirective);
   std::tuple<std::list<FnACCExitDataClause>> t;
+  CharBlock source;
 };
 
 struct FnACCStandaloneConstruct {
@@ -115,4 +117,5 @@ struct FnACCStandaloneConstruct {
       FnACCReleaseDirective, FnACCReleaseAllDirective, FnACCEnterDataDirective,
       FnACCExitDataDirective>
       u;
+  CharBlock source;
 };

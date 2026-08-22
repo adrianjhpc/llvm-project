@@ -5,7 +5,7 @@ module {
       %a: !fir.ref<!fir.array<?xf32>>,
       %b: !fir.ref<!fir.array<?xf32>>) {
     fnacc.launch tile_sizes = [64] pack(%a, %b : !fir.ref<!fir.array<?xf32>>, !fir.ref<!fir.array<?xf32>>) {
-      "fir.end"() : () -> ()
+      fnacc.terminator
     } attributes {pack_targets = array<i32: 0, 1>}
 
     return

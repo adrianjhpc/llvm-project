@@ -18,6 +18,7 @@
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/Debug.h"
 #include <limits>
+#include <type_traits>
 
 #define DEBUG_TYPE "flang-pft"
 

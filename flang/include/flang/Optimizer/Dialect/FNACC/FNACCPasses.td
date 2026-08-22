@@ -68,7 +68,7 @@ def FNACCLowerToTriton : Pass<"fnacc-lower-to-triton", "mlir::ModuleOp"> {
            "Number of Triton pipeline stages">,
     Option<"f64MatmulStrategy", "f64-matmul-strategy", "std::string",
            "\"reduce\"",
-           "Strategy for f64 matmul lowering: reduce or fma">
+           "Strategy for f64 matmul lowering: dot, reduce, or fma">
   ];
 
   let dependentDialects = [

@@ -16,7 +16,7 @@ module {
         fir.store %iv to %i : !fir.ref<i32>
       }
 
-      "fir.end"() : () -> ()
+      fnacc.terminator
     } attributes {pack_targets = array<i32>}
 
     return
@@ -34,7 +34,7 @@ module {
         fir.store %iv to %i : !fir.ref<i32>
       }
 
-      "fir.end"() : () -> ()
+      fnacc.terminator
     } attributes {pack_targets = array<i32>}
 
     return

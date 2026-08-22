@@ -3,11 +3,11 @@
 module {
   func.func @duplicate_ids() {
     fnacc.launch tile_sizes = [64] {
-      "fir.end"() : () -> ()
+      fnacc.terminator
     } attributes {fnacc.kernel_id = 7 : i32, pack_targets = array<i32>}
 
     fnacc.launch tile_sizes = [64] {
-      "fir.end"() : () -> ()
+      fnacc.terminator
     } attributes {fnacc.kernel_id = 7 : i32, pack_targets = array<i32>}
 
     return

@@ -46,7 +46,7 @@ module {
         fir.store %r to %cp_write : !fir.ref<f32>
       }
 
-      "fir.end"() : () -> ()
+      fnacc.terminator
     } attributes {pack_targets = array<i32: 1>}
 
     return

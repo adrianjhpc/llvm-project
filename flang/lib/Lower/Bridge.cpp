@@ -83,6 +83,8 @@
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/Path.h"
 #include "llvm/Target/TargetMachine.h"
+#include <cstdint>
+#include <limits>
 #include <optional>
 
 #define DEBUG_TYPE "flang-lower-bridge"
@@ -3556,6 +3558,8 @@ private:
     const auto &clauses{
         std::get<std::list<Fortran::parser::FnACCClause>>(directive.t)};
 
+    bool clauseError = false;
+    int64_t tileProduct = 1;
     llvm::SmallVector<int64_t> tileSizes;
     llvm::SmallVector<mlir::Value> packVars;
     llvm::SmallVector<int32_t> packTargets;
@@ -3566,11 +3570,38 @@ private:
       Fortran::common::visit(
           Fortran::common::visitors{
               [&](const Fortran::parser::FnACCTileClause &tileClause) {
-                for (const auto &expr : tileClause.v)
-                  if (std::optional<int64_t> val =
-                          Fortran::semantics::GetIntValue(expr))
-                    tileSizes.push_back(*val);
+                for (const auto &expr : tileClause.v) {
+                  std::optional<int64_t> value =
+                      Fortran::semantics::GetIntValue(expr);
+
+                  if (!value) {
+                    mlir::emitError(loc)
+                        << "FNACC TILE size must be a constant integer";
+                    clauseError = true;
+                    continue;
+                  }
+
+                  if (*value <= 0 ||
+                      *value > std::numeric_limits<int32_t>::max()) {
+                    mlir::emitError(loc)
+                        << "FNACC TILE size must be positive and fit in i32";
+                    clauseError = true;
+                    continue;
+                  }
+
+                  if (tileProduct >
+                      std::numeric_limits<int32_t>::max() / *value) {
+                    mlir::emitError(loc) << "FNACC TILE size product exceeds "
+                                            "the runtime i32 limit";
+                    clauseError = true;
+                    continue;
+                  }
+
+                  tileProduct *= *value;
+                  tileSizes.push_back(*value);
+                }
               },
+
               [&](const Fortran::parser::FnACCPackClause &packClause) {
                 for (const auto &item : packClause.v) {
                   const auto &name{std::get<Fortran::parser::Name>(item.t)};
@@ -3617,6 +3648,9 @@ private:
           clause.u);
     }
 
+    if (clauseError)
+      return;
+
     // parse clauses, fill packVars/packTargets/reductionVars/reductionOps
 
     unsigned reductionBase = packVars.size();
@@ -3650,7 +3684,9 @@ private:
     }
 
     // 6. Terminate and move out
-    fir::FirEndOp::create(*builder, loc);
+    mlir::Block &launchBlock{launchOp.getRegion().front()};
+    builder->setInsertionPointToEnd(&launchBlock);
+    fir::fnacc::TerminatorOp::create(*builder, loc);
     builder->setInsertionPointAfter(launchOp);
   }
 

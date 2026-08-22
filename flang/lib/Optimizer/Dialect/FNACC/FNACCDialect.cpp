@@ -3,6 +3,7 @@
 #include "mlir/IR/DialectImplementation.h"
 #include "mlir/IR/OpImplementation.h"
 #include "llvm/ADT/DenseSet.h"
+#include "llvm/ADT/STLExtras.h"
 
 #include <cstddef>
 #include <limits>
@@ -24,6 +25,16 @@ void fir::fnacc::FNACCDialect::initialize() {
 }
 
 llvm::LogicalResult fir::fnacc::LaunchOp::verify() {
+
+  if (!llvm::hasSingleElement(getRegion()))
+    return emitOpError("requires exactly one region block");
+
+  mlir::Block &block{getRegion().front()};
+  if (!block.getTerminator() ||
+      !mlir::isa<fir::fnacc::TerminatorOp>(block.getTerminator())) {
+    return emitOpError("requires fnacc.terminator");
+  }
+
   llvm::ArrayRef<int64_t> tileSizes = getTileSizes();
 
   if (tileSizes.size() > 3)

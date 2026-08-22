@@ -67,11 +67,11 @@ private:
 
     // The launch region was terminated with fir.end. A func.func body must
     // terminate with func.return, so rewrite any fir.end terminators.
-    for (auto endOp :
-         llvm::make_early_inc_range(kernelFunc.getOps<fir::FirEndOp>())) {
-      builder.setInsertionPoint(endOp);
-      func::ReturnOp::create(builder, endOp.getLoc());
-      endOp.erase();
+    for (auto terminator : llvm::make_early_inc_range(
+             kernelFunc.getOps<fir::fnacc::TerminatorOp>())) {
+      builder.setInsertionPoint(terminator);
+      func::ReturnOp::create(builder, terminator.getLoc());
+      terminator.erase();
     }
 
     // 4. Map captured values to new block arguments

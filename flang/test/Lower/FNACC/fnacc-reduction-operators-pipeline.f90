@@ -38,7 +38,7 @@ subroutine fnacc_max_reduce(n, a, result)
   end do
 end subroutine
 
-! HOST-COUNT-3: call @__fnacc_launch_reduce_f32_v1
+! HOST-COUNT-3: call @__fnacc_launch_reduce_f32_v2
 ! HOST-NOT: fnacc.launch
 
 ! TTIR-LABEL: tt.func @fnacc_kernel_0

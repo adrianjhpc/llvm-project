@@ -9,6 +9,7 @@
 #include "mlir/IR/Value.h"
 
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/ArrayRef.h"
 
 #include <memory>
 #include <optional>
@@ -147,6 +148,11 @@ struct ElementwiseKernel {
   std::unique_ptr<ElementwiseExpr> expression;
 
   ElementType elementType = ElementType::Unknown;
+
+  /// Operations proven to belong to the recognized kernel. Runtime lowering
+  /// must not erase the launch unless every operation in the launch region is
+  /// either present here or is an explicitly accepted structural operation.
+  llvm::SmallVector<mlir::Operation *, 64> consumedOps;
 };
 
 struct RecognitionFailure {

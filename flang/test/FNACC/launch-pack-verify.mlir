@@ -5,7 +5,7 @@ module {
       %a: !fir.ref<!fir.array<?xf32>>,
       %b: !fir.ref<!fir.array<?xf32>>) {
     fnacc.launch tile_sizes = [128] pack(%a, %b : !fir.ref<!fir.array<?xf32>>, !fir.ref<!fir.array<?xf32>>) {
-      "fir.end"() : () -> ()
+      fnacc.terminator
     } attributes {pack_targets = array<i32: 1>}
 
     return
@@ -14,7 +14,7 @@ module {
   func.func @bad_pack_duplicate(
       %a: !fir.ref<!fir.array<?xf32>>) {
     fnacc.launch tile_sizes = [128] pack(%a, %a : !fir.ref<!fir.array<?xf32>>, !fir.ref<!fir.array<?xf32>>) {
-      "fir.end"() : () -> ()
+      fnacc.terminator
     } attributes {pack_targets = array<i32: 1, 1>}
 
     return

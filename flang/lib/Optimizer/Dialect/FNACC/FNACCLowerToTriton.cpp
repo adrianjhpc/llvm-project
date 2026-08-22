@@ -8,12 +8,16 @@
 #include "mlir/Dialect/Arith/IR/Arith.h"
 
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/ArrayRef.h"
+#include "llvm/ADT/StringRef.h"
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/raw_ostream.h"
 
 #include <algorithm>
 #include <cassert>
 #include <string>
+#include <cstdint>
+#include <limits>
 
 namespace fir::fnacc {
 #define GEN_PASS_DEF_FNACCLOWERTOTRITON
@@ -1730,6 +1734,20 @@ struct FNACCLowerToTritonPass
 
     if (tritonNumStages <= 0) {
       module.emitError("FNACC num-stages must be positive");
+      signalPassFailure();
+      return;
+    }
+
+    if (tritonThreadsPerWarp != 32) {
+      module.emitError("FNACC currently supports exactly 32 threads per warp");
+      signalPassFailure();
+      return;
+    }
+
+    if (this->f64MatmulStrategy != "dot" &&
+        this->f64MatmulStrategy != "reduce" &&
+        this->f64MatmulStrategy != "fma") {
+      module.emitError("FNACC f64-matmul-strategy must be dot, reduce, or fma");
       signalPassFailure();
       return;
     }

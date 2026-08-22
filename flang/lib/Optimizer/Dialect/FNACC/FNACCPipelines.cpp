@@ -37,7 +37,7 @@ struct FNACCPipelineOptions
 
   Option<std::string> f64MatmulStrategy{
       *this, "f64-matmul-strategy",
-      llvm::cl::desc("Strategy for f64 matmul lowering: reduce or fma"),
+      llvm::cl::desc("Strategy for f64 matmul lowering: dot, reduce, or fma"),
       llvm::cl::init("reduce")};
 
 };

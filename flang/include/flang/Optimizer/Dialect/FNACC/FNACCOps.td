@@ -10,7 +10,20 @@ include "mlir/Interfaces/SideEffectInterfaces.td"
 class FNACC_Op<string mnemonic, list<Trait> traits = []> :
     Op<FNACC_Dialect, mnemonic, traits>;
 
-def FNACC_LaunchOp : FNACC_Op<"launch", [RecursiveMemoryEffects]> {
+def FNACC_TerminatorOp
+    : FNACC_Op<"terminator", [Pure, Terminator]> {
+  let summary = "Terminate an FNACC region";
+  let description = [{
+    The `fnacc.terminator` operation terminates a single-block FNACC region.
+  }];
+
+  let assemblyFormat = "attr-dict";
+}
+
+def FNACC_LaunchOp
+    : FNACC_Op<"launch",
+          [RecursiveMemoryEffects,
+           SingleBlockImplicitTerminator<"TerminatorOp">]> {
   let summary = "FNACC launch operation";
   let description = [{
     The `fnacc.launch` operation represents a parallel execution region.

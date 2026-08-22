@@ -8,8 +8,8 @@
 
 namespace Fortran::parser {
 
-constexpr auto startfnaccLine = skipStuffBeforeStatement >>
-    ("!$FNACC "_sptok || "!@FNACC "_sptok || "!DIR$ FNACC "_sptok);
+constexpr auto startfnaccLine =
+    skipStuffBeforeStatement >> ("!$FNACC "_sptok || "!@FNACC "_sptok);
 
 constexpr auto endfnaccLine = space >> endOfLine;
 
@@ -82,11 +82,21 @@ TYPE_PARSER(construct<FnACCEnterDataClause>(Parser<FnACCCopyinClause>{}) ||
 TYPE_PARSER(construct<FnACCExitDataClause>(Parser<FnACCCopyoutClause>{}) ||
     construct<FnACCExitDataClause>(Parser<FnACCDeleteClause>{}))
 
-TYPE_PARSER(construct<FnACCEnterDataDirective>(
-    "ENTER"_tok >> "DATA"_tok >> many(Parser<FnACCEnterDataClause>{})))
+TYPE_PARSER(sourced(construct<FnACCEnterDataDirective>(
+    "ENTER"_tok >> "DATA"_tok >>
+    many(
+        construct<FnACCEnterDataClause>(
+            Parser<FnACCCopyinClause>{}) ||
+        construct<FnACCEnterDataClause>(
+            Parser<FnACCCreateClause>{})))))
 
-TYPE_PARSER(construct<FnACCExitDataDirective>(
-    "EXIT"_tok >> "DATA"_tok >> many(Parser<FnACCExitDataClause>{})))
+TYPE_PARSER(sourced(construct<FnACCExitDataDirective>(
+    "EXIT"_tok >> "DATA"_tok >>
+    many(
+        construct<FnACCExitDataClause>(
+            Parser<FnACCCopyoutClause>{}) ||
+        construct<FnACCExitDataClause>(
+            Parser<FnACCDeleteClause>{})))))
 
 TYPE_PARSER(construct<FnACCStandaloneConstruct>(startfnaccLine >>
                 Parser<FnACCEnterDataDirective>{} / endOfLine) ||
@@ -97,8 +107,8 @@ TYPE_PARSER(construct<FnACCStandaloneConstruct>(startfnaccLine >>
     construct<FnACCStandaloneConstruct>(
         startfnaccLine >> Parser<FnACCUpdateDeviceDirective>{} / endOfLine) ||
     construct<FnACCStandaloneConstruct>(
-        startfnaccLine >> Parser<FnACCReleaseDirective>{} / endOfLine) ||
+        startfnaccLine >> Parser<FnACCReleaseAllDirective>{} / endOfLine) ||
     construct<FnACCStandaloneConstruct>(
-        startfnaccLine >> Parser<FnACCReleaseAllDirective>{} / endOfLine))
+        startfnaccLine >> Parser<FnACCReleaseDirective>{} / endOfLine))
 
 } // namespace Fortran::parser

@@ -43,6 +43,7 @@
 #include "flang/Support/Fortran.h"
 #include "flang/Support/default-kinds.h"
 #include "llvm/ADT/ArrayRef.h"
+#include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringSwitch.h"
 #include "llvm/Support/raw_ostream.h"
@@ -2133,6 +2134,26 @@ void OmpVisitor::ProcessMapperSpecifier(const parser::OmpMapperSpecifier &spec,
 // Resolve names in FNACC constructs.
 class FnACCVisitor : public virtual DeclarationVisitor {
 public:
+  bool CheckUniqueObjects(
+      const std::list<parser::Name> &names, const char *clauseName) {
+    llvm::SmallPtrSet<const Symbol *, 8> seen;
+    bool valid = true;
+
+    for (const parser::Name &name : names) {
+      if (!name.symbol)
+        continue;
+
+      const Symbol *symbol = &name.symbol->GetUltimate();
+      if (!seen.insert(symbol).second) {
+        Say(name.source, "'%s' appears more than once in FNACC %s"_err_en_US,
+            name.source, clauseName);
+        valid = false;
+      }
+    }
+
+    return valid;
+  }
+
   bool Pre(const parser::FnACCConstruct &x) {
     // Track source for diagnostics; descend into the construct.
     const auto &dir{std::get<parser::FnACCParallelDirective>(x.t)};
@@ -2167,7 +2188,11 @@ public:
           "FNACC REDUCTION clause may appear at most once"_err_en_US);
   }
 
-  bool Pre(const parser::FnACCStandaloneConstruct &) { return true; }
+  bool Pre(const parser::FnACCStandaloneConstruct &construct) {
+    messageHandler().set_currStmtSource(construct.source);
+    currScope().AddSourceRange(construct.source);
+    return true;
+  }
 
   void Post(const parser::FnACCStandaloneConstruct &) {
     messageHandler().set_currStmtSource(std::nullopt);
@@ -2241,6 +2266,33 @@ public:
     auto &names{const_cast<std::list<parser::Name> &>(clause.v)};
     for (parser::Name &name : names)
       ResolveFNACCName(name, "EXIT DATA DELETE clause");
+  }
+
+  void Post(const parser::FnACCTileClause &clause) {
+    if (clause.v.empty() || clause.v.size() > 3) {
+      Say("FNACC TILE requires between one and three sizes"_err_en_US);
+      return;
+    }
+  }
+
+  void Post(const parser::FnACCEnterDataDirective &directive) {
+    const auto &clauses{std::get<0>(directive.t)};
+
+    if (clauses.empty()) {
+      Say(directive.source,
+          "FNACC ENTER DATA requires at least one COPYIN or CREATE "
+          "clause"_err_en_US);
+    }
+  }
+
+  void Post(const parser::FnACCExitDataDirective &directive) {
+    const auto &clauses{std::get<0>(directive.t)};
+
+    if (clauses.empty()) {
+      Say(directive.source,
+          "FNACC EXIT DATA requires at least one COPYOUT or DELETE "
+          "clause"_err_en_US);
+    }
   }
 
 private:

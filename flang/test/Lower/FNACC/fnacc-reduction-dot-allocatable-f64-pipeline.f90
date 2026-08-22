@@ -20,7 +20,7 @@ subroutine fnacc_dot_reduce_allocatable_f64(n, a, b, sum)
   end do
 end subroutine
 
-! HOST-DAG: func.func private @__fnacc_launch_reduce_f64_v1
+! HOST-DAG: func.func private @__fnacc_launch_reduce_f64_v2
 
 ! HOST-LABEL: func.func @_QPfnacc_dot_reduce_allocatable_f64
 ! HOST-NOT: fnacc.launch
@@ -30,7 +30,7 @@ end subroutine
 ! HOST: %[[A_ADDR:.*]] = fir.box_addr %[[A_BOX]] : (!fir.box<!fir.heap<!fir.array<?xf64>>>) -> !fir.heap<!fir.array<?xf64>>
 ! HOST: %[[B_BOX:.*]] = fir.load {{.*}} : !fir.ref<!fir.box<!fir.heap<!fir.array<?xf64>>>>
 ! HOST: %[[B_ADDR:.*]] = fir.box_addr %[[B_BOX]] : (!fir.box<!fir.heap<!fir.array<?xf64>>>) -> !fir.heap<!fir.array<?xf64>>
-! HOST: call @__fnacc_launch_reduce_f64_v1
+! HOST: call @__fnacc_launch_reduce_f64_v2
 ! HOST-NOT: fnacc.launch
 
 ! TTIR-LABEL: tt.func @fnacc_kernel_0

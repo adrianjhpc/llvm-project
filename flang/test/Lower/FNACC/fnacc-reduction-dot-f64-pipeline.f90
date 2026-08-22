@@ -19,10 +19,10 @@ subroutine fnacc_dot_reduce_f64(n, a, b, sum)
   end do
 end subroutine
 
-! HOST-DAG: func.func private @__fnacc_launch_reduce_f64_v1
+! HOST-DAG: func.func private @__fnacc_launch_reduce_f64_v2
 
 ! HOST-LABEL: func.func @_QPfnacc_dot_reduce_f64
-! HOST: call @__fnacc_launch_reduce_f64_v1
+! HOST: call @__fnacc_launch_reduce_f64_v2
 ! HOST-NOT: fnacc.launch
 
 ! TTIR-LABEL: tt.func @fnacc_kernel_0

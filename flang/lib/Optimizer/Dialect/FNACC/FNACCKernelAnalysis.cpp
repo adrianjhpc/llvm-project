@@ -5,6 +5,8 @@
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/IR/Matchers.h"
 #include "llvm/ADT/APFloat.h"
+#include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/SmallPtrSet.h"
 
 #include <utility>
 
@@ -36,6 +38,68 @@ static Value stripFirConvert(Value v) {
     v = cvt.getValue();
 
   return v;
+}
+
+static void markConsumed(ElementwiseKernel &kernel, Operation *op) {
+  if (!op)
+    return;
+
+  if (!llvm::is_contained(kernel.consumedOps, op))
+    kernel.consumedOps.push_back(op);
+}
+
+static void markConsumedValueDefinition(ElementwiseKernel &kernel,
+                                        Value value) {
+  if (Operation *definingOp = value.getDefiningOp())
+    markConsumed(kernel, definingOp);
+}
+
+/// Mark a value's launch-local backward slice.
+///
+/// This follows only operands defined inside fnacc.launch. Values defined
+/// outside the launch are captures and must remain available to host lowering;
+/// their defining operations are not part of the region being erased.
+static void markLaunchLocalBackwardSlice(ElementwiseKernel &kernel,
+                                         fir::fnacc::LaunchOp launchOp,
+                                         Value value) {
+  Operation *definingOp = value.getDefiningOp();
+
+  if (!definingOp || !launchOp->isProperAncestor(definingOp))
+    return;
+
+  if (llvm::is_contained(kernel.consumedOps, definingOp))
+    return;
+
+  markConsumed(kernel, definingOp);
+
+  for (Value operand : definingOp->getOperands())
+    markLaunchLocalBackwardSlice(kernel, launchOp, operand);
+}
+
+static void markPostLoopInductionUpdate(ElementwiseKernel &kernel,
+                                        fir::fnacc::LaunchOp launchOp,
+                                        fir::DoLoopOp loop,
+                                        Value inductionMemref) {
+  Block *parentBlock = loop->getBlock();
+  bool afterLoop = false;
+
+  for (Operation &op : parentBlock->getOperations()) {
+    if (&op == loop.getOperation()) {
+      afterLoop = true;
+      continue;
+    }
+
+    if (!afterLoop)
+      continue;
+
+    auto store = dyn_cast<fir::StoreOp>(op);
+    if (!store || store.getMemref() != inductionMemref)
+      continue;
+
+    markConsumed(kernel, store.getOperation());
+    markLaunchLocalBackwardSlice(kernel, launchOp, store.getValue());
+    return;
+  }
 }
 
 /// Return a runtime-visible array base for a reduction.
@@ -160,6 +224,25 @@ getLoopExtentSource(fir::DoLoopOp loop) {
   source.kind = fir::fnacc::ElementwiseExtentSourceKind::Value;
   source.value = ub;
   return source;
+}
+
+static bool isAcceptedStructuralOperation(Operation *op) {
+  return isa<fir::ResultOp, fir::fnacc::TerminatorOp, arith::ConstantOp,
+             arith::ConstantIndexOp, fir::ShapeOp, fir::ShapeShiftOp>(op);
+}
+
+static void markBackwardSlice(ElementwiseKernel &kernel, Operation *root,
+                              fir::fnacc::LaunchOp launchOp) {
+  if (!root || !launchOp->isProperAncestor(root) ||
+      llvm::is_contained(kernel.consumedOps, root))
+    return;
+
+  markConsumed(kernel, root);
+
+  for (Value operand : root->getOperands()) {
+    if (Operation *def = operand.getDefiningOp())
+      markBackwardSlice(kernel, def, launchOp);
+  }
 }
 
 /// Return true if `v` is an integer constant equal to `expected`.
@@ -1072,6 +1155,34 @@ static bool valueIsLoadOfMemref(Value v, Value memref) {
   return load && load.getMemref() == memref;
 }
 
+static void markLoopBounds(ElementwiseKernel &kernel,
+                           fir::fnacc::LaunchOp launchOp, fir::DoLoopOp loop) {
+  markConsumed(kernel, loop.getOperation());
+
+  markLaunchLocalBackwardSlice(kernel, launchOp, loop.getLowerBound());
+  markLaunchLocalBackwardSlice(kernel, launchOp, loop.getUpperBound());
+  markLaunchLocalBackwardSlice(kernel, launchOp, loop.getStep());
+}
+
+static void markInductionStore(ElementwiseKernel &kernel, fir::DoLoopOp loop,
+                               Value inductionMemref) {
+  Block *body = loop.getBody();
+  if (!body)
+    return;
+
+  for (Operation &op : body->getOperations()) {
+    auto store = dyn_cast<fir::StoreOp>(op);
+    if (!store || store.getMemref() != inductionMemref)
+      continue;
+
+    Value stored = stripFirConvert(store.getValue());
+    if (stored == body->getArgument(0)) {
+      markConsumed(kernel, store.getOperation());
+      return;
+    }
+  }
+}
+
 static bool reductionOperationMatches(Operation *op,
                                       ReductionOperator reductionOp) {
   if (!op)
@@ -1308,6 +1419,26 @@ recognizeReduction1D(fir::fnacc::LaunchOp launchOp) {
   k.reductionOperator = *reductionOp;
   k.writeArray = {};
   k.scalarRefs.clear();
+
+  switch (extentX.kind) {
+  case ElementwiseExtentSourceKind::Value:
+    markLaunchLocalBackwardSlice(k, launchOp, extentX.value);
+    break;
+
+  case ElementwiseExtentSourceKind::LoadIntegerRef:
+  case ElementwiseExtentSourceKind::BoxDim:
+    // These sources intentionally retain a value defined outside the launch.
+    break;
+
+  case ElementwiseExtentSourceKind::Unknown:
+    break;
+  }
+
+  markLoopBounds(k, launchOp, loop);
+  markInductionStore(k, loop, indMemref);
+  markPostLoopInductionUpdate(k, launchOp, loop, indMemref);
+  markConsumed(k, reductionStore.getOperation());
+  markLaunchLocalBackwardSlice(k, launchOp, reductionStore.getValue());
 
   // Try dot first because it is also an additive reduction.
   Value arrayA;
@@ -1688,6 +1819,13 @@ recognizeMatMul2D(fir::fnacc::LaunchOp launchOp) {
   k.writeArray = cArray;
   k.computeOp = computeOp;
 
+  markLoopBounds(k, launchOp, jLoop);
+  markLoopBounds(k, launchOp, iLoop);
+  markLoopBounds(k, launchOp, pLoop);
+  markInductionStore(k, iLoop, iMemref);
+  markInductionStore(k, jLoop, jMemref);
+  markInductionStore(k, pLoop, pMemref);
+
   if (!inferAndCheckElementType(k, reason))
     return failWithDefault(iLoop.getOperation(), reason,
                            "matmul failed element type inference");
@@ -1738,6 +1876,10 @@ static ElementwiseRecognitionResult recognize1D(fir::fnacc::LaunchOp launchOp) {
   k.loop1D = loop;
   k.extentX = extentX;
   k.innerIndMemref = indMemref;
+
+  markLoopBounds(k, launchOp, loop);
+  markInductionStore(k, loop, indMemref);
+  markPostLoopInductionUpdate(k, launchOp, loop, indMemref);
 
   std::string reason;
   if (!collectArrayAccesses1D(k, loop, indMemref, reason))
@@ -1816,6 +1958,12 @@ static ElementwiseRecognitionResult recognize2D(fir::fnacc::LaunchOp launchOp) {
   k.extentX = extentX;
   k.outerIndMemref = outerIndMemref;
   k.innerIndMemref = innerIndMemref;
+
+  markLoopBounds(k, launchOp, outer);
+  markLoopBounds(k, launchOp, inner);
+  markInductionStore(k, outer, outerIndMemref);
+  markInductionStore(k, inner, innerIndMemref);
+  markPostLoopInductionUpdate(k, launchOp, outer, outerIndMemref);
 
   std::string reason;
   if (!collectArrayAccesses2D(k, inner, innerIndMemref, outerIndMemref, reason))

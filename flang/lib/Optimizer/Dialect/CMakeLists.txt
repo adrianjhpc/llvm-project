@@ -71,4 +71,6 @@ add_flang_library(FIRFNACCDialect
   MLIR_LIBS
   MLIRFuncDialect
   MLIRArithDialect 
+  MLIRSupport
+  MLIRTransformUtils
 )

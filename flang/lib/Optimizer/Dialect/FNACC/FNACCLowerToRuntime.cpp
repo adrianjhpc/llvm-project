@@ -13,7 +13,12 @@
 
 #include "llvm/ADT/APFloat.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/ArrayRef.h"
+#include "llvm/ADT/StringRef.h"
 
+#include <cstdint>
+#include <limits>
+#include <string>
 #include <optional>
 
 namespace fir::fnacc {
@@ -947,10 +952,13 @@ struct FNACCLowerToRuntimePass
           return;
         }
 
+        Value initialValue =
+            fir::LoadOp::create(builder, loc, k.reductionScalarRef);
+
         StringRef reductionRuntimeName =
             k.elementType == fir::fnacc::ElementType::F64
-                ? "__fnacc_launch_reduce_f64_v1"
-                : "__fnacc_launch_reduce_f32_v1";
+                ? "__fnacc_launch_reduce_f64_v2"
+                : "__fnacc_launch_reduce_f32_v2";
 
         Value numReadArraysValue = arith::ConstantIntOp::create(
             builder, loc, static_cast<int32_t>(k.readArrays.size()), 32);
@@ -979,6 +987,7 @@ struct FNACCLowerToRuntimePass
         argTypes.push_back(read0Ptr.getType());
         argTypes.push_back(read1Ptr.getType());
         argTypes.push_back(resultPtr.getType());
+        argTypes.push_back(initialValue.getType());
         argTypes.push_back(extentXValue.getType());
 
         func::FuncOp callee = getOrCreateRuntimeDecl(
@@ -991,6 +1000,7 @@ struct FNACCLowerToRuntimePass
         operands.push_back(read0Ptr);
         operands.push_back(read1Ptr);
         operands.push_back(resultPtr);
+        operands.push_back(initialValue);
         operands.push_back(extentXValue);
 
         func::CallOp::create(builder, loc, callee.getSymName(), TypeRange{},

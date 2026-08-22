@@ -36,7 +36,7 @@ module {
         fir.store %new to %sum : !fir.ref<f32>
       }
 
-      "fir.end"() : () -> ()
+      fnacc.terminator
     } attributes {
       fnacc.reduction_ops = array<i32: 0>,
       fnacc.reduction_slots = array<i32: 0>,
@@ -47,11 +47,11 @@ module {
   }
 }
 
-// CHECK: func.func private @__fnacc_launch_reduce_f32_v1
-// CHECK-SAME: i32, i32, i32, !fir.ref<f32>, !fir.ref<f32>, !fir.ref<f32>, i32
+// CHECK: func.func private @__fnacc_launch_reduce_f32_v2
+// CHECK-SAME: i32, i32, i32, !fir.ref<f32>, !fir.ref<f32>, !fir.ref<f32>, f32, i32
 
 // CHECK-LABEL: func.func @dot_reduce
-// CHECK: call @__fnacc_launch_reduce_f32_v1
+// CHECK: call @__fnacc_launch_reduce_f32_v2
 // CHECK-SAME: !fir.ref<f32>, !fir.ref<f32>, !fir.ref<f32>
 // CHECK-NOT: fnacc.launch
 
