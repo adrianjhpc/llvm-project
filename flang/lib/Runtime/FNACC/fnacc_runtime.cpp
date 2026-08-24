@@ -584,6 +584,9 @@ struct FNACCKernelDesc {
   // Number of hidden pointer parameters appended by Triton/NVVM PTX.
   int32_t tritonHiddenPtrArgs = 2;
 
+  std::string backend = "triton";
+  std::string deviceImageKind = "ptx";
+
   // Synthetic kernel used to recursively reduce a partials buffer. A negative
   // value denotes older metadata that requires the host-side fallback.
   int32_t reductionStageId = -1;
@@ -654,8 +657,12 @@ struct FNACCKernelRegistry {
 };
 
 struct FNACCEmbeddedKernelBundle {
-  std::vector<const char *> ptxData;
-  std::vector<std::size_t> ptxSize;
+  // Keep these integer values in sync with the generated C bundle ABI.
+  enum ImageKind : int32_t { PTX = 1, Cubin = 2 };
+
+  std::vector<const void *> imageData;
+  std::vector<std::size_t> imageSize;
+  std::vector<int32_t> imageKind;
   const char *jsonData = nullptr;
   std::size_t jsonSize = 0;
   bool registered = false;
@@ -767,36 +774,52 @@ static void fnaccPrintReductionWorkspaceStats() {
       workspace.scratch.bytes);
 }
 
-static bool fnaccHasEmbeddedPtxBundle() {
+static const char *fnaccEmbeddedImageKindName(int32_t kind) {
+  switch (kind) {
+  case FNACCEmbeddedKernelBundle::PTX:
+    return "ptx";
+  case FNACCEmbeddedKernelBundle::Cubin:
+    return "cubin";
+  default:
+    return "unknown";
+  }
+}
+
+static bool fnaccHasEmbeddedDeviceBundle() {
   const FNACCEmbeddedKernelBundle &bundle = fnaccGetEmbeddedKernelBundle();
-  if (bundle.ptxData.empty())
+  if (bundle.imageData.empty())
     return false;
 
-  if (bundle.ptxData.size() != bundle.ptxSize.size())
+  if (bundle.imageData.size() != bundle.imageSize.size() ||
+      bundle.imageData.size() != bundle.imageKind.size())
     return false;
 
-  for (std::size_t i = 0; i < bundle.ptxData.size(); ++i) {
-    if (!bundle.ptxData[i] || bundle.ptxSize[i] == 0)
+  for (std::size_t i = 0; i < bundle.imageData.size(); ++i) {
+    if (!bundle.imageData[i] || bundle.imageSize[i] == 0 ||
+        (bundle.imageKind[i] != FNACCEmbeddedKernelBundle::PTX &&
+            bundle.imageKind[i] != FNACCEmbeddedKernelBundle::Cubin))
       return false;
   }
 
   return true;
 }
 
-static std::vector<std::string> fnaccGetPtxTextsFromEmbeddedBundle() {
+static std::vector<std::string> fnaccGetImagesFromEmbeddedBundle() {
   std::vector<std::string> result;
 
-  if (!fnaccHasEmbeddedPtxBundle())
+  if (!fnaccHasEmbeddedDeviceBundle())
     return result;
 
   const FNACCEmbeddedKernelBundle &bundle = fnaccGetEmbeddedKernelBundle();
-  for (std::size_t i = 0; i < bundle.ptxData.size(); ++i) {
-    result.emplace_back(bundle.ptxData[i], bundle.ptxSize[i]);
+  for (std::size_t i = 0; i < bundle.imageData.size(); ++i) {
+    const char *bytes = static_cast<const char *>(bundle.imageData[i]);
+    result.emplace_back(bytes, bundle.imageSize[i]);
 
     if (fnaccDebugEnabled()) {
       std::fprintf(stderr,
-          "FNACC: loading embedded PTX bundle entry %zu, bytes=%zu\n", i,
-          bundle.ptxSize[i]);
+          "FNACC: loading embedded %s bundle entry %zu, bytes=%zu\n",
+          fnaccEmbeddedImageKindName(bundle.imageKind[i]), i,
+          bundle.imageSize[i]);
     }
   }
 
@@ -872,8 +895,8 @@ static std::vector<std::string> fnaccGetPtxTexts(
       return fnaccGetPtxTextsFromDirectory(kernels);
   }
 
-  if (fnaccHasEmbeddedPtxBundle())
-    return fnaccGetPtxTextsFromEmbeddedBundle();
+  if (fnaccHasEmbeddedDeviceBundle())
+    return fnaccGetImagesFromEmbeddedBundle();
 
   // Backwards-compatible fallback.
   return {fnaccReadTextFile("fnacc_kernels.ptx")};
@@ -943,16 +966,28 @@ fnaccParseKernelDescsFromJson(const std::string &json) {
       desc.name = "fnacc_kernel_" + std::to_string(desc.id);
 
     jsonFindString(objectText, "kind", desc.kind);
+    jsonFindString(objectText, "backend", desc.backend);
+    jsonFindString(objectText, "device_image_kind", desc.deviceImageKind);
 
-    jsonFindInt(objectText, "ptx_index", desc.ptxIndex);
-    jsonFindString(objectText, "ptx_file", desc.ptxFile);
+    if (!jsonFindInt(objectText, "image_index", desc.ptxIndex))
+      jsonFindInt(objectText, "ptx_index", desc.ptxIndex);
+    if (!jsonFindString(objectText, "image_file", desc.ptxFile))
+      jsonFindString(objectText, "ptx_file", desc.ptxFile);
 
     if (desc.ptxFile.empty())
-      desc.ptxFile = desc.name + ".ptx";
+      desc.ptxFile =
+          desc.name + (desc.deviceImageKind == "cubin" ? ".cubin" : ".ptx");
 
     if (desc.id < 0 || desc.ptxIndex < 0) {
       std::fprintf(stderr,
-          "FNACC error: kernel JSON contains a negative id or PTX index\n");
+          "FNACC error: kernel JSON contains a negative id or image index\n");
+      std::abort();
+    }
+
+    if (desc.deviceImageKind != "ptx" && desc.deviceImageKind != "cubin") {
+      std::fprintf(stderr,
+          "FNACC error: kernel id %d has unsupported device image kind '%s'\n",
+          desc.id, desc.deviceImageKind.c_str());
       std::abort();
     }
 
@@ -968,7 +1003,10 @@ fnaccParseKernelDescsFromJson(const std::string &json) {
     bool hasCudaThreads =
         jsonFindInt(objectText, "cuda_threads_per_cta", desc.cudaThreadsPerCTA);
 
-    jsonFindInt(objectText, "triton_hidden_ptr_args", desc.tritonHiddenPtrArgs);
+    if (!jsonFindInt(
+            objectText, "private_pointer_args", desc.tritonHiddenPtrArgs))
+      jsonFindInt(
+          objectText, "triton_hidden_ptr_args", desc.tritonHiddenPtrArgs);
 
     desc.pack = jsonParsePackEntries(objectText);
     jsonFindInt(objectText, "reduction_stage_id", desc.reductionStageId);
@@ -1013,7 +1051,7 @@ fnaccParseKernelDescsFromJson(const std::string &json) {
     }
     if (desc.tritonHiddenPtrArgs != 2) {
       std::fprintf(stderr,
-          "FNACC error: kernel id %d requires %d hidden Triton parameters; "
+          "FNACC error: kernel id %d requires %d private pointer parameters; "
           "this runtime ABI supports exactly 2\n",
           desc.id, desc.tritonHiddenPtrArgs);
       std::abort();
@@ -1264,14 +1302,14 @@ static void fnaccEnsureInitialized() {
   fnaccRegistry.ptxTexts = fnaccGetPtxTexts(fnaccRegistry.kernels);
 
   if (fnaccRegistry.ptxTexts.empty()) {
-    std::fprintf(stderr, "FNACC error: no PTX modules were available\n");
+    std::fprintf(stderr, "FNACC error: no device images were available\n");
     std::abort();
   }
 
   for (std::size_t i = 0; i < fnaccRegistry.ptxTexts.size(); ++i) {
     if (fnaccRegistry.ptxTexts[i].empty()) {
-      std::fprintf(
-          stderr, "FNACC error: PTX bundle entry %zu is empty or missing\n", i);
+      std::fprintf(stderr,
+          "FNACC error: device image entry %zu is empty or missing\n", i);
       std::abort();
     }
   }
@@ -1285,10 +1323,12 @@ static void fnaccEnsureInitialized() {
           "kind=%s rank=%d tile=(%d,%d,%d) "
           "warps=%d threads_per_warp=%d "
           "cuda_threads_per_cta=%d hidden_ptr_args=%d "
-          "reduction_stage_id=%d ptx_index=%d ptx_file=%s\n",
+          "backend=%s image_kind=%s reduction_stage_id=%d "
+          "image_index=%d image_file=%s\n",
           desc.id, desc.name.c_str(), desc.kind.c_str(), desc.rank, desc.tileX,
           desc.tileY, desc.tileZ, desc.numWarps, desc.threadsPerWarp,
           desc.cudaThreadsPerCTA, desc.tritonHiddenPtrArgs,
+          desc.backend.c_str(), desc.deviceImageKind.c_str(),
           desc.reductionStageId, desc.ptxIndex, desc.ptxFile.c_str());
     }
   }
@@ -1702,7 +1742,7 @@ static CUfunction getKernelFunction(int32_t kernelId) {
 
   if (moduleIndex >= state.modules.size() || !state.modules[moduleIndex]) {
     std::fprintf(stderr,
-        "FNACC error: kernel id %d requests PTX module index %zu, "
+        "FNACC error: kernel id %d requests device image index %zu, "
         "but only %zu module(s) are loaded\n",
         kernelId, moduleIndex, state.modules.size());
     std::abort();
@@ -4355,10 +4395,9 @@ extern "C" void __fnacc_release_all() {
   cache.clear();
 }
 
-extern "C" void __fnacc_register_embedded_kernel_bundle(
-    const char *const *ptxData, std::size_t const *ptxSizes,
-    std::size_t ptxCount, const char *jsonData, std::size_t jsonSize) {
-  FNACC_RUNTIME_GUARD();
+static void fnaccRegisterEmbeddedDeviceBundle(const void *const *imageData,
+    const std::size_t *imageSizes, const int32_t *imageKinds,
+    std::size_t imageCount, const char *jsonData, std::size_t jsonSize) {
   FNACCEmbeddedKernelBundle &bundle = fnaccGetEmbeddedKernelBundle();
   if (bundle.registered) {
     std::fprintf(stderr,
@@ -4366,40 +4405,56 @@ extern "C" void __fnacc_register_embedded_kernel_bundle(
         "Compile all FNACC kernels as one bundle so kernel IDs stay unique.\n");
     std::abort();
   }
-  if (!ptxData || !ptxSizes || ptxCount == 0 || !jsonData || jsonSize == 0) {
+  if (!imageData || !imageSizes || !imageKinds || imageCount == 0 ||
+      !jsonData || jsonSize == 0) {
     std::fprintf(stderr, "FNACC error: invalid embedded kernel bundle\n");
     std::abort();
   }
-  for (std::size_t i = 0; i < ptxCount; ++i) {
-    if (!ptxData[i] || ptxSizes[i] == 0) {
-      std::fprintf(stderr, "FNACC error: invalid embedded PTX entry %zu\n", i);
+  for (std::size_t i = 0; i < imageCount; ++i) {
+    if (!imageData[i] || imageSizes[i] == 0 ||
+        (imageKinds[i] != FNACCEmbeddedKernelBundle::PTX &&
+            imageKinds[i] != FNACCEmbeddedKernelBundle::Cubin)) {
+      std::fprintf(
+          stderr, "FNACC error: invalid embedded device image entry %zu\n", i);
       std::abort();
     }
   }
 
-  bundle.ptxData.assign(ptxData, ptxData + ptxCount);
-  bundle.ptxSize.assign(ptxSizes, ptxSizes + ptxCount);
+  bundle.imageData.assign(imageData, imageData + imageCount);
+  bundle.imageSize.assign(imageSizes, imageSizes + imageCount);
+  bundle.imageKind.assign(imageKinds, imageKinds + imageCount);
   bundle.jsonData = jsonData;
   bundle.jsonSize = jsonSize;
   bundle.registered = true;
 }
 
+extern "C" void __fnacc_register_embedded_device_bundle(
+    const void *const *imageData, const std::size_t *imageSizes,
+    const int32_t *imageKinds, std::size_t imageCount, const char *jsonData,
+    std::size_t jsonSize) {
+  FNACC_RUNTIME_GUARD();
+  fnaccRegisterEmbeddedDeviceBundle(
+      imageData, imageSizes, imageKinds, imageCount, jsonData, jsonSize);
+}
+
+extern "C" void __fnacc_register_embedded_kernel_bundle(
+    const char *const *ptxData, std::size_t const *ptxSizes,
+    std::size_t ptxCount, const char *jsonData, std::size_t jsonSize) {
+  FNACC_RUNTIME_GUARD();
+  std::vector<const void *> imageData(ptxCount);
+  for (std::size_t i = 0; i < ptxCount; ++i)
+    imageData[i] = ptxData ? ptxData[i] : nullptr;
+  std::vector<int32_t> imageKinds(ptxCount, FNACCEmbeddedKernelBundle::PTX);
+  fnaccRegisterEmbeddedDeviceBundle(imageData.data(), ptxSizes,
+      imageKinds.data(), ptxCount, jsonData, jsonSize);
+}
+
 extern "C" void __fnacc_register_embedded_kernels(const char *ptxData,
     std::size_t ptxSize, const char *jsonData, std::size_t jsonSize) {
   FNACC_RUNTIME_GUARD();
-  FNACCEmbeddedKernelBundle &bundle = fnaccGetEmbeddedKernelBundle();
-  if (bundle.registered) {
-    std::fprintf(stderr,
-        "FNACC error: multiple embedded kernel bundles were registered\n");
-    std::abort();
-  }
-  if (!ptxData || ptxSize == 0 || !jsonData || jsonSize == 0) {
-    std::fprintf(stderr, "FNACC error: invalid embedded kernel bundle\n");
-    std::abort();
-  }
-  bundle.ptxData.assign(1, ptxData);
-  bundle.ptxSize.assign(1, ptxSize);
-  bundle.jsonData = jsonData;
-  bundle.jsonSize = jsonSize;
-  bundle.registered = true;
+  const void *imageData[] = {ptxData};
+  std::size_t imageSizes[] = {ptxSize};
+  int32_t imageKinds[] = {FNACCEmbeddedKernelBundle::PTX};
+  fnaccRegisterEmbeddedDeviceBundle(
+      imageData, imageSizes, imageKinds, 1, jsonData, jsonSize);
 }

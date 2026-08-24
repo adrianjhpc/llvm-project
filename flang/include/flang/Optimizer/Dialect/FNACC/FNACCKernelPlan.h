@@ -16,9 +16,37 @@
 
 namespace fir::fnacc {
 
-/// Runtime-consumable device image formats. Triton is currently an FNACC
-/// code-generation backend whose final runtime image is PTX.
-enum class FNACCDeviceImageKind { PTX, Cubin, CUDATileIR };
+/// Compiler-side device IR produced by an FNACC code-generation backend.
+/// These values describe intermediate artifacts, not necessarily something a
+/// runtime loader can consume directly.
+enum class FNACCDeviceIRKind { TTIR, LLVMIR, CUDATileIR, PTX };
+
+/// Runtime-consumable CUDA device image formats.
+enum class FNACCDeviceImageKind { PTX, Cubin };
+
+inline llvm::StringRef fnaccDeviceIRKindName(FNACCDeviceIRKind kind) {
+  switch (kind) {
+  case FNACCDeviceIRKind::TTIR:
+    return "ttir";
+  case FNACCDeviceIRKind::LLVMIR:
+    return "llvm-ir";
+  case FNACCDeviceIRKind::CUDATileIR:
+    return "cuda-tile-ir";
+  case FNACCDeviceIRKind::PTX:
+    return "ptx";
+  }
+  return "unknown";
+}
+
+inline llvm::StringRef fnaccDeviceImageKindName(FNACCDeviceImageKind kind) {
+  switch (kind) {
+  case FNACCDeviceImageKind::PTX:
+    return "ptx";
+  case FNACCDeviceImageKind::Cubin:
+    return "cubin";
+  }
+  return "unknown";
+}
 
 enum class FNACCKernelParameterRole {
   Read,
@@ -38,8 +66,7 @@ enum class FNACCKernelParameterPassing { DevicePointer, Value };
 struct FNACCKernelParameter {
   unsigned slot = 0;
   FNACCKernelParameterRole role = FNACCKernelParameterRole::Read;
-  FNACCKernelParameterPassing passing =
-      FNACCKernelParameterPassing::Value;
+  FNACCKernelParameterPassing passing = FNACCKernelParameterPassing::Value;
   ElementType elementType = ElementType::Unknown;
   std::string name;
 };
@@ -120,9 +147,10 @@ private:
   RecognitionFailure failureInfo;
 };
 
-FNACCKernelPlanResult buildFNACCKernelPlan(
-    fir::fnacc::LaunchOp launchOp, int32_t fallbackId,
-    int32_t nextSyntheticKernelId, const FNACCKernelPlanOptions &options);
+FNACCKernelPlanResult
+buildFNACCKernelPlan(fir::fnacc::LaunchOp launchOp, int32_t fallbackId,
+                     int32_t nextSyntheticKernelId,
+                     const FNACCKernelPlanOptions &options);
 
 bool isReductionKernelKind(ElementwiseKernelKind kind);
 llvm::StringRef fnaccKernelKindName(ElementwiseKernelKind kind);
@@ -145,6 +173,9 @@ public:
   virtual ~FNACCCodegenBackend() = default;
 
   virtual llvm::StringRef getName() const = 0;
+  virtual FNACCDeviceIRKind getDeviceIRKind() const {
+    return FNACCDeviceIRKind::TTIR;
+  }
   virtual FNACCDeviceImageKind getRuntimeImageKind() const = 0;
   virtual FNACCBackendSupport
   querySupport(const FNACCKernelPlan &plan) const = 0;

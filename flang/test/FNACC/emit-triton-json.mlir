@@ -9,6 +9,7 @@
 // RUN:   --fnacc-assign-kernel-ids \
 // RUN:   --fnacc-lower-to-triton="ttir-output=%t.fallback.ttir json-output=%t.fallback.json backend=cuda-tile fallback-backend=triton allow-backend-fallback=true" \
 // RUN:   %s -o /dev/null 2>&1 | FileCheck %s --check-prefix=FALLBACK
+// RUN: FileCheck %s --check-prefix=FALLBACK-JSON --input-file=%t.fallback.json
 // RUN: not fir-opt \
 // RUN:   --fnacc-assign-kernel-ids \
 // RUN:   --fnacc-lower-to-triton="ttir-output=%t.no-fallback.ttir json-output=%t.no-fallback.json backend=cuda-tile allow-backend-fallback=false" \
@@ -119,10 +120,19 @@ module {
 // TTIR: tt.get_program_id y
 // TTIR: arith.divf
 
+// JSON: "backend_contract_version": 1
+// JSON: "requested_backend": "auto"
+// JSON: "selected_backend": "triton"
+// JSON: "device_ir_kind": "ttir"
+// JSON: "device_image_kind": "ptx"
 // JSON: "id": 0
 // JSON: "name": "fnacc_kernel_0"
+// JSON: "backend": "triton"
+// JSON: "image_index": 0
+// JSON: "image_file": "fnacc_kernel_0.ptx"
 // JSON: "rank": 1
 // JSON: "tile": [128, 1, 1]
+// JSON: "private_pointer_args": 2
 
 // JSON: "id": 1
 // JSON: "name": "fnacc_kernel_1"
@@ -131,4 +141,7 @@ module {
 // JSON: "grid": ["cdiv(extent_x, tile_x)", "cdiv(extent_y, tile_y)", "1"]
 
 // FALLBACK: warning: requested backend 'cuda-tile' is not registered; falling back to 'triton'
+// FALLBACK-JSON: "requested_backend": "cuda-tile"
+// FALLBACK-JSON: "used_backend_fallback": true
+// FALLBACK-JSON: "selected_backend": "triton"
 // NO-FALLBACK: error: FNACC backend selection failed: requested backend 'cuda-tile' is not registered

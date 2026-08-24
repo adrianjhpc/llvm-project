@@ -10,6 +10,7 @@
 
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/StringExtras.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/raw_ostream.h"
@@ -87,6 +88,24 @@ static std::string jsonElementType(fir::fnacc::ElementType type) {
 
 static std::string jsonPtrType(fir::fnacc::ElementType type) {
   return std::string("ptr<") + jsonElementType(type) + ">";
+}
+
+static bool isValidBackendName(StringRef name) {
+  if (name.empty())
+    return false;
+  return llvm::all_of(name, [](char c) {
+    return llvm::isAlnum(c) || c == '-' || c == '_' || c == '.' || c == '+';
+  });
+}
+
+static StringRef deviceImageExtension(fir::fnacc::FNACCDeviceImageKind kind) {
+  switch (kind) {
+  case fir::fnacc::FNACCDeviceImageKind::PTX:
+    return ".ptx";
+  case fir::fnacc::FNACCDeviceImageKind::Cubin:
+    return ".cubin";
+  }
+  llvm_unreachable("unknown FNACC device image kind");
 }
 
 static StringRef ttUnaryOpForExprKind(fir::fnacc::ElementwiseExprKind kind) {
@@ -1689,6 +1708,16 @@ static void emitJsonDescriptor(const fir::fnacc::FNACCKernelPlan &plan,
   os << "    {\n";
   os << "      \"id\": " << plan.id << ",\n";
   os << "      \"name\": \"" << plan.name << "\",\n";
+  os << "      \"backend\": \"" << backend.getName() << "\",\n";
+  os << "      \"device_ir_kind\": \""
+     << fir::fnacc::fnaccDeviceIRKindName(backend.getDeviceIRKind()) << "\",\n";
+  os << "      \"device_image_kind\": \""
+     << fir::fnacc::fnaccDeviceImageKindName(backend.getRuntimeImageKind())
+     << "\",\n";
+  os << "      \"image_index\": " << ptxIndex << ",\n";
+  os << "      \"image_file\": \"" << plan.name
+     << deviceImageExtension(backend.getRuntimeImageKind()) << "\",\n";
+  // Legacy aliases consumed by existing wrappers and runtimes.
   os << "      \"ptx_index\": " << ptxIndex << ",\n";
   os << "      \"ptx_file\": \"" << plan.name << ".ptx\",\n";
   os << "      \"kind\": \"" << fir::fnacc::fnaccKernelKindName(k.kind)
@@ -1702,6 +1731,8 @@ static void emitJsonDescriptor(const fir::fnacc::FNACCKernelPlan &plan,
   os << "      \"num_stages\": " << schedule.pipelineStages << ",\n";
   os << "      \"cuda_threads_per_cta\": "
      << schedule.parallelSubgroups * schedule.subgroupWidth << ",\n";
+  os << "      \"private_pointer_args\": "
+     << backend.getPrivatePointerArgumentCount(plan) << ",\n";
   os << "      \"triton_hidden_ptr_args\": "
      << backend.getPrivatePointerArgumentCount(plan) << ",\n";
 
@@ -1738,6 +1769,16 @@ emitJsonReductionStageDescriptor(const fir::fnacc::FNACCKernelPlan &plan,
   os << "    {\n";
   os << "      \"id\": " << stage.id << ",\n";
   os << "      \"name\": \"" << stage.name << "\",\n";
+  os << "      \"backend\": \"" << backend.getName() << "\",\n";
+  os << "      \"device_ir_kind\": \""
+     << fir::fnacc::fnaccDeviceIRKindName(backend.getDeviceIRKind()) << "\",\n";
+  os << "      \"device_image_kind\": \""
+     << fir::fnacc::fnaccDeviceImageKindName(backend.getRuntimeImageKind())
+     << "\",\n";
+  os << "      \"image_index\": " << ptxIndex << ",\n";
+  os << "      \"image_file\": \"" << stage.name
+     << deviceImageExtension(backend.getRuntimeImageKind()) << "\",\n";
+  // Legacy aliases consumed by existing wrappers and runtimes.
   os << "      \"ptx_index\": " << ptxIndex << ",\n";
   os << "      \"ptx_file\": \"" << stage.name << ".ptx\",\n";
   os << "      \"kind\": \"reduction_stage1d\",\n";
@@ -1928,6 +1969,15 @@ struct FNACCLowerToTritonPass
       return;
     }
 
+    if (!isValidBackendName(this->backend.getValue()) ||
+        !isValidBackendName(this->fallbackBackend.getValue())) {
+      module.emitError(
+          "FNACC backend names may contain only letters, digits, '.', '_', "
+          "'+' and '-'");
+      signalPassFailure();
+      return;
+    }
+
     fir::fnacc::FNACCKernelPlanOptions planOptions;
     planOptions.requestedParallelSubgroups = tritonNumWarps;
     planOptions.subgroupWidth = tritonThreadsPerWarp;
@@ -1950,6 +2000,7 @@ struct FNACCLowerToTritonPass
         &tritonBackend};
     std::vector<fir::fnacc::FNACCKernelPlan> plans;
     std::vector<const fir::fnacc::FNACCCodegenBackend *> selectedBackends;
+    bool usedBackendFallback = false;
 
     bool hasSimpleElementwiseLaunch = false;
     bool hasReductionLaunch = false;
@@ -2018,6 +2069,7 @@ struct FNACCLowerToTritonPass
 
       if (selection.usedFallback)
         launchOp.emitWarning() << selection.diagnostic;
+      usedBackendFallback |= selection.usedFallback;
 
       selectedBackends.push_back(selection.backend);
       plans.push_back(std::move(plan));
@@ -2058,12 +2110,33 @@ struct FNACCLowerToTritonPass
       return;
     }
 
-    jsonOs << "{\n";
-    jsonOs << "  \"fnacc_schema_version\": 1,\n";
-    jsonOs << "  \"kernels\": [\n";
-
     const fir::fnacc::FNACCCodegenBackend *moduleBackend =
         selectedBackends.empty() ? &tritonBackend : selectedBackends.front();
+
+    jsonOs << "{\n";
+    jsonOs << "  \"fnacc_schema_version\": 1,\n";
+    jsonOs << "  \"backend_contract_version\": 1,\n";
+    jsonOs << "  \"requested_backend\": \"" << this->backend.getValue()
+           << "\",\n";
+    jsonOs << "  \"fallback_backend\": \"" << this->fallbackBackend.getValue()
+           << "\",\n";
+    jsonOs << "  \"allow_backend_fallback\": "
+           << (this->allowBackendFallback.getValue() ? "true" : "false")
+           << ",\n";
+    jsonOs << "  \"used_backend_fallback\": "
+           << (usedBackendFallback ? "true" : "false") << ",\n";
+    jsonOs << "  \"selected_backend\": \"" << moduleBackend->getName()
+           << "\",\n";
+    jsonOs << "  \"device_ir_kind\": \""
+           << fir::fnacc::fnaccDeviceIRKindName(
+                  moduleBackend->getDeviceIRKind())
+           << "\",\n";
+    jsonOs << "  \"device_image_kind\": \""
+           << fir::fnacc::fnaccDeviceImageKindName(
+                  moduleBackend->getRuntimeImageKind())
+           << "\",\n";
+    jsonOs << "  \"kernels\": [\n";
+
     moduleBackend->beginModule(planOptions, ttirOs);
 
     bool firstKernel = true;
