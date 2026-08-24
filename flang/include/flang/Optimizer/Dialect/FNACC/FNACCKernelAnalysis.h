@@ -8,8 +8,8 @@
 #include "mlir/IR/Operation.h"
 #include "mlir/IR/Value.h"
 
-#include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/ArrayRef.h"
+#include "llvm/ADT/SmallVector.h"
 
 #include <memory>
 #include <optional>
@@ -70,25 +70,58 @@ enum class ElementwiseExprKind {
   ArrayLoad,
   ScalarLoad,
   ConstantReal,
+
+  // Unary arithmetic.
+  NegF,
+  AbsF,
+  SqrtF,
+  ExpF,
+  LogF,
+  SinF,
+  CosF,
+  TanhF,
+
+  // Binary arithmetic.
   AddF,
   SubF,
   MulF,
-  DivF
+  DivF,
+  MinF,
+  MaxF,
+  PowF,
+
+  // Comparisons.
+  CmpOLT,
+  CmpOLE,
+  CmpOGT,
+  CmpOGE,
+  CmpOEQ,
+  CmpONE,
+
+  // Conditional value selection.
+  Select
 };
+
+enum class ElementwiseExprResultKind { Element, Predicate };
 
 struct ElementwiseExpr {
   ElementwiseExprKind kind;
+  ElementwiseExprResultKind resultKind = ElementwiseExprResultKind::Element;
 
-  // For ArrayLoad and ScalarLoad.
   mlir::Value source;
-
-  // For ConstantReal.
   double realValue = 0.0;
 
   llvm::SmallVector<std::unique_ptr<ElementwiseExpr>> operands;
 };
 
 enum class ElementType { Unknown, F32, F64 };
+
+enum class ScalarCaptureKind { Reference, Value };
+
+struct ScalarCapture {
+  ScalarCaptureKind kind;
+  mlir::Value value;
+};
 
 struct ElementwiseKernel {
   int32_t rank = 1;
@@ -140,6 +173,8 @@ struct ElementwiseKernel {
   mlir::Value writeArray;
 
   llvm::SmallVector<mlir::Value> scalarRefs;
+
+//  llvm::SmallVector<ScalarCapture> scalarCaptures;
 
   mlir::Operation *computeOp = nullptr;
 

@@ -3,6 +3,7 @@
 #include "flang/Optimizer/Dialect/FIRType.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/IR/Matchers.h"
 #include "llvm/ADT/APFloat.h"
 #include "llvm/ADT/STLExtras.h"
@@ -527,6 +528,23 @@ static std::unique_ptr<ElementwiseExpr> makeExpr(ElementwiseExprKind kind) {
   return expr;
 }
 
+static bool isZeroReal(Value v) {
+  v = stripFirConvert(v);
+
+  auto cst = v.getDefiningOp<arith::ConstantOp>();
+  if (!cst)
+    return false;
+
+  auto floatAttr = dyn_cast<FloatAttr>(cst.getValue());
+  if (!floatAttr)
+    return false;
+
+  if (!floatAttr.getType().isF32() && !floatAttr.getType().isF64())
+    return false;
+
+  return floatAttr.getValue().isZero();
+}
+
 static unsigned getOrAddValueIndex(llvm::SmallVectorImpl<Value> &values,
                                    Value value) {
   for (auto it : llvm::enumerate(values)) {
@@ -555,77 +573,276 @@ static std::optional<double> getRealConstantValue(Value v) {
   return floatAttr.getValueAsDouble();
 }
 
+static bool isRealElementType(Type type, ElementType expected) {
+  if (expected == ElementType::F32)
+    return type.isF32();
+  if (expected == ElementType::F64)
+    return type.isF64();
+  return type.isF32() || type.isF64();
+}
+
 static std::unique_ptr<ElementwiseExpr>
-recognizeExpr1D(Value v, const ArrayAccessInfo &info, ElementwiseKernel &k,
-                std::string &reason) {
-  v = stripFirConvert(v);
+recognizeElementwiseExpr(Value value, const ArrayAccessInfo &accesses,
+                         ElementwiseKernel &kernel, std::string &reason);
 
-  // Array element load.
-  int readIndex = findReadValueIndex(info.readValues, v);
-  if (readIndex >= 0) {
-    Value arrayBase = info.readArrays[readIndex];
-    getOrAddValueIndex(k.readArrays, arrayBase);
-
-    auto expr = makeExpr(ElementwiseExprKind::ArrayLoad);
-    expr->source = arrayBase;
-    return expr;
-  }
-
-  // Scalar f32 or f64 load.
-  if (auto scalarRef = getScalarRealRefFromValue(v)) {
-    getOrAddValueIndex(k.scalarRefs, *scalarRef);
-
-    auto expr = makeExpr(ElementwiseExprKind::ScalarLoad);
-    expr->source = *scalarRef;
-    return expr;
-  }
-
-  // f32 or f64 constant.
-  if (auto constantValue = getRealConstantValue(v)) {
-    auto expr = makeExpr(ElementwiseExprKind::ConstantReal);
-    expr->realValue = *constantValue;
-    return expr;
-  }
-
-  Operation *op = v.getDefiningOp();
-  if (!op) {
-    reason = "expression value has no defining operation";
+static std::unique_ptr<ElementwiseExpr>
+recognizeUnaryElementwiseExpr(ElementwiseExprKind kind, Value operand,
+                              const ArrayAccessInfo &accesses,
+                              ElementwiseKernel &kernel, std::string &reason) {
+  auto child = recognizeElementwiseExpr(operand, accesses, kernel, reason);
+  if (!child)
     return nullptr;
-  }
 
-  ElementwiseExprKind exprKind;
+  auto expression = makeExpr(kind);
+  expression->operands.push_back(std::move(child));
+  return expression;
+}
 
-  if (isa<arith::AddFOp>(op)) {
-    exprKind = ElementwiseExprKind::AddF;
-  } else if (isa<arith::SubFOp>(op)) {
-    exprKind = ElementwiseExprKind::SubF;
-  } else if (isa<arith::MulFOp>(op)) {
-    exprKind = ElementwiseExprKind::MulF;
-  } else if (isa<arith::DivFOp>(op)) {
-    exprKind = ElementwiseExprKind::DivF;
-  } else {
-    reason = "unsupported operation in 1-D expression tree";
-    return nullptr;
-  }
-
-  if (op->getNumOperands() != 2) {
-    reason = "expression operation is not binary";
-    return nullptr;
-  }
-
-  auto lhs = recognizeExpr1D(op->getOperand(0), info, k, reason);
+static std::unique_ptr<ElementwiseExpr> recognizeBinaryElementwiseExpr(
+    ElementwiseExprKind kind, Value lhsValue, Value rhsValue,
+    const ArrayAccessInfo &accesses, ElementwiseKernel &kernel,
+    std::string &reason,
+    ElementwiseExprResultKind resultKind = ElementwiseExprResultKind::Element) {
+  auto lhs = recognizeElementwiseExpr(lhsValue, accesses, kernel, reason);
   if (!lhs)
     return nullptr;
 
-  auto rhs = recognizeExpr1D(op->getOperand(1), info, k, reason);
+  auto rhs = recognizeElementwiseExpr(rhsValue, accesses, kernel, reason);
   if (!rhs)
     return nullptr;
 
-  auto expr = makeExpr(exprKind);
-  expr->operands.push_back(std::move(lhs));
-  expr->operands.push_back(std::move(rhs));
+  auto expression = makeExpr(kind);
+  expression->resultKind = resultKind;
+  expression->operands.push_back(std::move(lhs));
+  expression->operands.push_back(std::move(rhs));
+  return expression;
+}
 
-  return expr;
+static std::optional<ElementwiseExprKind>
+getComparisonExprKind(arith::CmpFPredicate predicate) {
+  switch (predicate) {
+  case arith::CmpFPredicate::OLT:
+    return ElementwiseExprKind::CmpOLT;
+  case arith::CmpFPredicate::OLE:
+    return ElementwiseExprKind::CmpOLE;
+  case arith::CmpFPredicate::OGT:
+    return ElementwiseExprKind::CmpOGT;
+  case arith::CmpFPredicate::OGE:
+    return ElementwiseExprKind::CmpOGE;
+  case arith::CmpFPredicate::OEQ:
+    return ElementwiseExprKind::CmpOEQ;
+  case arith::CmpFPredicate::ONE:
+    return ElementwiseExprKind::CmpONE;
+  default:
+    return std::nullopt;
+  }
+}
+
+static bool isSupportedExpressionFloatType(Type type) {
+  return type.isF32() || type.isF64();
+}
+
+static std::unique_ptr<ElementwiseExpr>
+recognizeElementwiseExpr(Value value, const ArrayAccessInfo &accesses,
+                         ElementwiseKernel &kernel, std::string &reason) {
+  value = stripFirConvert(value);
+
+  // Array element load previously collected from a recognized array_coor.
+  int readIndex = findReadValueIndex(accesses.readValues, value);
+  if (readIndex >= 0) {
+    Value arrayBase = accesses.readArrays[readIndex];
+    getOrAddValueIndex(kernel.readArrays, arrayBase);
+
+    auto expression = makeExpr(ElementwiseExprKind::ArrayLoad);
+    expression->source = arrayBase;
+    return expression;
+  }
+
+  // Fortran scalar real variable captured by reference.
+  if (auto scalarRef = getScalarRealRefFromValue(value)) {
+    getOrAddValueIndex(kernel.scalarRefs, *scalarRef);
+
+    auto expression = makeExpr(ElementwiseExprKind::ScalarLoad);
+    expression->source = *scalarRef;
+    return expression;
+  }
+
+  // Floating-point constant.
+  if (auto constantValue = getRealConstantValue(value)) {
+    auto expression = makeExpr(ElementwiseExprKind::ConstantReal);
+    expression->realValue = *constantValue;
+    return expression;
+  }
+
+  Operation *operation = value.getDefiningOp();
+  if (!operation) {
+    reason = "elementwise expression value has no defining operation";
+    return nullptr;
+  }
+
+  Type resultType = value.getType();
+
+  // The only supported non-floating expression result is an i1 predicate.
+  if (!isSupportedExpressionFloatType(resultType) && !resultType.isInteger(1)) {
+    reason = "elementwise expression has unsupported result type";
+    return nullptr;
+  }
+
+  // Unary negation in canonical arith.negf form.
+  if (auto neg = dyn_cast<arith::NegFOp>(operation)) {
+    return recognizeUnaryElementwiseExpr(
+        ElementwiseExprKind::NegF, neg.getOperand(), accesses, kernel, reason);
+  }
+
+  // Flang or canonicalization may represent negation as 0.0 - value.
+  if (auto sub = dyn_cast<arith::SubFOp>(operation)) {
+    if (isZeroReal(sub.getLhs())) {
+      return recognizeUnaryElementwiseExpr(
+          ElementwiseExprKind::NegF, sub.getRhs(), accesses, kernel, reason);
+    }
+
+    return recognizeBinaryElementwiseExpr(ElementwiseExprKind::SubF,
+                                          sub.getLhs(), sub.getRhs(), accesses,
+                                          kernel, reason);
+  }
+
+  if (auto abs = dyn_cast<math::AbsFOp>(operation)) {
+    return recognizeUnaryElementwiseExpr(
+        ElementwiseExprKind::AbsF, abs.getOperand(), accesses, kernel, reason);
+  }
+
+  if (auto sqrt = dyn_cast<math::SqrtOp>(operation)) {
+    return recognizeUnaryElementwiseExpr(ElementwiseExprKind::SqrtF,
+                                         sqrt.getOperand(), accesses, kernel,
+                                         reason);
+  }
+
+  if (auto exp = dyn_cast<math::ExpOp>(operation)) {
+    return recognizeUnaryElementwiseExpr(
+        ElementwiseExprKind::ExpF, exp.getOperand(), accesses, kernel, reason);
+  }
+
+  if (auto log = dyn_cast<math::LogOp>(operation)) {
+    return recognizeUnaryElementwiseExpr(
+        ElementwiseExprKind::LogF, log.getOperand(), accesses, kernel, reason);
+  }
+
+  if (auto sin = dyn_cast<math::SinOp>(operation)) {
+    return recognizeUnaryElementwiseExpr(
+        ElementwiseExprKind::SinF, sin.getOperand(), accesses, kernel, reason);
+  }
+
+  if (auto cos = dyn_cast<math::CosOp>(operation)) {
+    return recognizeUnaryElementwiseExpr(
+        ElementwiseExprKind::CosF, cos.getOperand(), accesses, kernel, reason);
+  }
+
+  if (auto tanh = dyn_cast<math::TanhOp>(operation)) {
+    return recognizeUnaryElementwiseExpr(ElementwiseExprKind::TanhF,
+                                         tanh.getOperand(), accesses, kernel,
+                                         reason);
+  }
+
+  if (auto add = dyn_cast<arith::AddFOp>(operation)) {
+    return recognizeBinaryElementwiseExpr(ElementwiseExprKind::AddF,
+                                          add.getLhs(), add.getRhs(), accesses,
+                                          kernel, reason);
+  }
+
+  if (auto mul = dyn_cast<arith::MulFOp>(operation)) {
+    return recognizeBinaryElementwiseExpr(ElementwiseExprKind::MulF,
+                                          mul.getLhs(), mul.getRhs(), accesses,
+                                          kernel, reason);
+  }
+
+  if (auto div = dyn_cast<arith::DivFOp>(operation)) {
+    return recognizeBinaryElementwiseExpr(ElementwiseExprKind::DivF,
+                                          div.getLhs(), div.getRhs(), accesses,
+                                          kernel, reason);
+  }
+
+  // Use operation names for min/max because exact generated C++ class names
+  // differ across MLIR revisions.
+  StringRef operationName = operation->getName().getStringRef();
+
+  if (operationName == "arith.minimumf" || operationName == "arith.minnumf") {
+    if (operation->getNumOperands() != 2) {
+      reason = "floating-point minimum operation is not binary";
+      return nullptr;
+    }
+
+    return recognizeBinaryElementwiseExpr(
+        ElementwiseExprKind::MinF, operation->getOperand(0),
+        operation->getOperand(1), accesses, kernel, reason);
+  }
+
+  if (operationName == "arith.maximumf" || operationName == "arith.maxnumf") {
+    if (operation->getNumOperands() != 2) {
+      reason = "floating-point maximum operation is not binary";
+      return nullptr;
+    }
+
+    return recognizeBinaryElementwiseExpr(
+        ElementwiseExprKind::MaxF, operation->getOperand(0),
+        operation->getOperand(1), accesses, kernel, reason);
+  }
+
+  if (auto compare = dyn_cast<arith::CmpFOp>(operation)) {
+    std::optional<ElementwiseExprKind> comparisonKind =
+        getComparisonExprKind(compare.getPredicate());
+
+    if (!comparisonKind) {
+      reason = "unsupported floating-point comparison predicate";
+      return nullptr;
+    }
+
+    return recognizeBinaryElementwiseExpr(
+        *comparisonKind, compare.getLhs(), compare.getRhs(), accesses, kernel,
+        reason, ElementwiseExprResultKind::Predicate);
+  }
+
+  if (auto select = dyn_cast<arith::SelectOp>(operation)) {
+    auto condition = recognizeElementwiseExpr(select.getCondition(), accesses,
+                                              kernel, reason);
+    if (!condition)
+      return nullptr;
+
+    if (condition->resultKind != ElementwiseExprResultKind::Predicate) {
+      reason = "elementwise select condition is not a predicate";
+      return nullptr;
+    }
+
+    auto trueValue = recognizeElementwiseExpr(select.getTrueValue(), accesses,
+                                              kernel, reason);
+    if (!trueValue)
+      return nullptr;
+
+    if (trueValue->resultKind != ElementwiseExprResultKind::Element) {
+      reason = "elementwise select true value is not a real value";
+      return nullptr;
+    }
+
+    auto falseValue = recognizeElementwiseExpr(select.getFalseValue(), accesses,
+                                               kernel, reason);
+    if (!falseValue)
+      return nullptr;
+
+    if (falseValue->resultKind != ElementwiseExprResultKind::Element) {
+      reason = "elementwise select false value is not a real value";
+      return nullptr;
+    }
+
+    auto expression = makeExpr(ElementwiseExprKind::Select);
+    expression->resultKind = ElementwiseExprResultKind::Element;
+    expression->operands.push_back(std::move(condition));
+    expression->operands.push_back(std::move(trueValue));
+    expression->operands.push_back(std::move(falseValue));
+    return expression;
+  }
+
+  reason = "unsupported operation in elementwise expression tree: ";
+  reason += operationName;
+  return nullptr;
 }
 
 static bool detectGenericExpr(ElementwiseKernel &k, const ArrayAccessInfo &info,
@@ -638,12 +855,12 @@ static bool detectGenericExpr(ElementwiseKernel &k, const ArrayAccessInfo &info,
   k.scalarRefs.clear();
   k.computeOp = info.storedValue.getDefiningOp();
 
-  auto expr = recognizeExpr1D(info.storedValue, info, k, reason);
+  auto expr = recognizeElementwiseExpr(info.storedValue, info, k, reason);
   if (!expr)
     return false;
 
-  if (k.readArrays.empty() || k.readArrays.size() > 3) {
-    reason = "expression tree supports one to three read arrays";
+  if (k.readArrays.size() > 3) {
+    reason = "expression tree supports at most three read arrays";
     return false;
   }
 
@@ -958,23 +1175,6 @@ static fir::fnacc::ElementType getRealRefElementType(Value v) {
 
 static bool isRealRef(Value v) {
   return getRealRefElementType(v) != fir::fnacc::ElementType::Unknown;
-}
-
-static bool isZeroReal(Value v) {
-  v = stripFirConvert(v);
-
-  auto cst = v.getDefiningOp<arith::ConstantOp>();
-  if (!cst)
-    return false;
-
-  auto floatAttr = dyn_cast<FloatAttr>(cst.getValue());
-  if (!floatAttr)
-    return false;
-
-  if (!floatAttr.getType().isF32() && !floatAttr.getType().isF64())
-    return false;
-
-  return floatAttr.getValue().isZero();
 }
 
 struct ReductionArrayLoadInfo {

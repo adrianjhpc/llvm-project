@@ -7,17 +7,17 @@
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
 
-#include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/ArrayRef.h"
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/raw_ostream.h"
 
 #include <algorithm>
 #include <cassert>
-#include <string>
 #include <cstdint>
 #include <limits>
+#include <string>
 
 namespace fir::fnacc {
 #define GEN_PASS_DEF_FNACCLOWERTOTRITON
@@ -134,6 +134,29 @@ static int32_t getKernelNumWarps(const fir::fnacc::ElementwiseKernel &k,
   llvm_unreachable("unknown FNACC kernel kind");
 }
 
+static StringRef ttUnaryOpForExprKind(fir::fnacc::ElementwiseExprKind kind) {
+  switch (kind) {
+  case fir::fnacc::ElementwiseExprKind::NegF:
+    return "arith.negf";
+  case fir::fnacc::ElementwiseExprKind::AbsF:
+    return "math.absf";
+  case fir::fnacc::ElementwiseExprKind::SqrtF:
+    return "math.sqrt";
+  case fir::fnacc::ElementwiseExprKind::ExpF:
+    return "math.exp";
+  case fir::fnacc::ElementwiseExprKind::LogF:
+    return "math.log";
+  case fir::fnacc::ElementwiseExprKind::SinF:
+    return "math.sin";
+  case fir::fnacc::ElementwiseExprKind::CosF:
+    return "math.cos";
+  case fir::fnacc::ElementwiseExprKind::TanhF:
+    return "math.tanh";
+  default:
+    llvm_unreachable("not a unary FNACC expression");
+  }
+}
+
 static StringRef ttArith(Operation *op) {
   if (isa<arith::AddFOp>(op))
     return "arith.addf";
@@ -154,8 +177,31 @@ static StringRef ttArithForExprKind(fir::fnacc::ElementwiseExprKind kind) {
     return "arith.mulf";
   case fir::fnacc::ElementwiseExprKind::DivF:
     return "arith.divf";
+  case fir::fnacc::ElementwiseExprKind::MinF:
+    return "arith.minimumf";
+  case fir::fnacc::ElementwiseExprKind::MaxF:
+    return "arith.maximumf";
   default:
     llvm_unreachable("not a binary arithmetic expression kind");
+  }
+}
+
+static StringRef comparisonPredicate(fir::fnacc::ElementwiseExprKind kind) {
+  switch (kind) {
+  case fir::fnacc::ElementwiseExprKind::CmpOLT:
+    return "olt";
+  case fir::fnacc::ElementwiseExprKind::CmpOLE:
+    return "ole";
+  case fir::fnacc::ElementwiseExprKind::CmpOGT:
+    return "ogt";
+  case fir::fnacc::ElementwiseExprKind::CmpOGE:
+    return "oge";
+  case fir::fnacc::ElementwiseExprKind::CmpOEQ:
+    return "oeq";
+  case fir::fnacc::ElementwiseExprKind::CmpONE:
+    return "one";
+  default:
+    llvm_unreachable("not a comparison");
   }
 }
 
@@ -284,14 +330,16 @@ static std::string emitExprVector(const fir::fnacc::ElementwiseKernel &k,
     int index = findValueIndex(k.readArrays, expr.source);
     assert(index >= 0 && "array load source not found in read array list");
 
-    if (index == 0)
+    switch (index) {
+    case 0:
       return "%read0v";
-    if (index == 1)
+    case 1:
       return "%read1v";
-    if (index == 2)
+    case 2:
       return "%read2v";
-
-    llvm_unreachable("only three read arrays are supported");
+    default:
+      llvm_unreachable("only three read arrays are supported");
+    }
   }
 
   case fir::fnacc::ElementwiseExprKind::ScalarLoad: {
@@ -319,39 +367,98 @@ static std::string emitExprVector(const fir::fnacc::ElementwiseKernel &k,
 
   case fir::fnacc::ElementwiseExprKind::ConstantReal: {
     unsigned id = state.nextTmp++;
-    std::string cst = "%cst" + std::to_string(id);
+    std::string constant = "%cst" + std::to_string(id);
     std::string splat = "%cst" + std::to_string(id) + "_s";
 
-    os << "  " << cst << " = arith.constant " << expr.realValue << " : "
+    os << "  " << constant << " = arith.constant " << expr.realValue << " : "
        << elemTy << "\n";
 
-    os << "  " << splat << " = tt.splat " << cst << " : " << elemTy
+    os << "  " << splat << " = tt.splat " << constant << " : " << elemTy
        << " -> tensor<" << block << "x" << elemTy << ">\n";
 
     return splat;
   }
 
-  case fir::fnacc::ElementwiseExprKind::AddF:
-  case fir::fnacc::ElementwiseExprKind::SubF:
-  case fir::fnacc::ElementwiseExprKind::MulF:
-  case fir::fnacc::ElementwiseExprKind::DivF: {
-    assert(expr.operands.size() == 2 && "binary expression expected");
+  case fir::fnacc::ElementwiseExprKind::NegF:
+  case fir::fnacc::ElementwiseExprKind::AbsF:
+  case fir::fnacc::ElementwiseExprKind::SqrtF:
+  case fir::fnacc::ElementwiseExprKind::ExpF:
+  case fir::fnacc::ElementwiseExprKind::LogF:
+  case fir::fnacc::ElementwiseExprKind::SinF:
+  case fir::fnacc::ElementwiseExprKind::CosF:
+  case fir::fnacc::ElementwiseExprKind::TanhF: {
+    assert(expr.operands.size() == 1 &&
+           "unary expression requires one operand");
 
-    std::string lhs = emitExprVector(k, *expr.operands[0], state, os);
-    std::string rhs = emitExprVector(k, *expr.operands[1], state, os);
-
+    std::string operand = emitExprVector(k, *expr.operands[0], state, os);
     std::string result = "%expr" + std::to_string(state.nextTmp++);
 
-    StringRef opName = ttArithForExprKind(expr.kind);
-
-    os << "  " << result << " = " << opName << " " << lhs << ", " << rhs;
-    os << " : tensor<" << block << "x" << elemTy << ">\n";
+    os << "  " << result << " = " << ttUnaryOpForExprKind(expr.kind) << " "
+       << operand << " : tensor<" << block << "x" << elemTy << ">\n";
 
     return result;
   }
+
+  case fir::fnacc::ElementwiseExprKind::AddF:
+  case fir::fnacc::ElementwiseExprKind::SubF:
+  case fir::fnacc::ElementwiseExprKind::MulF:
+  case fir::fnacc::ElementwiseExprKind::DivF:
+  case fir::fnacc::ElementwiseExprKind::MinF:
+  case fir::fnacc::ElementwiseExprKind::MaxF: {
+    assert(expr.operands.size() == 2 &&
+           "binary expression requires two operands");
+
+    std::string lhs = emitExprVector(k, *expr.operands[0], state, os);
+    std::string rhs = emitExprVector(k, *expr.operands[1], state, os);
+    std::string result = "%expr" + std::to_string(state.nextTmp++);
+
+    os << "  " << result << " = " << ttArithForExprKind(expr.kind) << " " << lhs
+       << ", " << rhs << " : tensor<" << block << "x" << elemTy << ">\n";
+
+    return result;
   }
 
-  llvm_unreachable("unknown FNACC expression kind");
+  case fir::fnacc::ElementwiseExprKind::CmpOLT:
+  case fir::fnacc::ElementwiseExprKind::CmpOLE:
+  case fir::fnacc::ElementwiseExprKind::CmpOGT:
+  case fir::fnacc::ElementwiseExprKind::CmpOGE:
+  case fir::fnacc::ElementwiseExprKind::CmpOEQ:
+  case fir::fnacc::ElementwiseExprKind::CmpONE: {
+    assert(expr.operands.size() == 2 && "comparison requires two operands");
+
+    std::string lhs = emitExprVector(k, *expr.operands[0], state, os);
+    std::string rhs = emitExprVector(k, *expr.operands[1], state, os);
+    std::string result = "%pred" + std::to_string(state.nextTmp++);
+
+    os << "  " << result << " = arith.cmpf " << comparisonPredicate(expr.kind)
+       << ", " << lhs << ", " << rhs << " : tensor<" << block << "x" << elemTy
+       << ">\n";
+
+    return result;
+  }
+
+  case fir::fnacc::ElementwiseExprKind::Select: {
+    assert(expr.operands.size() == 3 &&
+           "select requires condition, true value, and false value");
+
+    std::string condition = emitExprVector(k, *expr.operands[0], state, os);
+    std::string trueValue = emitExprVector(k, *expr.operands[1], state, os);
+    std::string falseValue = emitExprVector(k, *expr.operands[2], state, os);
+    std::string result = "%expr" + std::to_string(state.nextTmp++);
+
+    os << "  " << result << " = arith.select " << condition << ", " << trueValue
+       << ", " << falseValue << " : tensor<" << block << "xi1>, "
+       << "tensor<" << block << "x" << elemTy << ">\n";
+
+    return result;
+  }
+
+  case fir::fnacc::ElementwiseExprKind::PowF:
+    llvm_unreachable("PowF emission has not been implemented");
+  default:
+    llvm_unreachable(std::to_string(expr.kind)
+                     << " operation has not been implememented yet");
+  }
 }
 
 static void emitTritonExpr1D(const fir::fnacc::ElementwiseKernel &k,
