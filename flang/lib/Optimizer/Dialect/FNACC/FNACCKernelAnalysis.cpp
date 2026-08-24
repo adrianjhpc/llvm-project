@@ -1,4 +1,5 @@
 #include "flang/Optimizer/Dialect/FNACC/FNACCKernelAnalysis.h"
+#include "flang/Optimizer/Dialect/FNACC/FNACCKernelPlan.h"
 
 #include "flang/Optimizer/Dialect/FIRType.h"
 
@@ -10,6 +11,7 @@
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallPtrSet.h"
 
+#include <cassert>
 #include <utility>
 
 using namespace mlir;
@@ -273,8 +275,8 @@ static bool isRecognizedKernelStore(const ElementwiseKernel &kernel,
   return arrayCoor && sameArrayBase(arrayCoor.getMemref(), kernel.writeArray);
 }
 
-static Operation *findDiscardedSideEffect(
-    fir::fnacc::LaunchOp launchOp, const ElementwiseKernel &kernel) {
+static Operation *findDiscardedSideEffect(fir::fnacc::LaunchOp launchOp,
+                                          const ElementwiseKernel &kernel) {
   Operation *unsupported = nullptr;
 
   launchOp.walk([&](Operation *op) {
@@ -302,8 +304,9 @@ static Operation *findDiscardedSideEffect(
   return unsupported;
 }
 
-static ElementwiseRecognitionResult validateRecognizedKernel(
-    fir::fnacc::LaunchOp launchOp, ElementwiseRecognitionResult result) {
+static ElementwiseRecognitionResult
+validateRecognizedKernel(fir::fnacc::LaunchOp launchOp,
+                         ElementwiseRecognitionResult result) {
   ElementwiseKernel kernel = std::move(result.getKernel());
 
   if (Operation *unsupported = findDiscardedSideEffect(launchOp, kernel)) {
@@ -419,7 +422,23 @@ static bool indexIsLoadOf(Value v, Value expectedMemref) {
   }
 }
 
-static std::optional<Value> getScalarRealRefFromValue(Value v) {
+static fir::fnacc::ElementType getSupportedElementType(Type type) {
+  if (type.isInteger(8))
+    return fir::fnacc::ElementType::I8;
+  if (type.isInteger(16))
+    return fir::fnacc::ElementType::I16;
+  if (type.isInteger(32))
+    return fir::fnacc::ElementType::I32;
+  if (type.isInteger(64))
+    return fir::fnacc::ElementType::I64;
+  if (type.isF32())
+    return fir::fnacc::ElementType::F32;
+  if (type.isF64())
+    return fir::fnacc::ElementType::F64;
+  return fir::fnacc::ElementType::Unknown;
+}
+
+static std::optional<Value> getScalarElementRefFromValue(Value v) {
   v = stripFirConvert(v);
 
   auto load = v.getDefiningOp<fir::LoadOp>();
@@ -439,26 +458,18 @@ static std::optional<Value> getScalarRealRefFromValue(Value v) {
 
   Type eleTy = refTy.getEleTy();
 
-  if (!eleTy.isF32() && !eleTy.isF64())
+  if (getSupportedElementType(eleTy) == fir::fnacc::ElementType::Unknown)
     return std::nullopt;
 
   return memref;
 }
 
-static fir::fnacc::ElementType getScalarRealRefElementType(Value memref) {
+static fir::fnacc::ElementType getScalarRefElementType(Value memref) {
   auto refTy = dyn_cast<fir::ReferenceType>(memref.getType());
   if (!refTy)
     return fir::fnacc::ElementType::Unknown;
 
-  Type eleTy = refTy.getEleTy();
-
-  if (eleTy.isF32())
-    return fir::fnacc::ElementType::F32;
-
-  if (eleTy.isF64())
-    return fir::fnacc::ElementType::F64;
-
-  return fir::fnacc::ElementType::Unknown;
+  return getSupportedElementType(refTy.getEleTy());
 }
 
 static Type unwrapArrayStorageType(Type type) {
@@ -487,22 +498,14 @@ static Type unwrapArrayStorageType(Type type) {
   }
 }
 
-static fir::fnacc::ElementType getRealArrayElementType(Value v) {
+static fir::fnacc::ElementType getArrayElementType(Value v) {
   Type type = unwrapArrayStorageType(v.getType());
   auto arrTy = dyn_cast<fir::SequenceType>(type);
 
   if (!arrTy)
     return fir::fnacc::ElementType::Unknown;
 
-  Type eleTy = arrTy.getEleTy();
-
-  if (eleTy.isF32())
-    return fir::fnacc::ElementType::F32;
-
-  if (eleTy.isF64())
-    return fir::fnacc::ElementType::F64;
-
-  return fir::fnacc::ElementType::Unknown;
+  return getSupportedElementType(arrTy.getEleTy());
 }
 
 static bool inferAndCheckElementType(ElementwiseKernel &k,
@@ -512,22 +515,22 @@ static bool inferAndCheckElementType(ElementwiseKernel &k,
     return false;
   }
 
-  fir::fnacc::ElementType type = getRealArrayElementType(k.writeArray);
+  fir::fnacc::ElementType type = getArrayElementType(k.writeArray);
   if (type == fir::fnacc::ElementType::Unknown) {
-    reason = "write array must be real(4) or real(8)";
+    reason = "write array must be integer(1/2/4/8) or real(4/8)";
     return false;
   }
 
   for (Value read : k.readArrays) {
-    fir::fnacc::ElementType readType = getRealArrayElementType(read);
+    fir::fnacc::ElementType readType = getArrayElementType(read);
     if (readType != type) {
-      reason = "all read/write arrays must have the same real element type";
+      reason = "all read/write arrays must have the same element type";
       return false;
     }
   }
 
   for (Value scalar : k.scalarRefs) {
-    if (getScalarRealRefElementType(scalar) != type) {
+    if (getScalarRefElementType(scalar) != type) {
       reason = "scalar captures must match array element type";
       return false;
     }
@@ -555,40 +558,6 @@ static int findReadValueIndex(ArrayRef<Value> readValues, Value v) {
   }
 
   return -1;
-}
-
-static std::optional<Value>
-getScalarRealRefFromValue(Value v, fir::fnacc::ElementType expectedType) {
-  v = stripFirConvert(v);
-
-  auto load = v.getDefiningOp<fir::LoadOp>();
-  if (!load)
-    return std::nullopt;
-
-  Value memref = load.getMemref();
-
-  if (memref.getDefiningOp<fir::ArrayCoorOp>())
-    return std::nullopt;
-
-  auto refTy = dyn_cast<fir::ReferenceType>(memref.getType());
-  if (!refTy)
-    return std::nullopt;
-
-  Type eleTy = refTy.getEleTy();
-
-  if (expectedType == fir::fnacc::ElementType::Unknown) {
-    if (eleTy.isF32() || eleTy.isF64())
-      return memref;
-    return std::nullopt;
-  }
-
-  if (expectedType == fir::fnacc::ElementType::F32 && eleTy.isF32())
-    return memref;
-
-  if (expectedType == fir::fnacc::ElementType::F64 && eleTy.isF64())
-    return memref;
-
-  return std::nullopt;
 }
 
 static std::unique_ptr<ElementwiseExpr> makeExpr(ElementwiseExprKind kind) {
@@ -653,12 +622,85 @@ static std::optional<double> getRealConstantValue(Value v) {
   return floatAttr.getValueAsDouble();
 }
 
-static bool isRealElementType(Type type, ElementType expected) {
-  if (expected == ElementType::F32)
-    return type.isF32();
-  if (expected == ElementType::F64)
-    return type.isF64();
-  return type.isF32() || type.isF64();
+static std::optional<int64_t> getIntegerConstantValue(Value v) {
+  v = stripFirConvert(v);
+
+  auto constant = v.getDefiningOp<arith::ConstantOp>();
+  if (!constant)
+    return std::nullopt;
+
+  auto integerAttr = dyn_cast<IntegerAttr>(constant.getValue());
+  if (!integerAttr || integerAttr.getType().isInteger(1) ||
+      getSupportedElementType(integerAttr.getType()) == ElementType::Unknown)
+    return std::nullopt;
+
+  return integerAttr.getValue().getSExtValue();
+}
+
+/// Strip FIR operations that preserve an elementwise expression's value.
+/// `fir.no_reassoc` records an optimization constraint, but it is not a
+/// computation that needs to be reproduced in TTIR. The expression tree still
+/// preserves the source evaluation order after this wrapper is removed.
+static Value stripElementwiseWrappers(Value value) {
+  while (true) {
+    value = stripFirConvert(value);
+
+    Operation *operation = value.getDefiningOp();
+    if (!operation || operation->getNumOperands() != 1 ||
+        operation->getName().getStringRef() != "fir.no_reassoc")
+      return value;
+
+    value = operation->getOperand(0);
+  }
+}
+
+/// Match the branch-free signed ABS sequence emitted by Flang:
+///
+///   sign = x >> (bitwidth - 1)
+///   abs  = (x xor sign) - sign
+static std::optional<Value> matchFlangIntegerAbs(Value value) {
+  auto subtract = value.getDefiningOp<arith::SubIOp>();
+  if (!subtract)
+    return std::nullopt;
+
+  Value xorValue = stripFirConvert(subtract.getLhs());
+  Value signValue = stripFirConvert(subtract.getRhs());
+  Operation *xorOperation = xorValue.getDefiningOp();
+  Operation *shiftOperation = signValue.getDefiningOp();
+
+  if (!xorOperation || xorOperation->getName().getStringRef() != "arith.xori" ||
+      xorOperation->getNumOperands() != 2 || !shiftOperation ||
+      shiftOperation->getName().getStringRef() != "arith.shrsi" ||
+      shiftOperation->getNumOperands() != 2)
+    return std::nullopt;
+
+  Value original = stripFirConvert(shiftOperation->getOperand(0));
+  auto integerType = dyn_cast<mlir::IntegerType>(original.getType());
+  if (!integerType ||
+      getSupportedElementType(integerType) == ElementType::Unknown)
+    return std::nullopt;
+
+  std::optional<int64_t> shiftAmount =
+      getIntegerConstantValue(shiftOperation->getOperand(1));
+  int64_t expectedShift = static_cast<int64_t>(integerType.getWidth()) - 1;
+  if (!shiftAmount || *shiftAmount != expectedShift)
+    return std::nullopt;
+
+  Value xorLhs = stripFirConvert(xorOperation->getOperand(0));
+  Value xorRhs = stripFirConvert(xorOperation->getOperand(1));
+  bool matches = (xorLhs == original && xorRhs == signValue) ||
+                 (xorRhs == original && xorLhs == signValue);
+  if (!matches)
+    return std::nullopt;
+
+  return original;
+}
+
+static bool isSupportedElementType(Type type, ElementType expected) {
+  ElementType actual = getSupportedElementType(type);
+  if (expected == ElementType::Unknown)
+    return actual != ElementType::Unknown;
+  return actual == expected;
 }
 
 static std::unique_ptr<ElementwiseExpr>
@@ -718,14 +760,30 @@ getComparisonExprKind(arith::CmpFPredicate predicate) {
   }
 }
 
-static bool isSupportedExpressionFloatType(Type type) {
-  return type.isF32() || type.isF64();
+static std::optional<ElementwiseExprKind>
+getComparisonExprKind(arith::CmpIPredicate predicate) {
+  switch (predicate) {
+  case arith::CmpIPredicate::slt:
+    return ElementwiseExprKind::CmpSLT;
+  case arith::CmpIPredicate::sle:
+    return ElementwiseExprKind::CmpSLE;
+  case arith::CmpIPredicate::sgt:
+    return ElementwiseExprKind::CmpSGT;
+  case arith::CmpIPredicate::sge:
+    return ElementwiseExprKind::CmpSGE;
+  case arith::CmpIPredicate::eq:
+    return ElementwiseExprKind::CmpIEQ;
+  case arith::CmpIPredicate::ne:
+    return ElementwiseExprKind::CmpINE;
+  default:
+    return std::nullopt;
+  }
 }
 
 static std::unique_ptr<ElementwiseExpr>
 recognizeElementwiseExpr(Value value, const ArrayAccessInfo &accesses,
                          ElementwiseKernel &kernel, std::string &reason) {
-  value = stripFirConvert(value);
+  value = stripElementwiseWrappers(value);
 
   // Array element load previously collected from a recognized array_coor.
   int readIndex = findReadValueIndex(accesses.readValues, value);
@@ -738,8 +796,8 @@ recognizeElementwiseExpr(Value value, const ArrayAccessInfo &accesses,
     return expression;
   }
 
-  // Fortran scalar real variable captured by reference.
-  if (auto scalarRef = getScalarRealRefFromValue(value)) {
+  // Fortran scalar integer or real variable captured by reference.
+  if (auto scalarRef = getScalarElementRefFromValue(value)) {
     getOrAddValueIndex(kernel.scalarRefs, *scalarRef);
 
     auto expression = makeExpr(ElementwiseExprKind::ScalarLoad);
@@ -754,6 +812,12 @@ recognizeElementwiseExpr(Value value, const ArrayAccessInfo &accesses,
     return expression;
   }
 
+  if (auto constantValue = getIntegerConstantValue(value)) {
+    auto expression = makeExpr(ElementwiseExprKind::ConstantInteger);
+    expression->integerValue = *constantValue;
+    return expression;
+  }
+
   Operation *operation = value.getDefiningOp();
   if (!operation) {
     reason = "elementwise expression value has no defining operation";
@@ -762,8 +826,10 @@ recognizeElementwiseExpr(Value value, const ArrayAccessInfo &accesses,
 
   Type resultType = value.getType();
 
-  // The only supported non-floating expression result is an i1 predicate.
-  if (!isSupportedExpressionFloatType(resultType) && !resultType.isInteger(1)) {
+  // Element results must use a supported integer or real type. i1 is accepted
+  // only as the intermediate result of a comparison.
+  if (!isSupportedElementType(resultType, ElementType::Unknown) &&
+      !resultType.isInteger(1)) {
     reason = "elementwise expression has unsupported result type";
     return nullptr;
   }
@@ -823,6 +889,18 @@ recognizeElementwiseExpr(Value value, const ArrayAccessInfo &accesses,
                                          reason);
   }
 
+  StringRef operationName = operation->getName().getStringRef();
+
+  if (operationName == "math.absi") {
+    if (operation->getNumOperands() != 1) {
+      reason = "integer absolute-value operation is not unary";
+      return nullptr;
+    }
+    return recognizeUnaryElementwiseExpr(ElementwiseExprKind::AbsI,
+                                         operation->getOperand(0), accesses,
+                                         kernel, reason);
+  }
+
   if (auto add = dyn_cast<arith::AddFOp>(operation)) {
     return recognizeBinaryElementwiseExpr(ElementwiseExprKind::AddF,
                                           add.getLhs(), add.getRhs(), accesses,
@@ -841,9 +919,36 @@ recognizeElementwiseExpr(Value value, const ArrayAccessInfo &accesses,
                                           kernel, reason);
   }
 
+  if (auto add = dyn_cast<arith::AddIOp>(operation)) {
+    return recognizeBinaryElementwiseExpr(ElementwiseExprKind::AddI,
+                                          add.getLhs(), add.getRhs(), accesses,
+                                          kernel, reason);
+  }
+
+  if (auto sub = dyn_cast<arith::SubIOp>(operation)) {
+    if (std::optional<Value> absOperand = matchFlangIntegerAbs(value))
+      return recognizeUnaryElementwiseExpr(
+          ElementwiseExprKind::AbsI, *absOperand, accesses, kernel, reason);
+
+    return recognizeBinaryElementwiseExpr(ElementwiseExprKind::SubI,
+                                          sub.getLhs(), sub.getRhs(), accesses,
+                                          kernel, reason);
+  }
+
+  if (auto mul = dyn_cast<arith::MulIOp>(operation)) {
+    return recognizeBinaryElementwiseExpr(ElementwiseExprKind::MulI,
+                                          mul.getLhs(), mul.getRhs(), accesses,
+                                          kernel, reason);
+  }
+
+  if (auto div = dyn_cast<arith::DivSIOp>(operation)) {
+    return recognizeBinaryElementwiseExpr(ElementwiseExprKind::DivSI,
+                                          div.getLhs(), div.getRhs(), accesses,
+                                          kernel, reason);
+  }
+
   // Use operation names for min/max because exact generated C++ class names
   // differ across MLIR revisions.
-  StringRef operationName = operation->getName().getStringRef();
 
   if (operationName == "arith.minimumf") {
     if (operation->getNumOperands() != 2) {
@@ -892,12 +997,40 @@ recognizeElementwiseExpr(Value value, const ArrayAccessInfo &accesses,
         operation->getOperand(1), accesses, kernel, reason);
   }
 
+  if (operationName == "arith.minsi" || operationName == "arith.maxsi") {
+    if (operation->getNumOperands() != 2) {
+      reason = "signed integer min/max operation is not binary";
+      return nullptr;
+    }
+
+    ElementwiseExprKind kind = operationName == "arith.minsi"
+                                   ? ElementwiseExprKind::MinSI
+                                   : ElementwiseExprKind::MaxSI;
+    return recognizeBinaryElementwiseExpr(kind, operation->getOperand(0),
+                                          operation->getOperand(1), accesses,
+                                          kernel, reason);
+  }
+
   if (auto compare = dyn_cast<arith::CmpFOp>(operation)) {
     std::optional<ElementwiseExprKind> comparisonKind =
         getComparisonExprKind(compare.getPredicate());
 
     if (!comparisonKind) {
       reason = "unsupported floating-point comparison predicate";
+      return nullptr;
+    }
+
+    return recognizeBinaryElementwiseExpr(
+        *comparisonKind, compare.getLhs(), compare.getRhs(), accesses, kernel,
+        reason, ElementwiseExprResultKind::Predicate);
+  }
+
+  if (auto compare = dyn_cast<arith::CmpIOp>(operation)) {
+    std::optional<ElementwiseExprKind> comparisonKind =
+        getComparisonExprKind(compare.getPredicate());
+
+    if (!comparisonKind) {
+      reason = "unsupported integer comparison predicate";
       return nullptr;
     }
 
@@ -923,7 +1056,7 @@ recognizeElementwiseExpr(Value value, const ArrayAccessInfo &accesses,
       return nullptr;
 
     if (trueValue->resultKind != ElementwiseExprResultKind::Element) {
-      reason = "elementwise select true value is not a real value";
+      reason = "elementwise select true value is not an element value";
       return nullptr;
     }
 
@@ -933,7 +1066,7 @@ recognizeElementwiseExpr(Value value, const ArrayAccessInfo &accesses,
       return nullptr;
 
     if (falseValue->resultKind != ElementwiseExprResultKind::Element) {
-      reason = "elementwise select false value is not a real value";
+      reason = "elementwise select false value is not an element value";
       return nullptr;
     }
 
@@ -970,7 +1103,7 @@ static bool detectGenericExpr(ElementwiseKernel &k, const ArrayAccessInfo &info,
   }
 
   if (k.scalarRefs.size() > 3) {
-    reason = "expression tree supports at most three scalar real values";
+    reason = "expression tree supports at most three scalar values";
     return false;
   }
 
@@ -1057,7 +1190,7 @@ static bool detectDirectBinaryArrayArray(ElementwiseKernel &k,
   Operation *op = info.storedValue.getDefiningOp();
 
   if (!isSupportedElementwiseCompute(op)) {
-    reason = "stored value is not a supported binary floating-point op";
+    reason = "stored value is not a supported binary elementwise op";
     return false;
   }
 
@@ -1113,11 +1246,11 @@ static bool detectSaxpy1D(ElementwiseKernel &k, const ArrayAccessInfo &info,
     std::optional<Value> scalarRef;
 
     if (scaledArrayIndex >= 0) {
-      scalarRef = getScalarRealRefFromValue(mulRhs);
+      scalarRef = getScalarElementRefFromValue(mulRhs);
     } else {
       scaledArrayIndex = findReadValueIndex(info.readValues, mulRhs);
       if (scaledArrayIndex >= 0)
-        scalarRef = getScalarRealRefFromValue(mulLhs);
+        scalarRef = getScalarElementRefFromValue(mulLhs);
     }
 
     if (scaledArrayIndex < 0 || !scalarRef)
@@ -1430,15 +1563,15 @@ static bool getOrCheckReductionElementType(ElementwiseKernel &k,
     return false;
   }
 
-  fir::fnacc::ElementType type = getRealArrayElementType(k.readArrays[0]);
+  fir::fnacc::ElementType type = getArrayElementType(k.readArrays[0]);
 
   if (type == fir::fnacc::ElementType::Unknown) {
-    reason = "reduction read array must be real(4) or real(8)";
+    reason = "reduction read array must be integer(1/2/4/8) or real(4/8)";
     return false;
   }
 
   for (Value read : k.readArrays) {
-    if (getRealArrayElementType(read) != type) {
+    if (getArrayElementType(read) != type) {
       reason = "all reduction read arrays must have same element type";
       return false;
     }
@@ -1449,7 +1582,7 @@ static bool getOrCheckReductionElementType(ElementwiseKernel &k,
     return false;
   }
 
-  if (getScalarRealRefElementType(k.reductionScalarRef) != type) {
+  if (getScalarRefElementType(k.reductionScalarRef) != type) {
     reason = "reduction scalar type must match array element type";
     return false;
   }
@@ -1501,15 +1634,17 @@ static bool reductionOperationMatches(Operation *op,
   StringRef name = op->getName().getStringRef();
   switch (reductionOp) {
   case ReductionOperator::Add:
-    return name == "arith.addf";
+    return name == "arith.addf" || name == "arith.addi";
   case ReductionOperator::Multiply:
-    return name == "arith.mulf";
+    return name == "arith.mulf" || name == "arith.muli";
   case ReductionOperator::Min:
-    if (name == "arith.minimumf" || name == "arith.minnumf")
+    if (name == "arith.minimumf" || name == "arith.minnumf" ||
+        name == "arith.minsi")
       return true;
     break;
   case ReductionOperator::Max:
-    if (name == "arith.maximumf" || name == "arith.maxnumf")
+    if (name == "arith.maximumf" || name == "arith.maxnumf" ||
+        name == "arith.maxsi")
       return true;
     break;
   }
@@ -1519,12 +1654,34 @@ static bool reductionOperationMatches(Operation *op,
                   reductionOp != ReductionOperator::Max))
     return false;
 
-  auto compare = select.getCondition().getDefiningOp<arith::CmpFOp>();
-  if (!compare)
-    return false;
+  Value cmpLhs;
+  Value cmpRhs;
+  bool less = false;
+  bool greater = false;
 
-  Value cmpLhs = stripFirConvert(compare.getLhs());
-  Value cmpRhs = stripFirConvert(compare.getRhs());
+  if (auto compare = select.getCondition().getDefiningOp<arith::CmpFOp>()) {
+    cmpLhs = stripFirConvert(compare.getLhs());
+    cmpRhs = stripFirConvert(compare.getRhs());
+
+    using Predicate = arith::CmpFPredicate;
+    Predicate predicate = compare.getPredicate();
+    less = predicate == Predicate::OLT || predicate == Predicate::OLE ||
+           predicate == Predicate::ULT || predicate == Predicate::ULE;
+    greater = predicate == Predicate::OGT || predicate == Predicate::OGE ||
+              predicate == Predicate::UGT || predicate == Predicate::UGE;
+  } else if (auto compare =
+                 select.getCondition().getDefiningOp<arith::CmpIOp>()) {
+    cmpLhs = stripFirConvert(compare.getLhs());
+    cmpRhs = stripFirConvert(compare.getRhs());
+
+    using Predicate = arith::CmpIPredicate;
+    Predicate predicate = compare.getPredicate();
+    less = predicate == Predicate::slt || predicate == Predicate::sle;
+    greater = predicate == Predicate::sgt || predicate == Predicate::sge;
+  } else {
+    return false;
+  }
+
   Value trueValue = stripFirConvert(select.getTrueValue());
   Value falseValue = stripFirConvert(select.getFalseValue());
 
@@ -1532,13 +1689,6 @@ static bool reductionOperationMatches(Operation *op,
   bool reversed = trueValue == cmpRhs && falseValue == cmpLhs;
   if (!direct && !reversed)
     return false;
-
-  using Predicate = arith::CmpFPredicate;
-  Predicate predicate = compare.getPredicate();
-  bool less = predicate == Predicate::OLT || predicate == Predicate::OLE ||
-              predicate == Predicate::ULT || predicate == Predicate::ULE;
-  bool greater = predicate == Predicate::OGT || predicate == Predicate::OGE ||
-                 predicate == Predicate::UGT || predicate == Predicate::UGE;
 
   if (reversed)
     std::swap(less, greater);
@@ -1599,14 +1749,17 @@ static bool matchReductionDotValue(Value value,
                                    std::string &reason) {
   value = stripFirConvert(value);
 
-  auto add = value.getDefiningOp<arith::AddFOp>();
-  if (!add) {
-    reason = "dot reduction store value is not arith.addf";
+  Operation *add = value.getDefiningOp();
+  if (!add ||
+      (add->getName().getStringRef() != "arith.addf" &&
+       add->getName().getStringRef() != "arith.addi") ||
+      add->getNumOperands() != 2) {
+    reason = "dot reduction store value is not a supported add";
     return false;
   }
 
-  Value lhs = stripFirConvert(add.getLhs());
-  Value rhs = stripFirConvert(add.getRhs());
+  Value lhs = stripFirConvert(add->getOperand(0));
+  Value rhs = stripFirConvert(add->getOperand(1));
 
   Value maybeMul;
 
@@ -1621,14 +1774,17 @@ static bool matchReductionDotValue(Value value,
 
   maybeMul = stripFirConvert(maybeMul);
 
-  auto mul = maybeMul.getDefiningOp<arith::MulFOp>();
-  if (!mul) {
-    reason = "dot reduction term is not arith.mulf";
+  Operation *mul = maybeMul.getDefiningOp();
+  if (!mul ||
+      (mul->getName().getStringRef() != "arith.mulf" &&
+       mul->getName().getStringRef() != "arith.muli") ||
+      mul->getNumOperands() != 2) {
+    reason = "dot reduction term is not a supported multiply";
     return false;
   }
 
-  Value mulLhs = stripFirConvert(mul.getLhs());
-  Value mulRhs = stripFirConvert(mul.getRhs());
+  Value mulLhs = stripFirConvert(mul->getOperand(0));
+  Value mulRhs = stripFirConvert(mul->getOperand(1));
 
   int lhsIndex = findReductionLoadedValueIndex(loads, mulLhs);
   int rhsIndex = findReductionLoadedValueIndex(loads, mulRhs);
@@ -1640,7 +1796,7 @@ static bool matchReductionDotValue(Value value,
 
   arrayA = loads[lhsIndex].arrayBase;
   arrayB = loads[rhsIndex].arrayBase;
-  computeOp = mul.getOperation();
+  computeOp = mul;
   return true;
 }
 
@@ -2286,7 +2442,8 @@ static ElementwiseRecognitionResult recognize2D(fir::fnacc::LaunchOp launchOp) {
 
 bool isSupportedElementwiseCompute(Operation *op) {
   return op &&
-         isa<arith::AddFOp, arith::SubFOp, arith::MulFOp, arith::DivFOp>(op);
+         isa<arith::AddFOp, arith::SubFOp, arith::MulFOp, arith::DivFOp,
+             arith::AddIOp, arith::SubIOp, arith::MulIOp, arith::DivSIOp>(op);
 }
 
 ElementwiseRecognitionResult
@@ -2329,6 +2486,349 @@ recognizeElementwiseKernel(fir::fnacc::LaunchOp launchOp) {
   reason += r1.getFailure().reason;
 
   return fail(launchOp, reason);
+}
+
+namespace {
+
+static constexpr llvm::StringLiteral kKernelIdAttrName = "fnacc.kernel_id";
+static constexpr llvm::StringLiteral kKernelNameAttrName = "fnacc.kernel_name";
+
+static int32_t getPlannedKernelId(fir::fnacc::LaunchOp launchOp,
+                                  int32_t fallbackId) {
+  if (auto attr = launchOp->getAttrOfType<IntegerAttr>(kKernelIdAttrName))
+    return static_cast<int32_t>(attr.getInt());
+  return fallbackId;
+}
+
+static std::string getPlannedKernelName(fir::fnacc::LaunchOp launchOp,
+                                        int32_t fallbackId) {
+  if (auto attr = launchOp->getAttrOfType<StringAttr>(kKernelNameAttrName))
+    return attr.getValue().str();
+  return "fnacc_kernel_" + std::to_string(fallbackId);
+}
+
+static int32_t getPlannedParallelSubgroups(const ElementwiseKernel &kernel,
+                                           int32_t requestedParallelSubgroups) {
+  bool isF64ScalarElementwise =
+      kernel.elementType == ElementType::F64 && !kernel.scalarRefs.empty() &&
+      (kernel.kind == ElementwiseKernelKind::Saxpy1D ||
+       kernel.kind == ElementwiseKernelKind::Expr1D ||
+       kernel.kind == ElementwiseKernelKind::Expr2D);
+
+  if (isF64ScalarElementwise || isReductionKernelKind(kernel.kind) ||
+      kernel.kind == ElementwiseKernelKind::MatMul2D)
+    return requestedParallelSubgroups;
+
+  return 1;
+}
+
+static llvm::SmallVector<unsigned>
+getKernelParameterSlotsForValue(const ElementwiseKernel &kernel, Value value) {
+  llvm::SmallVector<unsigned> slots;
+
+  for (unsigned i = 0; i < kernel.readArrays.size(); ++i)
+    if (kernel.readArrays[i] == value)
+      slots.push_back(i);
+
+  if (kernel.writeArray == value)
+    slots.push_back(kernel.readArrays.size());
+
+  unsigned scalarBaseSlot = kernel.readArrays.size() + 1;
+  for (unsigned i = 0; i < kernel.scalarRefs.size(); ++i)
+    if (kernel.scalarRefs[i] == value)
+      slots.push_back(scalarBaseSlot + i);
+
+  return slots;
+}
+
+static bool isReductionMetadataPackSlot(fir::fnacc::LaunchOp launchOp,
+                                        unsigned packIndex) {
+  auto slotsAttr =
+      launchOp->getAttrOfType<DenseI32ArrayAttr>("fnacc.reduction_slots");
+  if (!slotsAttr)
+    return false;
+
+  for (int32_t slot : slotsAttr.asArrayRef())
+    if (slot >= 0 && static_cast<unsigned>(slot) == packIndex)
+      return true;
+
+  return false;
+}
+
+static void appendABIParameter(FNACCKernelABI &abi,
+                               FNACCKernelParameterRole role,
+                               FNACCKernelParameterPassing passing,
+                               ElementType elementType, llvm::StringRef name) {
+  FNACCKernelParameter parameter;
+  parameter.slot = abi.parameters.size();
+  parameter.role = role;
+  parameter.passing = passing;
+  parameter.elementType = elementType;
+  parameter.name = name.str();
+  abi.parameters.push_back(std::move(parameter));
+}
+
+static FNACCKernelABI buildKernelABI(fir::fnacc::LaunchOp launchOp,
+                                     const ElementwiseKernel &kernel) {
+  FNACCKernelABI abi;
+  bool isReduction = isReductionKernelKind(kernel.kind);
+
+  for (unsigned i = 0; i < kernel.readArrays.size(); ++i)
+    appendABIParameter(abi, FNACCKernelParameterRole::Read,
+                       FNACCKernelParameterPassing::DevicePointer,
+                       kernel.elementType, "read" + std::to_string(i));
+
+  if (isReduction) {
+    appendABIParameter(abi, FNACCKernelParameterRole::Partials,
+                       FNACCKernelParameterPassing::DevicePointer,
+                       kernel.elementType, "partials");
+    appendABIParameter(abi, FNACCKernelParameterRole::ExtentX,
+                       FNACCKernelParameterPassing::Value, ElementType::I32,
+                       "extent_x");
+  } else {
+    appendABIParameter(abi, FNACCKernelParameterRole::Write,
+                       FNACCKernelParameterPassing::DevicePointer,
+                       kernel.elementType, "write");
+
+    for (unsigned i = 0; i < kernel.scalarRefs.size(); ++i)
+      appendABIParameter(abi, FNACCKernelParameterRole::Scalar,
+                         FNACCKernelParameterPassing::Value, kernel.elementType,
+                         "scalar" + std::to_string(i));
+
+    appendABIParameter(abi, FNACCKernelParameterRole::ExtentX,
+                       FNACCKernelParameterPassing::Value, ElementType::I32,
+                       "extent_x");
+
+    if (kernel.rank == 2) {
+      appendABIParameter(abi, FNACCKernelParameterRole::ExtentY,
+                         FNACCKernelParameterPassing::Value, ElementType::I32,
+                         "extent_y");
+
+      if (kernel.kind == ElementwiseKernelKind::MatMul2D)
+        appendABIParameter(abi, FNACCKernelParameterRole::ExtentZ,
+                           FNACCKernelParameterPassing::Value, ElementType::I32,
+                           "extent_k");
+    }
+  }
+
+  auto packVars = launchOp.getPackVars();
+  llvm::ArrayRef<int32_t> targets = launchOp.getPackTargets();
+
+  for (auto [packIndex, packValue] : llvm::enumerate(packVars)) {
+    if (isReductionMetadataPackSlot(launchOp, packIndex))
+      continue;
+
+    llvm::SmallVector<unsigned> slots =
+        getKernelParameterSlotsForValue(kernel, packValue);
+    if (slots.empty()) {
+      launchOp.emitWarning() << "PACK variable #" << packIndex
+                             << " was not used by recognized FNACC kernel body";
+      continue;
+    }
+
+    if (packIndex >= targets.size()) {
+      launchOp.emitWarning("PACK target list shorter than PACK var list");
+      continue;
+    }
+
+    for (unsigned slot : slots)
+      abi.packBindings.push_back({slot, targets[packIndex]});
+  }
+
+  return abi;
+}
+
+static FNACCKernelABI buildReductionStageABI(ElementType elementType) {
+  FNACCKernelABI abi;
+  appendABIParameter(abi, FNACCKernelParameterRole::Read,
+                     FNACCKernelParameterPassing::DevicePointer, elementType,
+                     "input");
+  appendABIParameter(abi, FNACCKernelParameterRole::Partials,
+                     FNACCKernelParameterPassing::DevicePointer, elementType,
+                     "output");
+  appendABIParameter(abi, FNACCKernelParameterRole::ExtentX,
+                     FNACCKernelParameterPassing::Value, ElementType::I32,
+                     "extent_x");
+  return abi;
+}
+
+static FNACCTileShape getPlannedTileShape(fir::fnacc::LaunchOp launchOp,
+                                          const ElementwiseKernel &kernel) {
+  llvm::ArrayRef<int64_t> tiles = launchOp.getTileSizes();
+  FNACCTileShape tile;
+
+  if (kernel.rank == 2) {
+    tile.x = tiles.size() >= 1 ? tiles[0] : 16;
+    tile.y = tiles.size() >= 2 ? tiles[1] : 16;
+    if (kernel.kind == ElementwiseKernelKind::MatMul2D)
+      tile.z = tiles.size() >= 3
+                   ? tiles[2]
+                   : (kernel.elementType == ElementType::F64 ? 8 : 32);
+  } else {
+    tile.x = tiles.empty() ? 1024 : tiles[0];
+  }
+
+  return tile;
+}
+
+} // namespace
+
+FNACCKernelPlanResult FNACCKernelPlanResult::success(FNACCKernelPlan plan) {
+  FNACCKernelPlanResult result;
+  result.plan.emplace(std::move(plan));
+  return result;
+}
+
+FNACCKernelPlanResult FNACCKernelPlanResult::failure(Operation *where,
+                                                     std::string reason) {
+  FNACCKernelPlanResult result;
+  result.failureInfo.where = where;
+  result.failureInfo.reason = std::move(reason);
+  return result;
+}
+
+FNACCKernelPlan FNACCKernelPlanResult::takePlan() {
+  assert(plan && "cannot take a failed FNACC kernel plan");
+  FNACCKernelPlan result = std::move(*plan);
+  plan.reset();
+  return result;
+}
+
+bool isReductionKernelKind(ElementwiseKernelKind kind) {
+  return kind == ElementwiseKernelKind::ReductionSum1D ||
+         kind == ElementwiseKernelKind::ReductionDot1D ||
+         kind == ElementwiseKernelKind::ReductionProduct1D ||
+         kind == ElementwiseKernelKind::ReductionMin1D ||
+         kind == ElementwiseKernelKind::ReductionMax1D;
+}
+
+llvm::StringRef fnaccKernelKindName(ElementwiseKernelKind kind) {
+  switch (kind) {
+  case ElementwiseKernelKind::BinaryArrayArray:
+    return "binary";
+  case ElementwiseKernelKind::Saxpy1D:
+    return "saxpy1d";
+  case ElementwiseKernelKind::Expr1D:
+    return "expr1d";
+  case ElementwiseKernelKind::Expr2D:
+    return "expr2d";
+  case ElementwiseKernelKind::MatMul2D:
+    return "matmul2d";
+  case ElementwiseKernelKind::ReductionSum1D:
+    return "reduction_sum1d";
+  case ElementwiseKernelKind::ReductionDot1D:
+    return "reduction_dot1d";
+  case ElementwiseKernelKind::ReductionProduct1D:
+    return "reduction_product1d";
+  case ElementwiseKernelKind::ReductionMin1D:
+    return "reduction_min1d";
+  case ElementwiseKernelKind::ReductionMax1D:
+    return "reduction_max1d";
+  }
+  llvm_unreachable("unknown FNACC kernel kind");
+}
+
+FNACCKernelPlanResult
+buildFNACCKernelPlan(fir::fnacc::LaunchOp launchOp, int32_t fallbackId,
+                     int32_t nextSyntheticKernelId,
+                     const FNACCKernelPlanOptions &options) {
+  ElementwiseRecognitionResult recognition =
+      recognizeElementwiseKernel(launchOp);
+  if (recognition.failed())
+    return FNACCKernelPlanResult::failure(recognition.getFailure().where,
+                                          recognition.getFailure().reason);
+
+  ElementwiseKernel kernel = std::move(recognition.getKernel());
+
+  FNACCKernelPlan plan;
+  plan.launchOp = launchOp;
+  plan.id = getPlannedKernelId(launchOp, fallbackId);
+  plan.name = getPlannedKernelName(launchOp, plan.id);
+  plan.kernel = std::move(kernel);
+  plan.schedule.tile = getPlannedTileShape(launchOp, plan.kernel);
+  plan.schedule.parallelSubgroups = getPlannedParallelSubgroups(
+      plan.kernel, options.requestedParallelSubgroups);
+  plan.schedule.subgroupWidth = options.subgroupWidth;
+  plan.schedule.pipelineStages = options.pipelineStages;
+  plan.schedule.f64MatmulStrategy = options.f64MatmulStrategy;
+  plan.abi = buildKernelABI(launchOp, plan.kernel);
+
+  if (isReductionKernelKind(plan.kernel.kind)) {
+    FNACCReductionStagePlan stage;
+    stage.id = nextSyntheticKernelId;
+    stage.name = plan.name + "_reduce_stage";
+    stage.reductionOperator = plan.kernel.reductionOperator;
+    stage.elementType = plan.kernel.elementType;
+    stage.abi = buildReductionStageABI(plan.kernel.elementType);
+    plan.reductionStage = std::move(stage);
+  }
+
+  return FNACCKernelPlanResult::success(std::move(plan));
+}
+
+FNACCBackendSelection selectFNACCBackend(
+    const FNACCKernelPlan &plan,
+    llvm::ArrayRef<const FNACCCodegenBackend *> availableBackends,
+    llvm::StringRef preferredBackend, llvm::StringRef fallbackBackend,
+    bool allowFallback) {
+  auto findBackend = [&](llvm::StringRef name) -> const FNACCCodegenBackend * {
+    for (const FNACCCodegenBackend *backend : availableBackends)
+      if (backend && backend->getName() == name)
+        return backend;
+    return nullptr;
+  };
+
+  if (preferredBackend.empty() || preferredBackend == "auto") {
+    std::string unsupportedReasons;
+    for (const FNACCCodegenBackend *backend : availableBackends) {
+      if (!backend)
+        continue;
+      FNACCBackendSupport support = backend->querySupport(plan);
+      if (support.supported)
+        return {backend, false, {}};
+      if (!unsupportedReasons.empty())
+        unsupportedReasons += "; ";
+      unsupportedReasons += backend->getName().str() + ": " + support.reason;
+    }
+
+    return {nullptr, false,
+            unsupportedReasons.empty()
+                ? "no FNACC code-generation backends are registered"
+                : "no registered FNACC backend supports this kernel: " +
+                      unsupportedReasons};
+  }
+
+  const FNACCCodegenBackend *preferred = findBackend(preferredBackend);
+  std::string preferredFailure;
+  if (!preferred) {
+    preferredFailure =
+        "requested backend '" + preferredBackend.str() + "' is not registered";
+  } else {
+    FNACCBackendSupport support = preferred->querySupport(plan);
+    if (support.supported)
+      return {preferred, false, {}};
+    preferredFailure = "backend '" + preferredBackend.str() +
+                       "' does not support this kernel: " + support.reason;
+  }
+
+  if (!allowFallback)
+    return {nullptr, false, std::move(preferredFailure)};
+
+  const FNACCCodegenBackend *fallback = findBackend(fallbackBackend);
+  if (!fallback)
+    return {nullptr, false,
+            preferredFailure + "; fallback backend '" + fallbackBackend.str() +
+                "' is not registered"};
+
+  FNACCBackendSupport fallbackSupport = fallback->querySupport(plan);
+  if (!fallbackSupport.supported)
+    return {nullptr, false,
+            preferredFailure + "; fallback backend '" + fallbackBackend.str() +
+                "' does not support this kernel: " + fallbackSupport.reason};
+
+  return {fallback, true,
+          preferredFailure + "; falling back to '" + fallbackBackend.str() +
+              "'"};
 }
 
 } // namespace fir::fnacc

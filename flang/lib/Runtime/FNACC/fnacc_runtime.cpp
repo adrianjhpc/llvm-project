@@ -12,6 +12,7 @@
 #include <optional>
 #include <sstream>
 #include <string>
+#include <type_traits>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -700,15 +701,22 @@ static bool fnaccReductionStatsEnabled() {
 class FNACCCurrentContextGuard {
 public:
   FNACCCurrentContextGuard() {
-    FNACC_CUDA_CHECK(cuCtxGetCurrent(&previousContext));
-  }
+    CUresult result = cuCtxGetCurrent(&previousContext);
 
-  FNACCCurrentContextGuard(const FNACCCurrentContextGuard &) = delete;
-  FNACCCurrentContextGuard &operator=(
-      const FNACCCurrentContextGuard &) = delete;
+    if (result == CUDA_ERROR_NOT_INITIALIZED) {
+      previousContext = nullptr;
+      return;
+    }
+
+    FNACC_CUDA_CHECK(result);
+  }
 
   ~FNACCCurrentContextGuard() {
     CUresult result = cuCtxSetCurrent(previousContext);
+
+    if (result == CUDA_ERROR_NOT_INITIALIZED)
+      return;
+
     if (result != CUDA_SUCCESS && fnaccDebugEnabled()) {
       std::fprintf(stderr,
           "FNACC warning: failed to restore the caller's CUDA context\n");
@@ -1830,7 +1838,6 @@ extern "C" void __fnacc_validate_contiguous_desc(void *hostPtr,
     int64_t elementBytes, int32_t rank, int64_t extent0, int64_t extent1,
     int64_t extent2, int64_t stride0, int64_t stride1, int64_t stride2) {
   FNACC_RUNTIME_GUARD();
-  FNACCCurrentContextGuard contextGuard;
   if (!hostPtr && extent0 != 0 && extent1 != 0 && extent2 != 0) {
     std::fprintf(
         stderr, "FNACC error: launch descriptor has a null base pointer\n");
@@ -3187,6 +3194,206 @@ extern "C" void __fnacc_launch_f64_v1(int32_t kernelId, int32_t rank,
   fnaccReleaseDeviceArg(writeDev);
 }
 
+template <typename Integer>
+static void fnaccLaunchIntegerV1(const char *abiName, const char *typeName,
+    int32_t kernelId, int32_t rank, int32_t blockX, int32_t blockY,
+    int32_t blockZ, int32_t numReadArrays, int32_t numScalars, Integer *read0,
+    Integer *read1, Integer *read2, Integer *write, Integer scalar0,
+    Integer scalar1, Integer scalar2, int32_t extentX, int32_t extentY,
+    int32_t extentZ) {
+  FNACC_RUNTIME_GUARD();
+  FNACCCurrentContextGuard contextGuard;
+  fnaccEnsureCurrentContext();
+
+  fnaccValidateHostLaunchAgainstDesc(kernelId, rank, blockX, blockY, blockZ);
+
+  if (numReadArrays < 1 || numReadArrays > 3) {
+    std::fprintf(stderr,
+        "FNACC error: %s requires one to three read arrays; "
+        "got numReadArrays=%d for kernel id %d\n",
+        abiName, numReadArrays, kernelId);
+    std::abort();
+  }
+
+  if (numScalars < 0 || numScalars > 3) {
+    std::fprintf(stderr,
+        "FNACC error: unsupported numScalars=%d for kernel id %d\n", numScalars,
+        kernelId);
+    std::abort();
+  }
+
+  if (rank < 1 || rank > 3) {
+    std::fprintf(
+        stderr, "FNACC error: unsupported rank %d in %s\n", rank, abiName);
+    std::abort();
+  }
+
+  if (blockX <= 0 || blockY <= 0 || blockZ <= 0) {
+    std::fprintf(stderr,
+        "FNACC error: invalid tile/block shape (%d,%d,%d) in %s\n", blockX,
+        blockY, blockZ, abiName);
+    std::abort();
+  }
+
+  if (!read0 || !write) {
+    std::fprintf(stderr,
+        "FNACC error: null required pointer in %s: read0=%p write=%p\n",
+        abiName, static_cast<void *>(read0), static_cast<void *>(write));
+    std::abort();
+  }
+
+  if (numReadArrays >= 2 && !read1) {
+    std::fprintf(stderr, "FNACC error: null read1 pointer in %s\n", abiName);
+    std::abort();
+  }
+
+  if (numReadArrays >= 3 && !read2) {
+    std::fprintf(stderr, "FNACC error: null read2 pointer in %s\n", abiName);
+    std::abort();
+  }
+
+  if (extentX <= 0 || extentY <= 0 || extentZ <= 0)
+    return;
+
+  CUfunction fn = getKernelFunction(kernelId);
+  unsigned gridX = fnaccCdiv(extentX, blockX, "grid dimension X");
+  unsigned gridY =
+      rank >= 2 ? fnaccCdiv(extentY, blockY, "grid dimension Y") : 1;
+  unsigned cudaBlockX = fnaccCudaThreadsPerCTA(kernelId);
+
+  std::size_t elemCount = fnaccElementCount(rank, extentX, extentY, extentZ);
+  std::size_t numBytes =
+      fnaccCheckedMul(elemCount, sizeof(Integer), "integer launch byte count");
+
+  const FNACCKernelDesc *desc = fnaccLookupKernelDesc(kernelId);
+  if (!desc) {
+    std::fprintf(stderr,
+        "FNACC error: no JSON descriptor for generic %s kernel id %d\n",
+        typeName, kernelId);
+    std::abort();
+  }
+
+  if (desc->kind == "matmul2d") {
+    std::fprintf(stderr,
+        "FNACC error: generic %s launcher called for matmul kernel id %d\n",
+        typeName, kernelId);
+    std::abort();
+  }
+
+  int32_t read0Slot = 0;
+  int32_t read1Slot = 1;
+  int32_t read2Slot = 2;
+  int32_t writeSlot = numReadArrays;
+
+  int32_t read0Target = fnaccEffectivePackTargetForSlot(desc, read0Slot, read0);
+  int32_t read1Target = numReadArrays >= 2
+      ? fnaccEffectivePackTargetForSlot(desc, read1Slot, read1)
+      : FNACC_PACK_TARGET_HOST;
+  int32_t read2Target = numReadArrays >= 3
+      ? fnaccEffectivePackTargetForSlot(desc, read2Slot, read2)
+      : FNACC_PACK_TARGET_HOST;
+  int32_t writeTarget = fnaccEffectivePackTargetForSlot(desc, writeSlot, write);
+
+  FNACCDeviceArg read0Dev =
+      fnaccPrepareReadBuffer(read0, numBytes, read0Target, read0Slot);
+  FNACCDeviceArg read1Dev;
+  if (numReadArrays >= 2)
+    read1Dev = fnaccPrepareReadBuffer(read1, numBytes, read1Target, read1Slot);
+  FNACCDeviceArg read2Dev;
+  if (numReadArrays >= 3)
+    read2Dev = fnaccPrepareReadBuffer(read2, numBytes, read2Target, read2Slot);
+  FNACCDeviceArg writeDev =
+      fnaccPrepareWriteBuffer(write, numBytes, writeTarget, writeSlot);
+
+  CUdeviceptr dRead0 = read0Dev.ptr;
+  CUdeviceptr dRead1 = read1Dev.ptr;
+  CUdeviceptr dRead2 = read2Dev.ptr;
+  CUdeviceptr dWrite = writeDev.ptr;
+
+  fnaccValidateSupportedHiddenPtrArgCount(kernelId);
+  FNACCHiddenTritonArgs hidden;
+
+  void *args[16];
+  int argCount = 0;
+  args[argCount++] = &dRead0;
+  if (numReadArrays >= 2)
+    args[argCount++] = &dRead1;
+  if (numReadArrays >= 3)
+    args[argCount++] = &dRead2;
+  args[argCount++] = &dWrite;
+  if (numScalars >= 1)
+    args[argCount++] = &scalar0;
+  if (numScalars >= 2)
+    args[argCount++] = &scalar1;
+  if (numScalars >= 3)
+    args[argCount++] = &scalar2;
+  args[argCount++] = &extentX;
+  if (rank >= 2)
+    args[argCount++] = &extentY;
+  if (rank >= 3)
+    args[argCount++] = &extentZ;
+  args[argCount++] = &hidden.hidden0;
+  args[argCount++] = &hidden.hidden1;
+
+  if (argCount > 16) {
+    std::fprintf(stderr,
+        "FNACC error: internal runtime argument buffer overflow "
+        "for kernel id %d; argCount=%d\n",
+        kernelId, argCount);
+    std::abort();
+  }
+
+  if (fnaccDebugEnabled()) {
+    std::fprintf(stderr,
+        "FNACC: launch generic %s kernel id=%d rank=%d reads=%d scalars=%d "
+        "grid=(%u,%u,1) tile=(%d,%d,%d) cuda_block=(%u,1,1) "
+        "extent=(%d,%d,%d) bytes=%zu\n",
+        typeName, kernelId, rank, numReadArrays, numScalars, gridX, gridY,
+        blockX, blockY, blockZ, cudaBlockX, extentX, extentY, extentZ,
+        numBytes);
+  }
+
+  fnaccValidateCudaBlockSize(fn, kernelId, cudaBlockX);
+  FNACC_CUDA_CHECK(cuLaunchKernel(fn, gridX, gridY, 1, cudaBlockX, 1, 1, 0,
+      fnaccActiveContextState().stream, args, nullptr));
+  fnaccWaitForRuntimeStream();
+
+  if (writeDev.target == FNACC_PACK_TARGET_HOST) {
+    fnaccCopyBackWriteBuffer(write, writeDev, numBytes);
+  } else if (fnaccDebugEnabled()) {
+    std::fprintf(stderr,
+        "FNACC: skipped automatic copy-back for write slot %d "
+        "because target=device; use !$fnacc update host(...) to copy back\n",
+        writeDev.slot);
+  }
+
+  fnaccReleaseDeviceArg(read0Dev);
+  if (numReadArrays >= 2)
+    fnaccReleaseDeviceArg(read1Dev);
+  if (numReadArrays >= 3)
+    fnaccReleaseDeviceArg(read2Dev);
+  fnaccReleaseDeviceArg(writeDev);
+}
+
+#define FNACC_DEFINE_INTEGER_LAUNCH(BITS, TYPE) \
+  extern "C" void __fnacc_launch_i##BITS##_v1(int32_t kernelId, int32_t rank, \
+      int32_t blockX, int32_t blockY, int32_t blockZ, int32_t numReadArrays, \
+      int32_t numScalars, TYPE *read0, TYPE *read1, TYPE *read2, TYPE *write, \
+      TYPE scalar0, TYPE scalar1, TYPE scalar2, int32_t extentX, \
+      int32_t extentY, int32_t extentZ) { \
+    fnaccLaunchIntegerV1<TYPE>("__fnacc_launch_i" #BITS "_v1", "i" #BITS, \
+        kernelId, rank, blockX, blockY, blockZ, numReadArrays, numScalars, \
+        read0, read1, read2, write, scalar0, scalar1, scalar2, extentX, \
+        extentY, extentZ); \
+  }
+
+FNACC_DEFINE_INTEGER_LAUNCH(8, int8_t)
+FNACC_DEFINE_INTEGER_LAUNCH(16, int16_t)
+FNACC_DEFINE_INTEGER_LAUNCH(32, int32_t)
+FNACC_DEFINE_INTEGER_LAUNCH(64, int64_t)
+
+#undef FNACC_DEFINE_INTEGER_LAUNCH
+
 extern "C" void __fnacc_launch_matmul_f32_v1(int32_t kernelId, int32_t blockX,
     int32_t blockY, int32_t blockK, float *a, float *b, float *c, int32_t n,
     int32_t m, int32_t k) {
@@ -3538,9 +3745,13 @@ static Real fnaccReductionIdentity(FNACCKernelDesc::ReductionOperator op) {
   case FNACCKernelDesc::ReductionOperator::Multiply:
     return Real{1};
   case FNACCKernelDesc::ReductionOperator::Min:
-    return std::numeric_limits<Real>::infinity();
+    if constexpr (std::numeric_limits<Real>::has_infinity)
+      return std::numeric_limits<Real>::infinity();
+    return std::numeric_limits<Real>::max();
   case FNACCKernelDesc::ReductionOperator::Max:
-    return -std::numeric_limits<Real>::infinity();
+    if constexpr (std::numeric_limits<Real>::has_infinity)
+      return -std::numeric_limits<Real>::infinity();
+    return std::numeric_limits<Real>::lowest();
   }
   std::abort();
 }
@@ -3550,8 +3761,18 @@ static Real fnaccApplyReduction(
     FNACCKernelDesc::ReductionOperator op, Real lhs, Real rhs) {
   switch (op) {
   case FNACCKernelDesc::ReductionOperator::Add:
+    if constexpr (std::is_integral_v<Real>) {
+      using Unsigned = std::make_unsigned_t<Real>;
+      return static_cast<Real>(
+          static_cast<Unsigned>(lhs) + static_cast<Unsigned>(rhs));
+    }
     return lhs + rhs;
   case FNACCKernelDesc::ReductionOperator::Multiply:
+    if constexpr (std::is_integral_v<Real>) {
+      using Unsigned = std::make_unsigned_t<Real>;
+      return static_cast<Real>(
+          static_cast<Unsigned>(lhs) * static_cast<Unsigned>(rhs));
+    }
     return lhs * rhs;
   case FNACCKernelDesc::ReductionOperator::Min:
     return rhs < lhs ? rhs : lhs;
@@ -3759,10 +3980,9 @@ extern "C" void __fnacc_launch_reduce_f32_v2(int32_t kernelId, int32_t blockX,
     for (float value : partials)
       reducedValue =
           fnaccApplyReduction(desc->reductionOp, reducedValue, value);
-
-    *result =
-        fnaccApplyReduction(desc->reductionOp, initialValue, reducedValue);
   }
+
+  *result = fnaccApplyReduction(desc->reductionOp, initialValue, reducedValue);
 
   fnaccReleaseDeviceArg(read0Dev);
   if (numReadArrays >= 2)
@@ -3863,15 +4083,123 @@ extern "C" void __fnacc_launch_reduce_f64_v2(int32_t kernelId, int32_t blockX,
     for (double value : partials)
       reducedValue =
           fnaccApplyReduction(desc->reductionOp, reducedValue, value);
-
-    *result =
-        fnaccApplyReduction(desc->reductionOp, initialValue, reducedValue);
   }
+
+  *result = fnaccApplyReduction(desc->reductionOp, initialValue, reducedValue);
 
   fnaccReleaseDeviceArg(read0Dev);
   if (numReadArrays >= 2)
     fnaccReleaseDeviceArg(read1Dev);
 }
+
+template <typename Integer>
+static void fnaccLaunchReduceIntegerV2(const char *abiName,
+    const char *typeName, int32_t kernelId, int32_t blockX,
+    int32_t numReadArrays, Integer *read0, Integer *read1, Integer *result,
+    Integer initialValue, int32_t extentX) {
+  FNACC_RUNTIME_GUARD();
+  FNACCCurrentContextGuard contextGuard;
+  fnaccEnsureCurrentContext();
+
+  if (!read0 || !result) {
+    std::fprintf(stderr, "FNACC error: null pointer in %s\n", abiName);
+    std::abort();
+  }
+
+  if (numReadArrays < 1 || numReadArrays > 2) {
+    std::fprintf(stderr,
+        "FNACC error: reduction %s supports one or two read arrays, got %d\n",
+        typeName, numReadArrays);
+    std::abort();
+  }
+
+  CUfunction fn = getKernelFunction(kernelId);
+  const FNACCKernelDesc *desc = fnaccLookupKernelDesc(kernelId);
+  if (!desc) {
+    std::fprintf(stderr,
+        "FNACC error: no JSON descriptor for reduction kernel id %d\n",
+        kernelId);
+    std::abort();
+  }
+
+  if (extentX <= 0) {
+    *result = initialValue;
+    return;
+  }
+
+  FNACCReductionWorkspace &workspace = fnaccGetReductionWorkspace();
+  unsigned gridX = fnaccCdiv(extentX, blockX, "grid dimension X");
+  unsigned cudaBlockX = fnaccCudaThreadsPerCTA(kernelId);
+  std::size_t bytes = static_cast<std::size_t>(extentX) * sizeof(Integer);
+
+  int32_t read0Target = fnaccEffectivePackTargetForSlot(desc, 0, read0);
+  int32_t read1Target = numReadArrays >= 2
+      ? fnaccEffectivePackTargetForSlot(desc, 1, read1)
+      : FNACC_PACK_TARGET_HOST;
+
+  FNACCDeviceArg read0Dev =
+      fnaccPrepareReadBuffer(read0, bytes, read0Target, 0);
+  FNACCDeviceArg read1Dev;
+  if (numReadArrays >= 2)
+    read1Dev = fnaccPrepareReadBuffer(read1, bytes, read1Target, 1);
+
+  CUdeviceptr dRead0 = read0Dev.ptr;
+  CUdeviceptr dRead1 = read1Dev.ptr;
+  std::size_t partialBytes = static_cast<std::size_t>(gridX) * sizeof(Integer);
+  CUdeviceptr dPartials = fnaccReserveReductionBuffer(
+      workspace.partials, partialBytes, workspace.partialStats, "partials");
+
+  fnaccValidateSupportedHiddenPtrArgCount(kernelId);
+  FNACCHiddenTritonArgs hidden;
+  void *args[8];
+  int argCount = 0;
+  args[argCount++] = &dRead0;
+  if (numReadArrays >= 2)
+    args[argCount++] = &dRead1;
+  args[argCount++] = &dPartials;
+  args[argCount++] = &extentX;
+  args[argCount++] = &hidden.hidden0;
+  args[argCount++] = &hidden.hidden1;
+
+  fnaccValidateCudaBlockSize(fn, kernelId, cudaBlockX);
+  FNACC_CUDA_CHECK(cuLaunchKernel(fn, gridX, 1, 1, cudaBlockX, 1, 1, 0,
+      fnaccActiveContextState().stream, args, nullptr));
+  ++workspace.primaryLaunches;
+
+  Integer reducedValue = fnaccReductionIdentity<Integer>(desc->reductionOp);
+  if (!fnaccFinalizeReductionOnDevice<Integer>(
+          desc, workspace, dPartials, gridX, &reducedValue)) {
+    fnaccWaitForRuntimeStream();
+
+    std::vector<Integer> partials(gridX);
+    FNACC_CUDA_CHECK(cuMemcpyDtoH(partials.data(), dPartials, partialBytes));
+    for (Integer value : partials)
+      reducedValue =
+          fnaccApplyReduction(desc->reductionOp, reducedValue, value);
+  }
+
+  *result = fnaccApplyReduction(desc->reductionOp, initialValue, reducedValue);
+
+  fnaccReleaseDeviceArg(read0Dev);
+  if (numReadArrays >= 2)
+    fnaccReleaseDeviceArg(read1Dev);
+}
+
+#define FNACC_DEFINE_INTEGER_REDUCTION(BITS, TYPE) \
+  extern "C" void __fnacc_launch_reduce_i##BITS##_v2(int32_t kernelId, \
+      int32_t blockX, int32_t numReadArrays, TYPE *read0, TYPE *read1, \
+      TYPE *result, TYPE initialValue, int32_t extentX) { \
+    fnaccLaunchReduceIntegerV2<TYPE>("__fnacc_launch_reduce_i" #BITS "_v2", \
+        "i" #BITS, kernelId, blockX, numReadArrays, read0, read1, result, \
+        initialValue, extentX); \
+  }
+
+FNACC_DEFINE_INTEGER_REDUCTION(8, int8_t)
+FNACC_DEFINE_INTEGER_REDUCTION(16, int16_t)
+FNACC_DEFINE_INTEGER_REDUCTION(32, int32_t)
+FNACC_DEFINE_INTEGER_REDUCTION(64, int64_t)
+
+#undef FNACC_DEFINE_INTEGER_REDUCTION
 
 extern "C" void __fnacc_get_reduction_workspace_stats_v1(
     uint64_t *primaryLaunches, uint64_t *stageLaunches,
@@ -3880,7 +4208,6 @@ extern "C" void __fnacc_get_reduction_workspace_stats_v1(
     uint64_t *scratchAllocations, uint64_t *scratchGrowths,
     uint64_t *scratchReuses, uint64_t *scratchCapacityBytes) {
   FNACC_RUNTIME_GUARD();
-  FNACCCurrentContextGuard contextGuard;
   FNACCReductionWorkspace workspace = fnaccAggregateReductionWorkspaceStats();
   if (primaryLaunches)
     *primaryLaunches = workspace.primaryLaunches;
@@ -4032,7 +4359,6 @@ extern "C" void __fnacc_register_embedded_kernel_bundle(
     const char *const *ptxData, std::size_t const *ptxSizes,
     std::size_t ptxCount, const char *jsonData, std::size_t jsonSize) {
   FNACC_RUNTIME_GUARD();
-  FNACCCurrentContextGuard contextGuard;
   FNACCEmbeddedKernelBundle &bundle = fnaccGetEmbeddedKernelBundle();
   if (bundle.registered) {
     std::fprintf(stderr,
@@ -4061,7 +4387,6 @@ extern "C" void __fnacc_register_embedded_kernel_bundle(
 extern "C" void __fnacc_register_embedded_kernels(const char *ptxData,
     std::size_t ptxSize, const char *jsonData, std::size_t jsonSize) {
   FNACC_RUNTIME_GUARD();
-  FNACCCurrentContextGuard contextGuard;
   FNACCEmbeddedKernelBundle &bundle = fnaccGetEmbeddedKernelBundle();
   if (bundle.registered) {
     std::fprintf(stderr,

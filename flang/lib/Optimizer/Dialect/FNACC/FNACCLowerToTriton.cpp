@@ -1,5 +1,6 @@
 #include "flang/Optimizer/Dialect/FNACC/FNACCDialect.h"
 #include "flang/Optimizer/Dialect/FNACC/FNACCKernelAnalysis.h"
+#include "flang/Optimizer/Dialect/FNACC/FNACCKernelPlan.h"
 #include "flang/Optimizer/Dialect/FNACC/FNACCPasses.h"
 
 #include "flang/Optimizer/Dialect/FIRDialect.h"
@@ -18,6 +19,7 @@
 #include <cstdint>
 #include <limits>
 #include <string>
+#include <vector>
 
 namespace fir::fnacc {
 #define GEN_PASS_DEF_FNACCLOWERTOTRITON
@@ -28,13 +30,16 @@ using namespace mlir;
 
 namespace {
 
-static constexpr int32_t kTritonHiddenPtrArgs = 2;
-
-static constexpr llvm::StringLiteral kKernelIdAttrName = "fnacc.kernel_id";
-static constexpr llvm::StringLiteral kKernelNameAttrName = "fnacc.kernel_name";
-
 static StringRef ttElementType(fir::fnacc::ElementType type) {
   switch (type) {
+  case fir::fnacc::ElementType::I8:
+    return "i8";
+  case fir::fnacc::ElementType::I16:
+    return "i16";
+  case fir::fnacc::ElementType::I32:
+    return "i32";
+  case fir::fnacc::ElementType::I64:
+    return "i64";
   case fir::fnacc::ElementType::F32:
     return "f32";
   case fir::fnacc::ElementType::F64:
@@ -42,6 +47,13 @@ static StringRef ttElementType(fir::fnacc::ElementType type) {
   default:
     llvm_unreachable("unsupported FNACC element type");
   }
+}
+
+static bool isIntegerElementType(fir::fnacc::ElementType type) {
+  return type == fir::fnacc::ElementType::I8 ||
+         type == fir::fnacc::ElementType::I16 ||
+         type == fir::fnacc::ElementType::I32 ||
+         type == fir::fnacc::ElementType::I64;
 }
 
 static std::string ptrType(fir::fnacc::ElementType type) {
@@ -77,63 +89,6 @@ static std::string jsonPtrType(fir::fnacc::ElementType type) {
   return std::string("ptr<") + jsonElementType(type) + ">";
 }
 
-static int32_t getKernelId(fir::fnacc::LaunchOp launchOp, int32_t fallbackId) {
-  if (auto attr = launchOp->getAttrOfType<IntegerAttr>(kKernelIdAttrName))
-    return static_cast<int32_t>(attr.getInt());
-  return fallbackId;
-}
-
-static std::string getKernelName(fir::fnacc::LaunchOp launchOp,
-                                 int32_t fallbackId) {
-  if (auto attr = launchOp->getAttrOfType<StringAttr>(kKernelNameAttrName))
-    return attr.getValue().str();
-  return "fnacc_kernel_" + std::to_string(fallbackId);
-}
-
-static int32_t getKernelNumWarps(const fir::fnacc::ElementwiseKernel &k,
-                                 int32_t requestedNumWarps) {
-  using Kind = fir::fnacc::ElementwiseKernelKind;
-  using Elem = fir::fnacc::ElementType;
-
-  // f64 scalar elementwise kernels such as:
-  //
-  //   c(i) = alpha * a(i) + b(i)
-  //   c(i) = alpha * a(i) + beta * b(i)
-  //
-  // are more compute-heavy than plain vector add. Let them use the requested
-  // number of warps.
-  bool isF64ScalarElementwise =
-      k.elementType == Elem::F64 && !k.scalarRefs.empty() &&
-      (k.kind == Kind::Saxpy1D || k.kind == Kind::Expr1D ||
-       k.kind == Kind::Expr2D);
-
-  if (isF64ScalarElementwise)
-    return requestedNumWarps;
-
-  switch (k.kind) {
-  case Kind::ReductionSum1D:
-  case Kind::ReductionDot1D:
-  case Kind::ReductionProduct1D:
-  case Kind::ReductionMin1D:
-  case Kind::ReductionMax1D:
-    // The pass default remains one warp. Values greater than one are recorded
-    // for both the primary and hierarchical follow-up kernels; the driver
-    // completes lowering of any residual warp-id query automatically.
-    return requestedNumWarps;
-
-  case Kind::BinaryArrayArray:
-  case Kind::Saxpy1D:
-  case Kind::Expr1D:
-  case Kind::Expr2D:
-    return 1;
-
-  case Kind::MatMul2D:
-    return requestedNumWarps;
-  }
-
-  llvm_unreachable("unknown FNACC kernel kind");
-}
-
 static StringRef ttUnaryOpForExprKind(fir::fnacc::ElementwiseExprKind kind) {
   switch (kind) {
   case fir::fnacc::ElementwiseExprKind::NegF:
@@ -152,6 +107,8 @@ static StringRef ttUnaryOpForExprKind(fir::fnacc::ElementwiseExprKind kind) {
     return "math.cos";
   case fir::fnacc::ElementwiseExprKind::TanhF:
     return "math.tanh";
+  case fir::fnacc::ElementwiseExprKind::AbsI:
+    return "math.absi";
   default:
     llvm_unreachable("not a unary FNACC expression");
   }
@@ -166,6 +123,14 @@ static StringRef ttArith(Operation *op) {
     return "arith.mulf";
   if (isa<arith::DivFOp>(op))
     return "arith.divf";
+  if (isa<arith::AddIOp>(op))
+    return "arith.addi";
+  if (isa<arith::SubIOp>(op))
+    return "arith.subi";
+  if (isa<arith::MulIOp>(op))
+    return "arith.muli";
+  if (isa<arith::DivSIOp>(op))
+    return "arith.divsi";
   llvm_unreachable("unsupported binary FNACC arithmetic operation");
 }
 
@@ -187,6 +152,18 @@ static StringRef ttArithForExprKind(fir::fnacc::ElementwiseExprKind kind) {
     return "arith.minnumf";
   case fir::fnacc::ElementwiseExprKind::MaxNumF:
     return "arith.maxnumf";
+  case fir::fnacc::ElementwiseExprKind::AddI:
+    return "arith.addi";
+  case fir::fnacc::ElementwiseExprKind::SubI:
+    return "arith.subi";
+  case fir::fnacc::ElementwiseExprKind::MulI:
+    return "arith.muli";
+  case fir::fnacc::ElementwiseExprKind::DivSI:
+    return "arith.divsi";
+  case fir::fnacc::ElementwiseExprKind::MinSI:
+    return "arith.minsi";
+  case fir::fnacc::ElementwiseExprKind::MaxSI:
+    return "arith.maxsi";
   default:
     llvm_unreachable("not a binary arithmetic expression kind");
   }
@@ -206,6 +183,18 @@ static StringRef comparisonPredicate(fir::fnacc::ElementwiseExprKind kind) {
     return "oeq";
   case fir::fnacc::ElementwiseExprKind::CmpONE:
     return "one";
+  case fir::fnacc::ElementwiseExprKind::CmpSLT:
+    return "slt";
+  case fir::fnacc::ElementwiseExprKind::CmpSLE:
+    return "sle";
+  case fir::fnacc::ElementwiseExprKind::CmpSGT:
+    return "sgt";
+  case fir::fnacc::ElementwiseExprKind::CmpSGE:
+    return "sge";
+  case fir::fnacc::ElementwiseExprKind::CmpIEQ:
+    return "eq";
+  case fir::fnacc::ElementwiseExprKind::CmpINE:
+    return "ne";
   default:
     llvm_unreachable("not a comparison");
   }
@@ -385,6 +374,18 @@ static std::string emitExprVector(const fir::fnacc::ElementwiseKernel &k,
     return splat;
   }
 
+  case fir::fnacc::ElementwiseExprKind::ConstantInteger: {
+    unsigned id = state.nextTmp++;
+    std::string constant = "%cst" + std::to_string(id);
+    std::string splat = "%cst" + std::to_string(id) + "_s";
+
+    os << "  " << constant << " = arith.constant " << expr.integerValue << " : "
+       << elemTy << "\n";
+    os << "  " << splat << " = tt.splat " << constant << " : " << elemTy
+       << " -> tensor<" << block << "x" << elemTy << ">\n";
+    return splat;
+  }
+
   case fir::fnacc::ElementwiseExprKind::NegF:
   case fir::fnacc::ElementwiseExprKind::AbsF:
   case fir::fnacc::ElementwiseExprKind::SqrtF:
@@ -402,6 +403,29 @@ static std::string emitExprVector(const fir::fnacc::ElementwiseKernel &k,
     os << "  " << result << " = " << ttUnaryOpForExprKind(expr.kind) << " "
        << operand << " : tensor<" << block << "x" << elemTy << ">\n";
 
+    return result;
+  }
+
+  case fir::fnacc::ElementwiseExprKind::AbsI: {
+    assert(expr.operands.size() == 1 &&
+           "integer absolute value requires one operand");
+
+    std::string operand = emitExprVector(k, *expr.operands[0], state, os);
+    std::string zero = "%cst" + std::to_string(state.nextTmp++);
+    std::string zeroSplat = zero + "_s";
+    std::string negative = "%expr" + std::to_string(state.nextTmp++);
+    std::string predicate = "%pred" + std::to_string(state.nextTmp++);
+    std::string result = "%expr" + std::to_string(state.nextTmp++);
+    os << "  " << zero << " = arith.constant 0 : " << elemTy << "\n";
+    os << "  " << zeroSplat << " = tt.splat " << zero << " : " << elemTy
+       << " -> tensor<" << block << "x" << elemTy << ">\n";
+    os << "  " << negative << " = arith.subi " << zeroSplat << ", " << operand
+       << " : tensor<" << block << "x" << elemTy << ">\n";
+    os << "  " << predicate << " = arith.cmpi slt, " << operand << ", "
+       << zeroSplat << " : tensor<" << block << "x" << elemTy << ">\n";
+    os << "  " << result << " = arith.select " << predicate << ", " << negative
+       << ", " << operand << " : tensor<" << block << "xi1>, tensor<" << block
+       << "x" << elemTy << ">\n";
     return result;
   }
 
@@ -426,6 +450,24 @@ static std::string emitExprVector(const fir::fnacc::ElementwiseKernel &k,
     return result;
   }
 
+  case fir::fnacc::ElementwiseExprKind::AddI:
+  case fir::fnacc::ElementwiseExprKind::SubI:
+  case fir::fnacc::ElementwiseExprKind::MulI:
+  case fir::fnacc::ElementwiseExprKind::DivSI:
+  case fir::fnacc::ElementwiseExprKind::MinSI:
+  case fir::fnacc::ElementwiseExprKind::MaxSI: {
+    assert(expr.operands.size() == 2 &&
+           "binary integer expression requires two operands");
+
+    std::string lhs = emitExprVector(k, *expr.operands[0], state, os);
+    std::string rhs = emitExprVector(k, *expr.operands[1], state, os);
+    std::string result = "%expr" + std::to_string(state.nextTmp++);
+
+    os << "  " << result << " = " << ttArithForExprKind(expr.kind) << " " << lhs
+       << ", " << rhs << " : tensor<" << block << "x" << elemTy << ">\n";
+    return result;
+  }
+
   case fir::fnacc::ElementwiseExprKind::CmpOLT:
   case fir::fnacc::ElementwiseExprKind::CmpOLE:
   case fir::fnacc::ElementwiseExprKind::CmpOGT:
@@ -442,6 +484,24 @@ static std::string emitExprVector(const fir::fnacc::ElementwiseKernel &k,
        << ", " << lhs << ", " << rhs << " : tensor<" << block << "x" << elemTy
        << ">\n";
 
+    return result;
+  }
+
+  case fir::fnacc::ElementwiseExprKind::CmpSLT:
+  case fir::fnacc::ElementwiseExprKind::CmpSLE:
+  case fir::fnacc::ElementwiseExprKind::CmpSGT:
+  case fir::fnacc::ElementwiseExprKind::CmpSGE:
+  case fir::fnacc::ElementwiseExprKind::CmpIEQ:
+  case fir::fnacc::ElementwiseExprKind::CmpINE: {
+    assert(expr.operands.size() == 2 &&
+           "integer comparison requires two operands");
+    std::string lhs = emitExprVector(k, *expr.operands[0], state, os);
+    std::string rhs = emitExprVector(k, *expr.operands[1], state, os);
+    std::string result = "%pred" + std::to_string(state.nextTmp++);
+
+    os << "  " << result << " = arith.cmpi " << comparisonPredicate(expr.kind)
+       << ", " << lhs << ", " << rhs << " : tensor<" << block << "x" << elemTy
+       << ">\n";
     return result;
   }
 
@@ -535,16 +595,18 @@ static StringRef reductionOperatorName(fir::fnacc::ReductionOperator op) {
   llvm_unreachable("unknown FNACC reduction operator");
 }
 
-static StringRef reductionArithOp(fir::fnacc::ReductionOperator op) {
+static StringRef reductionArithOp(fir::fnacc::ReductionOperator op,
+                                  fir::fnacc::ElementType type) {
+  bool integer = isIntegerElementType(type);
   switch (op) {
   case fir::fnacc::ReductionOperator::Add:
-    return "arith.addf";
+    return integer ? "arith.addi" : "arith.addf";
   case fir::fnacc::ReductionOperator::Multiply:
-    return "arith.mulf";
+    return integer ? "arith.muli" : "arith.mulf";
   case fir::fnacc::ReductionOperator::Min:
-    return "arith.minimumf";
+    return integer ? "arith.minsi" : "arith.minimumf";
   case fir::fnacc::ReductionOperator::Max:
-    return "arith.maximumf";
+    return integer ? "arith.maxsi" : "arith.maximumf";
   }
   llvm_unreachable("unknown FNACC reduction operator");
 }
@@ -553,15 +615,45 @@ static StringRef reductionIdentity(fir::fnacc::ReductionOperator op,
                                    fir::fnacc::ElementType type) {
   switch (op) {
   case fir::fnacc::ReductionOperator::Add:
-    return "0.000000e+00";
+    return isIntegerElementType(type) ? "0" : "0.000000e+00";
   case fir::fnacc::ReductionOperator::Multiply:
-    return "1.000000e+00";
+    return isIntegerElementType(type) ? "1" : "1.000000e+00";
   case fir::fnacc::ReductionOperator::Min:
-    return type == fir::fnacc::ElementType::F64 ? "0x7FF0000000000000"
-                                                : "0x7F800000";
+    switch (type) {
+    case fir::fnacc::ElementType::I8:
+      return "127";
+    case fir::fnacc::ElementType::I16:
+      return "32767";
+    case fir::fnacc::ElementType::I32:
+      return "2147483647";
+    case fir::fnacc::ElementType::I64:
+      return "9223372036854775807";
+    case fir::fnacc::ElementType::F32:
+      return "0x7F800000";
+    case fir::fnacc::ElementType::F64:
+      return "0x7FF0000000000000";
+    case fir::fnacc::ElementType::Unknown:
+      break;
+    }
+    break;
   case fir::fnacc::ReductionOperator::Max:
-    return type == fir::fnacc::ElementType::F64 ? "0xFFF0000000000000"
-                                                : "0xFF800000";
+    switch (type) {
+    case fir::fnacc::ElementType::I8:
+      return "-128";
+    case fir::fnacc::ElementType::I16:
+      return "-32768";
+    case fir::fnacc::ElementType::I32:
+      return "-2147483648";
+    case fir::fnacc::ElementType::I64:
+      return "-9223372036854775808";
+    case fir::fnacc::ElementType::F32:
+      return "0xFF800000";
+    case fir::fnacc::ElementType::F64:
+      return "0xFFF0000000000000";
+    case fir::fnacc::ElementType::Unknown:
+      break;
+    }
+    break;
   }
   llvm_unreachable("unknown FNACC reduction operator");
 }
@@ -603,7 +695,7 @@ static void emitTritonReduction1D(const fir::fnacc::ElementwiseKernel &k,
 
   os << "  %reduced = \"tt.reduce\"(%safe) ({\n";
   os << "  ^bb0(%lhs: " << elemTy << ", %rhs: " << elemTy << "):\n";
-  os << "    %r = " << reductionArithOp(k.reductionOperator)
+  os << "    %r = " << reductionArithOp(k.reductionOperator, k.elementType)
      << " %lhs, %rhs : " << elemTy << "\n";
   os << "    \"tt.reduce.return\"(%r) : (" << elemTy << ") -> ()\n";
   os << "  }) {axis = 0 : i32} : (tensor<" << block << "x" << elemTy << ">) -> "
@@ -657,7 +749,7 @@ static void emitTritonReductionStage1D(fir::fnacc::ElementType type,
 
   os << "  %reduced = \"tt.reduce\"(%safe) ({\n";
   os << "  ^bb0(%lhs: " << elemTy << ", %rhs: " << elemTy << "):\n";
-  os << "    %r = " << reductionArithOp(op) << " %lhs, %rhs : " << elemTy
+  os << "    %r = " << reductionArithOp(op, type) << " %lhs, %rhs : " << elemTy
      << "\n";
   os << "    \"tt.reduce.return\"(%r) : (" << elemTy << ") -> ()\n";
   os << "  }) {axis = 0 : i32} : (tensor<" << block << "x" << elemTy << ">) -> "
@@ -776,10 +868,13 @@ static void emitTritonReductionDot1D(const fir::fnacc::ElementwiseKernel &k,
   os << "  %bv = tt.load %bo, %mask : tensor<" << block << "x" << ptrTy
      << ">\n";
 
-  os << "  %prod = arith.mulf %av, %bv : tensor<" << block << "x" << elemTy
-     << ">\n";
+  os << "  %prod = "
+     << (isIntegerElementType(k.elementType) ? "arith.muli" : "arith.mulf")
+     << " %av, %bv : tensor<" << block << "x" << elemTy << ">\n";
 
-  os << "  %zero = arith.constant 0.000000e+00 : " << elemTy << "\n";
+  os << "  %zero = arith.constant "
+     << (isIntegerElementType(k.elementType) ? "0" : "0.000000e+00") << " : "
+     << elemTy << "\n";
   os << "  %zero_s = tt.splat %zero : " << elemTy << " -> tensor<" << block
      << "x" << elemTy << ">\n";
 
@@ -788,7 +883,9 @@ static void emitTritonReductionDot1D(const fir::fnacc::ElementwiseKernel &k,
 
   os << "  %sum = \"tt.reduce\"(%safe) ({\n";
   os << "  ^bb0(%lhs: " << elemTy << ", %rhs: " << elemTy << "):\n";
-  os << "    %r = arith.addf %lhs, %rhs : " << elemTy << "\n";
+  os << "    %r = "
+     << (isIntegerElementType(k.elementType) ? "arith.addi" : "arith.addf")
+     << " %lhs, %rhs : " << elemTy << "\n";
   os << "    \"tt.reduce.return\"(%r) : (" << elemTy << ") -> ()\n";
   os << "  }) {axis = 0 : i32} : (tensor<" << block << "x" << elemTy << ">) -> "
      << elemTy << "\n";
@@ -1525,94 +1622,91 @@ static void emitTritonMatMul2DF64FMA(const fir::fnacc::ElementwiseKernel &k,
   os << "}\n\n";
 }
 
-static llvm::SmallVector<unsigned>
-kernelParamSlotsForValue(const fir::fnacc::ElementwiseKernel &k, Value v) {
-  llvm::SmallVector<unsigned> slots;
-
-  for (unsigned i = 0; i < k.readArrays.size(); ++i)
-    if (k.readArrays[i] == v)
-      slots.push_back(i);
-
-  if (k.writeArray == v)
-    slots.push_back(k.readArrays.size());
-
-  unsigned scalarBaseSlot = k.readArrays.size() + 1;
-  for (unsigned i = 0; i < k.scalarRefs.size(); ++i)
-    if (k.scalarRefs[i] == v)
-      slots.push_back(scalarBaseSlot + i);
-
-  return slots;
-}
-
-static bool isReductionMetadataPackSlot(fir::fnacc::LaunchOp launchOp,
-                                        unsigned packIndex) {
-  auto slotsAttr =
-      launchOp->getAttrOfType<DenseI32ArrayAttr>("fnacc.reduction_slots");
-
-  if (!slotsAttr)
-    return false;
-
-  for (int32_t slot : slotsAttr.asArrayRef()) {
-    if (slot >= 0 && static_cast<unsigned>(slot) == packIndex)
-      return true;
+static StringRef jsonParameterRole(fir::fnacc::FNACCKernelParameterRole role) {
+  using Role = fir::fnacc::FNACCKernelParameterRole;
+  switch (role) {
+  case Role::Read:
+    return "read";
+  case Role::Write:
+    return "write";
+  case Role::Partials:
+    return "partials";
+  case Role::Scalar:
+    return "scalar";
+  case Role::ExtentX:
+    return "extent_x";
+  case Role::ExtentY:
+    return "extent_y";
+  case Role::ExtentZ:
+    return "extent_k";
   }
-
-  return false;
+  llvm_unreachable("unknown FNACC ABI parameter role");
 }
 
-static void emitJsonDescriptor(
-    fir::fnacc::LaunchOp launchOp, const fir::fnacc::ElementwiseKernel &k,
-    int64_t blockX, int64_t blockY, int64_t blockZ, int32_t kernelId,
-    int32_t ptxIndex, llvm::StringRef kernelName, int32_t tritonNumWarps,
-    int32_t tritonThreadsPerWarp, int32_t tritonNumStages,
-    int32_t cudaThreadsPerCTA, int32_t reductionStageId, llvm::raw_ostream &os,
-    bool &firstKernel) {
+static std::string
+jsonParameterType(const fir::fnacc::FNACCKernelParameter &parameter) {
+  if (parameter.passing ==
+      fir::fnacc::FNACCKernelParameterPassing::DevicePointer)
+    return jsonPtrType(parameter.elementType);
+  return jsonElementType(parameter.elementType);
+}
+
+static void emitJsonABI(const fir::fnacc::FNACCKernelABI &abi,
+                        llvm::raw_ostream &os) {
+  os << "      \"params\": [\n";
+  for (auto [index, parameter] : llvm::enumerate(abi.parameters)) {
+    if (index != 0)
+      os << ",\n";
+    os << "        {\"slot\": " << parameter.slot << ", \"role\": \""
+       << jsonParameterRole(parameter.role) << "\", \"name\": \""
+       << parameter.name << "\", \"type\": \"" << jsonParameterType(parameter)
+       << "\"}";
+  }
+  os << "\n      ],\n";
+
+  os << "      \"pack\": [";
+  for (auto [index, binding] : llvm::enumerate(abi.packBindings)) {
+    if (index != 0)
+      os << ", ";
+    os << "{\"kernel_arg_slot\": " << binding.kernelArgSlot
+       << ", \"target\": " << binding.target << ", \"target_name\": \""
+       << (binding.target == 0 ? "host" : "device") << "\"}";
+  }
+  os << "]\n";
+}
+
+static void emitJsonDescriptor(const fir::fnacc::FNACCKernelPlan &plan,
+                               int32_t ptxIndex,
+                               const fir::fnacc::FNACCCodegenBackend &backend,
+                               llvm::raw_ostream &os, bool &firstKernel) {
+  const fir::fnacc::ElementwiseKernel &k = plan.kernel;
+  const fir::fnacc::FNACCKernelSchedule &schedule = plan.schedule;
 
   if (!firstKernel)
     os << ",\n";
   firstKernel = false;
 
-  StringRef kindName = "binary";
-  if (k.kind == fir::fnacc::ElementwiseKernelKind::Saxpy1D)
-    kindName = "saxpy1d";
-  else if (k.kind == fir::fnacc::ElementwiseKernelKind::Expr1D)
-    kindName = "expr1d";
-  else if (k.kind == fir::fnacc::ElementwiseKernelKind::Expr2D)
-    kindName = "expr2d";
-  else if (k.kind == fir::fnacc::ElementwiseKernelKind::MatMul2D)
-    kindName = "matmul2d";
-  else if (k.kind == fir::fnacc::ElementwiseKernelKind::ReductionSum1D)
-    kindName = "reduction_sum1d";
-  else if (k.kind == fir::fnacc::ElementwiseKernelKind::ReductionDot1D)
-    kindName = "reduction_dot1d";
-  else if (k.kind == fir::fnacc::ElementwiseKernelKind::ReductionProduct1D)
-    kindName = "reduction_product1d";
-  else if (k.kind == fir::fnacc::ElementwiseKernelKind::ReductionMin1D)
-    kindName = "reduction_min1d";
-  else if (k.kind == fir::fnacc::ElementwiseKernelKind::ReductionMax1D)
-    kindName = "reduction_max1d";
-
-  std::string ptrJsonTy = jsonPtrType(k.elementType);
-  std::string elemJsonTy = jsonElementType(k.elementType);
-
   os << "    {\n";
-  os << "      \"id\": " << kernelId << ",\n";
-  os << "      \"name\": \"" << kernelName << "\",\n";
+  os << "      \"id\": " << plan.id << ",\n";
+  os << "      \"name\": \"" << plan.name << "\",\n";
   os << "      \"ptx_index\": " << ptxIndex << ",\n";
-  os << "      \"ptx_file\": \"" << kernelName << ".ptx\",\n";
-  os << "      \"kind\": \"" << kindName << "\",\n";
+  os << "      \"ptx_file\": \"" << plan.name << ".ptx\",\n";
+  os << "      \"kind\": \"" << fir::fnacc::fnaccKernelKindName(k.kind)
+     << "\",\n";
   os << "      \"rank\": " << k.rank << ",\n";
-  os << "      \"tile\": [" << blockX << ", " << blockY << ", " << blockZ
-     << "],\n";
-  os << "      \"num_warps\": " << tritonNumWarps << ",\n";
-  os << "      \"threads_per_warp\": " << tritonThreadsPerWarp << ",\n";
+  os << "      \"tile\": [" << schedule.tile.x << ", " << schedule.tile.y
+     << ", " << schedule.tile.z << "],\n";
+  os << "      \"num_warps\": " << schedule.parallelSubgroups << ",\n";
+  os << "      \"threads_per_warp\": " << schedule.subgroupWidth << ",\n";
   os << "      \"num_ctas\": 1,\n";
-  os << "      \"num_stages\": " << tritonNumStages << ",\n";
-  os << "      \"cuda_threads_per_cta\": " << cudaThreadsPerCTA << ",\n";
-  os << "      \"triton_hidden_ptr_args\": " << kTritonHiddenPtrArgs << ",\n";
+  os << "      \"num_stages\": " << schedule.pipelineStages << ",\n";
+  os << "      \"cuda_threads_per_cta\": "
+     << schedule.parallelSubgroups * schedule.subgroupWidth << ",\n";
+  os << "      \"triton_hidden_ptr_args\": "
+     << backend.getPrivatePointerArgumentCount(plan) << ",\n";
 
-  if (reductionStageId >= 0)
-    os << "      \"reduction_stage_id\": " << reductionStageId << ",\n";
+  if (plan.reductionStage)
+    os << "      \"reduction_stage_id\": " << plan.reductionStage->id << ",\n";
 
   if (k.rank == 2) {
     os << "      \"grid\": [\"cdiv(extent_x, tile_x)\", "
@@ -1621,194 +1715,166 @@ static void emitJsonDescriptor(
     os << "      \"grid\": [\"cdiv(extent_x, tile_x)\", \"1\", \"1\"],\n";
   }
 
-  bool isReduction =
-      k.kind == fir::fnacc::ElementwiseKernelKind::ReductionSum1D ||
-      k.kind == fir::fnacc::ElementwiseKernelKind::ReductionDot1D ||
-      k.kind == fir::fnacc::ElementwiseKernelKind::ReductionProduct1D ||
-      k.kind == fir::fnacc::ElementwiseKernelKind::ReductionMin1D ||
-      k.kind == fir::fnacc::ElementwiseKernelKind::ReductionMax1D;
-
-  if (isReduction)
+  if (fir::fnacc::isReductionKernelKind(k.kind))
     os << "      \"reduction_op\": \""
        << reductionOperatorName(k.reductionOperator) << "\",\n";
 
-  os << "      \"params\": [\n";
-
-  unsigned nextSlot = 0;
-
-  if (isReduction) {
-    // Reduction kernel ABI:
-    //
-    //   reduction_sum1d:
-    //     read0, partials, extent_x
-    //
-    //   reduction_dot1d:
-    //     read0, read1, partials, extent_x
-    //
-    // The final scalar result is not a Triton kernel parameter. Runtime
-    // lowering passes the scalar to the host runtime, which recursively
-    // reduces the partials buffer with the reduction_stage_id kernel.
-    for (unsigned i = 0; i < k.readArrays.size(); ++i) {
-      if (i != 0)
-        os << ",\n";
-
-      os << "        {\"slot\": " << nextSlot++
-         << ", \"role\": \"read\",     \"name\": \"read" << i
-         << "\",    \"type\": \"" << ptrJsonTy << "\"}";
-    }
-
-    if (!k.readArrays.empty())
-      os << ",\n";
-
-    os << "        {\"slot\": " << nextSlot++
-       << ", \"role\": \"partials\", \"name\": \"partials\", "
-       << "\"type\": \"" << ptrJsonTy << "\"},\n";
-
-    os << "        {\"slot\": " << nextSlot++
-       << ", \"role\": \"extent_x\", \"name\": \"extent_x\", "
-       << "\"type\": \"i32\"}\n";
-
-    os << "      ],\n";
-
-  } else {
-    // Generic elementwise/matmul parameter metadata.
-    for (unsigned i = 0; i < k.readArrays.size(); ++i) {
-      if (i != 0)
-        os << ",\n";
-
-      os << "        {\"slot\": " << nextSlot++
-         << ", \"role\": \"read\",     \"name\": \"read" << i
-         << "\",    \"type\": \"" << ptrJsonTy << "\"}";
-    }
-
-    if (!k.readArrays.empty())
-      os << ",\n";
-
-    os << "        {\"slot\": " << nextSlot++
-       << ", \"role\": \"write\",    \"name\": \"write\",    "
-       << "\"type\": \"" << ptrJsonTy << "\"}";
-
-    for (unsigned i = 0; i < k.scalarRefs.size(); ++i) {
-      os << ",\n";
-      os << "        {\"slot\": " << nextSlot++
-         << ", \"role\": \"scalar\",   \"name\": \"scalar" << i
-         << "\",  \"type\": \"" << elemJsonTy << "\"}";
-    }
-
-    os << ",\n";
-    os << "        {\"slot\": " << nextSlot++
-       << ", \"role\": \"extent_x\", \"name\": \"extent_x\", "
-       << "\"type\": \"i32\"}";
-
-    if (k.rank == 2) {
-      os << ",\n";
-      os << "        {\"slot\": " << nextSlot++
-         << ", \"role\": \"extent_y\", \"name\": \"extent_y\", "
-         << "\"type\": \"i32\"}";
-
-      if (k.kind == fir::fnacc::ElementwiseKernelKind::MatMul2D) {
-        os << ",\n";
-        os << "        {\"slot\": " << nextSlot++
-           << ", \"role\": \"extent_k\", \"name\": \"extent_k\", "
-           << "\"type\": \"i32\"}\n";
-      } else {
-        os << "\n";
-      }
-    } else {
-      os << "\n";
-    }
-
-    os << "      ],\n";
-  }
-
-  os << "      \"pack\": [";
-
-  auto packVars = launchOp.getPackVars();
-  llvm::ArrayRef<int32_t> targets = launchOp.getPackTargets();
-
-  bool firstPack = true;
-  for (auto it : llvm::enumerate(packVars)) {
-    unsigned packIndex = it.index();
-    Value packValue = it.value();
-
-    // Reduction scalars are carried through pack_vars only as launch metadata.
-    // They are not Triton kernel arguments and should not appear in JSON pack
-    // entries.
-    if (isReductionMetadataPackSlot(launchOp, packIndex))
-      continue;
-
-    llvm::SmallVector<unsigned> slots = kernelParamSlotsForValue(k, packValue);
-    if (slots.empty()) {
-      launchOp.emitWarning()
-          << "PACK variable #" << packIndex
-          << " was not used by recognized Triton kernel body";
-      continue;
-    }
-
-    if (packIndex >= targets.size()) {
-      launchOp.emitWarning("PACK target list shorter than PACK var list");
-      continue;
-    }
-
-    int32_t target = targets[packIndex];
-
-    for (unsigned slot : slots) {
-      if (!firstPack)
-        os << ", ";
-      firstPack = false;
-
-      os << "{\"kernel_arg_slot\": " << slot << ", \"target\": " << target
-         << ", \"target_name\": \"" << (target == 0 ? "host" : "device")
-         << "\"}";
-    }
-  }
-
-  os << "]\n";
+  emitJsonABI(plan.abi, os);
   os << "    }";
 }
 
-static void emitJsonReductionStageDescriptor(
-    fir::fnacc::ElementType type, fir::fnacc::ReductionOperator reductionOp,
-    int64_t block, int32_t kernelId, int32_t ptxIndex,
-    llvm::StringRef kernelName, int32_t tritonNumWarps,
-    int32_t tritonThreadsPerWarp, int32_t tritonNumStages,
-    int32_t cudaThreadsPerCTA, llvm::raw_ostream &os, bool &firstKernel) {
+static void
+emitJsonReductionStageDescriptor(const fir::fnacc::FNACCKernelPlan &plan,
+                                 int32_t ptxIndex,
+                                 const fir::fnacc::FNACCCodegenBackend &backend,
+                                 llvm::raw_ostream &os, bool &firstKernel) {
+  assert(plan.reductionStage && "reduction stage descriptor without a stage");
+  const fir::fnacc::FNACCReductionStagePlan &stage = *plan.reductionStage;
+
   if (!firstKernel)
     os << ",\n";
   firstKernel = false;
 
-  std::string ptrJsonTy = jsonPtrType(type);
-
   os << "    {\n";
-  os << "      \"id\": " << kernelId << ",\n";
-  os << "      \"name\": \"" << kernelName << "\",\n";
+  os << "      \"id\": " << stage.id << ",\n";
+  os << "      \"name\": \"" << stage.name << "\",\n";
   os << "      \"ptx_index\": " << ptxIndex << ",\n";
-  os << "      \"ptx_file\": \"" << kernelName << ".ptx\",\n";
+  os << "      \"ptx_file\": \"" << stage.name << ".ptx\",\n";
   os << "      \"kind\": \"reduction_stage1d\",\n";
-  os << "      \"reduction_op\": \"" << reductionOperatorName(reductionOp)
-     << "\",\n";
+  os << "      \"reduction_op\": \""
+     << reductionOperatorName(stage.reductionOperator) << "\",\n";
   os << "      \"rank\": 1,\n";
-  os << "      \"tile\": [" << block << ", 1, 1],\n";
-  os << "      \"num_warps\": " << tritonNumWarps << ",\n";
-  os << "      \"threads_per_warp\": " << tritonThreadsPerWarp << ",\n";
+  os << "      \"tile\": [" << plan.schedule.tile.x << ", 1, 1],\n";
+  os << "      \"num_warps\": " << plan.schedule.parallelSubgroups << ",\n";
+  os << "      \"threads_per_warp\": " << plan.schedule.subgroupWidth << ",\n";
   os << "      \"num_ctas\": 1,\n";
-  os << "      \"num_stages\": " << tritonNumStages << ",\n";
-  os << "      \"cuda_threads_per_cta\": " << cudaThreadsPerCTA << ",\n";
-  os << "      \"triton_hidden_ptr_args\": " << kTritonHiddenPtrArgs << ",\n";
+  os << "      \"num_stages\": " << plan.schedule.pipelineStages << ",\n";
+  os << "      \"cuda_threads_per_cta\": "
+     << plan.schedule.parallelSubgroups * plan.schedule.subgroupWidth << ",\n";
+  os << "      \"triton_hidden_ptr_args\": "
+     << backend.getPrivatePointerArgumentCount(plan) << ",\n";
   os << "      \"grid\": [\"cdiv(extent_x, tile_x)\", \"1\", \"1\"],\n";
-  os << "      \"params\": [\n";
-  os << "        {\"slot\": 0, \"role\": \"read\", "
-        "\"name\": \"input\", \"type\": \""
-     << ptrJsonTy << "\"},\n";
-  os << "        {\"slot\": 1, \"role\": \"partials\", "
-        "\"name\": \"output\", \"type\": \""
-     << ptrJsonTy << "\"},\n";
-  os << "        {\"slot\": 2, \"role\": \"extent_x\", "
-        "\"name\": \"extent_x\", \"type\": \"i32\"}\n";
-  os << "      ],\n";
-  os << "      \"pack\": []\n";
+  emitJsonABI(stage.abi, os);
   os << "    }";
 }
+
+class TritonBackend final : public fir::fnacc::FNACCCodegenBackend {
+public:
+  StringRef getName() const override { return "triton"; }
+
+  fir::fnacc::FNACCDeviceImageKind getRuntimeImageKind() const override {
+    return fir::fnacc::FNACCDeviceImageKind::PTX;
+  }
+
+  fir::fnacc::FNACCBackendSupport
+  querySupport(const fir::fnacc::FNACCKernelPlan &plan) const override {
+    const fir::fnacc::ElementwiseKernel &kernel = plan.kernel;
+    const fir::fnacc::FNACCKernelSchedule &schedule = plan.schedule;
+
+    if (kernel.rank < 1 || kernel.rank > 2)
+      return fir::fnacc::FNACCBackendSupport::failure(
+          "Triton backend supports rank-one and rank-two kernels");
+
+    if (kernel.elementType == fir::fnacc::ElementType::Unknown)
+      return fir::fnacc::FNACCBackendSupport::failure(
+          "kernel has no supported element type");
+
+    if (schedule.tile.x <= 0 || schedule.tile.y <= 0 || schedule.tile.z <= 0)
+      return fir::fnacc::FNACCBackendSupport::failure(
+          "tile dimensions must be positive");
+
+    if (schedule.parallelSubgroups <= 0 || schedule.pipelineStages <= 0)
+      return fir::fnacc::FNACCBackendSupport::failure(
+          "parallel subgroup and pipeline-stage counts must be positive");
+
+    if (schedule.subgroupWidth != 32)
+      return fir::fnacc::FNACCBackendSupport::failure(
+          "Triton CUDA lowering requires subgroup width 32");
+
+    for (auto [index, parameter] : llvm::enumerate(plan.abi.parameters))
+      if (parameter.slot != index)
+        return fir::fnacc::FNACCBackendSupport::failure(
+            "kernel ABI slots are not contiguous");
+
+    if (kernel.kind == fir::fnacc::ElementwiseKernelKind::MatMul2D &&
+        kernel.elementType != fir::fnacc::ElementType::F32 &&
+        kernel.elementType != fir::fnacc::ElementType::F64)
+      return fir::fnacc::FNACCBackendSupport::failure(
+          "Triton matmul supports f32 and f64 element types");
+
+    return fir::fnacc::FNACCBackendSupport::success();
+  }
+
+  void beginModule(const fir::fnacc::FNACCKernelPlanOptions &options,
+                   llvm::raw_ostream &os) const override {
+    os << "module attributes {"
+       << "\"ttg.num-warps\" = " << options.requestedParallelSubgroups
+       << " : i32, " << "\"ttg.num-ctas\" = 1 : i32, "
+       << "\"ttg.num-stages\" = " << options.pipelineStages << " : i32, "
+       << "\"ttg.threads-per-warp\" = " << options.subgroupWidth << " : i32"
+       << "} {\n";
+  }
+
+  LogicalResult emitKernel(const fir::fnacc::FNACCKernelPlan &plan,
+                           llvm::raw_ostream &os) const override {
+    using Kind = fir::fnacc::ElementwiseKernelKind;
+    const fir::fnacc::ElementwiseKernel &kernel = plan.kernel;
+    int64_t blockX = plan.schedule.tile.x;
+    int64_t blockY = plan.schedule.tile.y;
+    int64_t blockZ = plan.schedule.tile.z;
+
+    if (kernel.rank == 2) {
+      if (kernel.kind == Kind::MatMul2D) {
+        if (kernel.elementType == fir::fnacc::ElementType::F64) {
+          switch (plan.schedule.f64MatmulStrategy) {
+          case fir::fnacc::FNACCMatmulStrategy::Dot:
+            emitTritonMatMul2DF64Dot(kernel, blockX, blockY, blockZ, plan.name,
+                                     os);
+            break;
+          case fir::fnacc::FNACCMatmulStrategy::Reduce:
+            emitTritonMatMul2DF64Reduce(kernel, blockX, blockY, blockZ,
+                                        plan.name, os);
+            break;
+          case fir::fnacc::FNACCMatmulStrategy::FMA:
+            emitTritonMatMul2DF64FMA(kernel, blockX, blockY, blockZ, plan.name,
+                                     os);
+            break;
+          }
+        } else {
+          emitTritonMatMul2DF32(kernel, blockX, blockY, blockZ, plan.name, os);
+        }
+      } else if (kernel.kind == Kind::Expr2D) {
+        emitTritonExpr2D(kernel, blockX, blockY, plan.name, os);
+      } else {
+        emitTriton2D(kernel, blockX, blockY, plan.name, os);
+      }
+    } else if (kernel.kind == Kind::ReductionDot1D) {
+      emitTritonReductionDot1D(kernel, blockX, plan.name, os);
+    } else if (fir::fnacc::isReductionKernelKind(kernel.kind)) {
+      emitTritonReduction1D(kernel, blockX, plan.name, os);
+    } else if (kernel.kind == Kind::Expr1D) {
+      emitTritonExpr1D(kernel, blockX, plan.name, os);
+    } else if (kernel.kind == Kind::Saxpy1D) {
+      emitTritonSaxpy1D(kernel, blockX, plan.name, os);
+    } else {
+      emitTriton1D(kernel, blockX, plan.name, os);
+    }
+
+    if (plan.reductionStage)
+      emitTritonReductionStage1D(plan.reductionStage->elementType,
+                                 plan.reductionStage->reductionOperator, blockX,
+                                 plan.reductionStage->name, os);
+
+    return success();
+  }
+
+  void endModule(llvm::raw_ostream &os) const override { os << "}\n"; }
+
+  int32_t getPrivatePointerArgumentCount(
+      const fir::fnacc::FNACCKernelPlan &) const override {
+    return 2;
+  }
+};
 
 struct FNACCLowerToTritonPass
     : public fir::fnacc::impl::FNACCLowerToTritonBase<FNACCLowerToTritonPass> {
@@ -1816,13 +1882,19 @@ struct FNACCLowerToTritonPass
 
   FNACCLowerToTritonPass(llvm::StringRef ttirOutput, llvm::StringRef jsonOutput,
                          int32_t numWarps, int32_t threadsPerWarp,
-                         int32_t numStages, llvm::StringRef f64MatmulStrategy) {
+                         int32_t numStages, llvm::StringRef f64MatmulStrategy,
+                         llvm::StringRef backend,
+                         llvm::StringRef fallbackBackend,
+                         bool allowBackendFallback) {
     this->ttirOutput = ttirOutput.str();
     this->jsonOutput = jsonOutput.str();
     this->numWarps = numWarps;
     this->threadsPerWarp = threadsPerWarp;
     this->numStages = numStages;
     this->f64MatmulStrategy = f64MatmulStrategy;
+    this->backend = backend.str();
+    this->fallbackBackend = fallbackBackend.str();
+    this->allowBackendFallback = allowBackendFallback;
   }
 
   void runOnOperation() override {
@@ -1856,29 +1928,61 @@ struct FNACCLowerToTritonPass
       return;
     }
 
-    if (this->f64MatmulStrategy != "dot" &&
-        this->f64MatmulStrategy != "reduce" &&
-        this->f64MatmulStrategy != "fma") {
+    fir::fnacc::FNACCKernelPlanOptions planOptions;
+    planOptions.requestedParallelSubgroups = tritonNumWarps;
+    planOptions.subgroupWidth = tritonThreadsPerWarp;
+    planOptions.pipelineStages = tritonNumStages;
+
+    if (this->f64MatmulStrategy == "dot") {
+      planOptions.f64MatmulStrategy = fir::fnacc::FNACCMatmulStrategy::Dot;
+    } else if (this->f64MatmulStrategy == "reduce") {
+      planOptions.f64MatmulStrategy = fir::fnacc::FNACCMatmulStrategy::Reduce;
+    } else if (this->f64MatmulStrategy == "fma") {
+      planOptions.f64MatmulStrategy = fir::fnacc::FNACCMatmulStrategy::FMA;
+    } else {
       module.emitError("FNACC f64-matmul-strategy must be dot, reduce, or fma");
       signalPassFailure();
       return;
     }
 
+    TritonBackend tritonBackend;
+    llvm::SmallVector<const fir::fnacc::FNACCCodegenBackend *> backends{
+        &tritonBackend};
+    std::vector<fir::fnacc::FNACCKernelPlan> plans;
+    std::vector<const fir::fnacc::FNACCCodegenBackend *> selectedBackends;
+
     bool hasSimpleElementwiseLaunch = false;
     bool hasReductionLaunch = false;
     bool hasMatmulLaunch = false;
-    bool recognitionFailed = false;
+    bool planningFailed = false;
+
+    int32_t nextSyntheticKernelId = 0;
+    int32_t scanFallbackId = 0;
 
     module.walk([&](fir::fnacc::LaunchOp launchOp) {
-      auto result = fir::fnacc::recognizeElementwiseKernel(launchOp);
+      int32_t kernelId = scanFallbackId++;
+      if (auto attr = launchOp->getAttrOfType<IntegerAttr>("fnacc.kernel_id"))
+        kernelId = static_cast<int32_t>(attr.getInt());
+      nextSyntheticKernelId = std::max(nextSyntheticKernelId, kernelId + 1);
+    });
+
+    int32_t fallbackId = 0;
+
+    module.walk([&](fir::fnacc::LaunchOp launchOp) {
+      auto result = fir::fnacc::buildFNACCKernelPlan(
+          launchOp, fallbackId++, nextSyntheticKernelId, planOptions);
       if (result.failed()) {
-        launchOp.emitError("FNACC Triton cannot emit launch: ")
+        launchOp.emitError("FNACC cannot plan launch: ")
             << result.getFailure().reason;
-        recognitionFailed = true;
+        planningFailed = true;
         return;
       }
 
-      const fir::fnacc::ElementwiseKernel &k = result.getKernel();
+      fir::fnacc::FNACCKernelPlan plan = result.takePlan();
+      const fir::fnacc::ElementwiseKernel &k = plan.kernel;
+
+      if (plan.reductionStage)
+        ++nextSyntheticKernelId;
 
       switch (k.kind) {
       case fir::fnacc::ElementwiseKernelKind::BinaryArrayArray:
@@ -1900,9 +2004,26 @@ struct FNACCLowerToTritonPass
         hasMatmulLaunch = true;
         break;
       }
+
+      fir::fnacc::FNACCBackendSelection selection =
+          fir::fnacc::selectFNACCBackend(plan, backends, this->backend,
+                                         this->fallbackBackend,
+                                         this->allowBackendFallback);
+      if (!selection.succeeded()) {
+        launchOp.emitError("FNACC backend selection failed: ")
+            << selection.diagnostic;
+        planningFailed = true;
+        return;
+      }
+
+      if (selection.usedFallback)
+        launchOp.emitWarning() << selection.diagnostic;
+
+      selectedBackends.push_back(selection.backend);
+      plans.push_back(std::move(plan));
     });
 
-    if (recognitionFailed) {
+    if (planningFailed) {
       signalPassFailure();
       return;
     }
@@ -1941,148 +2062,55 @@ struct FNACCLowerToTritonPass
     jsonOs << "  \"fnacc_schema_version\": 1,\n";
     jsonOs << "  \"kernels\": [\n";
 
-    ttirOs << "module attributes {"
-           << "\"ttg.num-warps\" = " << tritonNumWarps << " : i32, "
-           << "\"ttg.num-ctas\" = 1 : i32, "
-           << "\"ttg.num-stages\" = " << tritonNumStages << " : i32, "
-           << "\"ttg.threads-per-warp\" = " << tritonThreadsPerWarp << " : i32"
-           << "} {\n";
+    const fir::fnacc::FNACCCodegenBackend *moduleBackend =
+        selectedBackends.empty() ? &tritonBackend : selectedBackends.front();
+    moduleBackend->beginModule(planOptions, ttirOs);
 
     bool firstKernel = true;
-    int32_t fallbackId = 0;
-    bool failed = false;
+    bool emissionFailed = false;
 
     int32_t emittedPtxIndex = 0;
-    int32_t nextSyntheticKernelId = 0;
-    int32_t scanFallbackId = 0;
 
-    module.walk([&](fir::fnacc::LaunchOp launchOp) {
-      int32_t kernelId = getKernelId(launchOp, scanFallbackId++);
-      nextSyntheticKernelId = std::max(nextSyntheticKernelId, kernelId + 1);
-    });
+    for (auto it : llvm::enumerate(plans)) {
+      fir::fnacc::FNACCKernelPlan &plan = it.value();
+      const fir::fnacc::FNACCCodegenBackend *backend =
+          selectedBackends[it.index()];
 
-    module.walk([&](fir::fnacc::LaunchOp launchOp) {
-      if (failed)
-        return;
+      if (emissionFailed)
+        break;
 
-      auto result = fir::fnacc::recognizeElementwiseKernel(launchOp);
-      if (result.failed()) {
-        launchOp.emitError("FNACC Triton recognition changed during emission: ")
-            << result.getFailure().reason;
-        failed = true;
-        return;
+      if (backend != moduleBackend) {
+        plan.launchOp.emitError(
+            "FNACC mixed-backend module emission is not available yet");
+        emissionFailed = true;
+        break;
       }
 
-      const fir::fnacc::ElementwiseKernel &k = result.getKernel();
-
-      int32_t kernelId = getKernelId(launchOp, fallbackId);
-      std::string kernelName = getKernelName(launchOp, kernelId);
-
-      bool isReduction =
-          k.kind == fir::fnacc::ElementwiseKernelKind::ReductionSum1D ||
-          k.kind == fir::fnacc::ElementwiseKernelKind::ReductionDot1D ||
-          k.kind == fir::fnacc::ElementwiseKernelKind::ReductionProduct1D ||
-          k.kind == fir::fnacc::ElementwiseKernelKind::ReductionMin1D ||
-          k.kind == fir::fnacc::ElementwiseKernelKind::ReductionMax1D;
-      int32_t reductionStageId = isReduction ? nextSyntheticKernelId++ : -1;
-      std::string reductionStageName = kernelName + "_reduce_stage";
-
-      llvm::ArrayRef<int64_t> tiles = launchOp.getTileSizes();
-
-      int64_t blockX = 1024;
-      int64_t blockY = 1;
-      int64_t blockZ = 1;
-
-      if (k.rank == 2) {
-        blockX = tiles.size() >= 1 ? tiles[0] : 16;
-        blockY = tiles.size() >= 2 ? tiles[1] : 16;
-
-        if (k.kind == fir::fnacc::ElementwiseKernelKind::MatMul2D) {
-          blockZ =
-              tiles.size() >= 3
-                  ? tiles[2]
-                  : (k.elementType == fir::fnacc::ElementType::F64 ? 8 : 32);
-
-          if (k.elementType == fir::fnacc::ElementType::F64) {
-            if (this->f64MatmulStrategy == "dot") {
-              emitTritonMatMul2DF64Dot(k, blockX, blockY, blockZ, kernelName,
-                                       ttirOs);
-            } else if (this->f64MatmulStrategy == "fma") {
-              emitTritonMatMul2DF64FMA(k, blockX, blockY, blockZ, kernelName,
-                                       ttirOs);
-            } else if (this->f64MatmulStrategy == "reduce") {
-              emitTritonMatMul2DF64Reduce(k, blockX, blockY, blockZ, kernelName,
-                                          ttirOs);
-            } else {
-              launchOp.emitError("unknown FNACC f64 matmul strategy: ")
-                  << this->f64MatmulStrategy;
-              failed = true;
-              return;
-            }
-          } else {
-            emitTritonMatMul2DF32(k, blockX, blockY, blockZ, kernelName,
-                                  ttirOs);
-          }
-
-        } else if (k.kind == fir::fnacc::ElementwiseKernelKind::Expr2D) {
-          blockZ = 1;
-          emitTritonExpr2D(k, blockX, blockY, kernelName, ttirOs);
-        } else {
-          blockZ = 1;
-          emitTriton2D(k, blockX, blockY, kernelName, ttirOs);
-        }
-      } else {
-        blockX = tiles.empty() ? 1024 : tiles[0];
-        blockY = 1;
-        blockZ = 1;
-
-        if (k.kind == fir::fnacc::ElementwiseKernelKind::ReductionDot1D) {
-          emitTritonReductionDot1D(k, blockX, kernelName, ttirOs);
-        } else if (isReduction) {
-          emitTritonReduction1D(k, blockX, kernelName, ttirOs);
-        } else if (k.kind == fir::fnacc::ElementwiseKernelKind::Expr1D) {
-          emitTritonExpr1D(k, blockX, kernelName, ttirOs);
-        } else if (k.kind == fir::fnacc::ElementwiseKernelKind::Saxpy1D) {
-          emitTritonSaxpy1D(k, blockX, kernelName, ttirOs);
-        } else {
-          emitTriton1D(k, blockX, kernelName, ttirOs);
-        }
+      if (mlir::failed(backend->emitKernel(plan, ttirOs))) {
+        plan.launchOp.emitError("FNACC backend '")
+            << backend->getName() << "' failed while emitting kernel '"
+            << plan.name << "'";
+        emissionFailed = true;
+        break;
       }
 
-      if (isReduction) {
-        emitTritonReductionStage1D(k.elementType, k.reductionOperator, blockX,
-                                   reductionStageName, ttirOs);
-      }
-
-      int32_t kernelNumWarps = getKernelNumWarps(k, tritonNumWarps);
-      int32_t kernelCudaThreadsPerCTA = kernelNumWarps * tritonThreadsPerWarp;
-
-      emitJsonDescriptor(
-          launchOp, k, blockX, blockY, blockZ, kernelId, emittedPtxIndex,
-          kernelName, kernelNumWarps, tritonThreadsPerWarp, tritonNumStages,
-          kernelCudaThreadsPerCTA, reductionStageId, jsonOs, firstKernel);
-
+      emitJsonDescriptor(plan, emittedPtxIndex, *backend, jsonOs, firstKernel);
       ++emittedPtxIndex;
 
-      if (isReduction) {
-        emitJsonReductionStageDescriptor(
-            k.elementType, k.reductionOperator, blockX, reductionStageId,
-            emittedPtxIndex, reductionStageName, kernelNumWarps,
-            tritonThreadsPerWarp, tritonNumStages, kernelCudaThreadsPerCTA,
-            jsonOs, firstKernel);
+      if (plan.reductionStage) {
+        emitJsonReductionStageDescriptor(plan, emittedPtxIndex, *backend,
+                                         jsonOs, firstKernel);
         ++emittedPtxIndex;
       }
+    }
 
-      ++fallbackId;
-    });
-
-    ttirOs << "}\n";
+    moduleBackend->endModule(ttirOs);
 
     jsonOs << "\n";
     jsonOs << "  ]\n";
     jsonOs << "}\n";
 
-    if (failed) {
+    if (emissionFailed) {
       signalPassFailure();
       return;
     }
@@ -2098,8 +2126,9 @@ std::unique_ptr<mlir::Pass> fir::fnacc::createFNACCLowerToTritonPass() {
 std::unique_ptr<mlir::Pass> fir::fnacc::createFNACCLowerToTritonPass(
     llvm::StringRef ttirOutput, llvm::StringRef jsonOutput, int32_t numWarps,
     int32_t threadsPerWarp, int32_t numStages,
-    llvm::StringRef f64MatmulStrategy) {
-  return std::make_unique<FNACCLowerToTritonPass>(ttirOutput, jsonOutput,
-                                                  numWarps, threadsPerWarp,
-                                                  numStages, f64MatmulStrategy);
+    llvm::StringRef f64MatmulStrategy, llvm::StringRef backend,
+    llvm::StringRef fallbackBackend, bool allowBackendFallback) {
+  return std::make_unique<FNACCLowerToTritonPass>(
+      ttirOutput, jsonOutput, numWarps, threadsPerWarp, numStages,
+      f64MatmulStrategy, backend, fallbackBackend, allowBackendFallback);
 }

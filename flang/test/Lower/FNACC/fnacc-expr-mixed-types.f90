@@ -15,6 +15,5 @@ subroutine fnacc_expr_mixed_types(n, a, b, c)
   end do
 end subroutine
 
-! CHECK: error: FNACC Triton cannot emit launch:
-! CHECK-SAME: all read/write arrays must have the same real element type
-
+! CHECK: error: FNACC cannot plan launch:
+! CHECK-SAME: all read/write arrays must have the same element type

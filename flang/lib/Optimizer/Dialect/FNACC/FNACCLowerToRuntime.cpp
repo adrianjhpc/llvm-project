@@ -12,14 +12,14 @@
 #include "mlir/IR/SymbolTable.h"
 
 #include "llvm/ADT/APFloat.h"
-#include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/ArrayRef.h"
+#include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringRef.h"
 
 #include <cstdint>
 #include <limits>
-#include <string>
 #include <optional>
+#include <string>
 
 namespace fir::fnacc {
 #define GEN_PASS_DEF_FNACCLOWERTORUNTIME
@@ -39,9 +39,17 @@ struct BlockShape {
   int32_t z = 1;
 };
 
-static FloatType getMLIRFloatType(OpBuilder &builder,
-                                  fir::fnacc::ElementType type) {
+static Type getMLIRElementType(OpBuilder &builder,
+                               fir::fnacc::ElementType type) {
   switch (type) {
+  case fir::fnacc::ElementType::I8:
+    return builder.getI8Type();
+  case fir::fnacc::ElementType::I16:
+    return builder.getI16Type();
+  case fir::fnacc::ElementType::I32:
+    return builder.getI32Type();
+  case fir::fnacc::ElementType::I64:
+    return builder.getI64Type();
   case fir::fnacc::ElementType::F32:
     return builder.getF32Type();
   case fir::fnacc::ElementType::F64:
@@ -49,6 +57,56 @@ static FloatType getMLIRFloatType(OpBuilder &builder,
   default:
     llvm_unreachable("unsupported FNACC element type");
   }
+}
+
+static StringRef getElementwiseRuntimeName(fir::fnacc::ElementType type) {
+  switch (type) {
+  case fir::fnacc::ElementType::I8:
+    return "__fnacc_launch_i8_v1";
+  case fir::fnacc::ElementType::I16:
+    return "__fnacc_launch_i16_v1";
+  case fir::fnacc::ElementType::I32:
+    return "__fnacc_launch_i32_v1";
+  case fir::fnacc::ElementType::I64:
+    return "__fnacc_launch_i64_v1";
+  case fir::fnacc::ElementType::F32:
+    return "__fnacc_launch_f32_v1";
+  case fir::fnacc::ElementType::F64:
+    return "__fnacc_launch_f64_v1";
+  case fir::fnacc::ElementType::Unknown:
+    llvm_unreachable("unknown FNACC element type");
+  }
+  llvm_unreachable("unhandled FNACC element type");
+}
+
+static StringRef getReductionRuntimeName(fir::fnacc::ElementType type) {
+  switch (type) {
+  case fir::fnacc::ElementType::I8:
+    return "__fnacc_launch_reduce_i8_v2";
+  case fir::fnacc::ElementType::I16:
+    return "__fnacc_launch_reduce_i16_v2";
+  case fir::fnacc::ElementType::I32:
+    return "__fnacc_launch_reduce_i32_v2";
+  case fir::fnacc::ElementType::I64:
+    return "__fnacc_launch_reduce_i64_v2";
+  case fir::fnacc::ElementType::F32:
+    return "__fnacc_launch_reduce_f32_v2";
+  case fir::fnacc::ElementType::F64:
+    return "__fnacc_launch_reduce_f64_v2";
+  case fir::fnacc::ElementType::Unknown:
+    llvm_unreachable("unknown FNACC reduction element type");
+  }
+  llvm_unreachable("unhandled FNACC reduction element type");
+}
+
+static Value createZeroElement(OpBuilder &builder, Location loc, Type type) {
+  if (auto integerType = dyn_cast<IntegerType>(type))
+    return arith::ConstantOp::create(builder, loc, type,
+                                     builder.getIntegerAttr(integerType, 0));
+
+  auto floatType = cast<FloatType>(type);
+  return arith::ConstantOp::create(builder, loc, type,
+                                   builder.getFloatAttr(floatType, 0.0));
 }
 
 static BlockShape getBlockShape(fir::fnacc::LaunchOp launchOp,
@@ -336,10 +394,10 @@ static std::optional<int64_t> getElementByteSize(Type elementType) {
   return std::nullopt;
 }
 
-static Value getRuntimeRealPointer(OpBuilder &builder, Location loc,
-                                   fir::fnacc::LaunchOp launchOp,
-                                   Value arrayLike,
-                                   fir::fnacc::ElementType type) {
+static Value getRuntimeElementPointer(OpBuilder &builder, Location loc,
+                                      fir::fnacc::LaunchOp launchOp,
+                                      Value arrayLike,
+                                      fir::fnacc::ElementType type) {
   if (!arrayLike) {
     mlir::emitError(loc) << "FNACC internal error: null array-like value";
     return {};
@@ -352,24 +410,24 @@ static Value getRuntimeRealPointer(OpBuilder &builder, Location loc,
     return {};
   }
 
-  FloatType realTy = getMLIRFloatType(builder, type);
-  Type realRefTy = fir::ReferenceType::get(realTy);
+  Type elementTy = getMLIRElementType(builder, type);
+  Type elementRefTy = fir::ReferenceType::get(elementTy);
 
   arrayLike = getAddressOfBoxIfNeeded(builder, loc, *runtimeVisible);
 
-  return fir::ConvertOp::create(builder, loc, realRefTy, arrayLike);
+  return fir::ConvertOp::create(builder, loc, elementRefTy, arrayLike);
 }
 
-static Value getRuntimeScalarRealPointer(OpBuilder &builder, Location loc,
-                                         Value scalarRef,
-                                         fir::fnacc::ElementType type) {
-  FloatType realTy = getMLIRFloatType(builder, type);
-  Type realRefTy = fir::ReferenceType::get(realTy);
+static Value getRuntimeScalarElementPointer(OpBuilder &builder, Location loc,
+                                            Value scalarRef,
+                                            fir::fnacc::ElementType type) {
+  Type elementTy = getMLIRElementType(builder, type);
+  Type elementRefTy = fir::ReferenceType::get(elementTy);
 
-  if (scalarRef.getType() == realRefTy)
+  if (scalarRef.getType() == elementRefTy)
     return scalarRef;
 
-  return fir::ConvertOp::create(builder, loc, realRefTy, scalarRef);
+  return fir::ConvertOp::create(builder, loc, elementRefTy, scalarRef);
 }
 
 static void createRuntimeCall(ModuleOp module, OpBuilder &builder, Location loc,
@@ -955,21 +1013,18 @@ struct FNACCLowerToRuntimePass
         Value initialValue =
             fir::LoadOp::create(builder, loc, k.reductionScalarRef);
 
-        StringRef reductionRuntimeName =
-            k.elementType == fir::fnacc::ElementType::F64
-                ? "__fnacc_launch_reduce_f64_v2"
-                : "__fnacc_launch_reduce_f32_v2";
+        StringRef reductionRuntimeName = getReductionRuntimeName(k.elementType);
 
         Value numReadArraysValue = arith::ConstantIntOp::create(
             builder, loc, static_cast<int32_t>(k.readArrays.size()), 32);
 
-        Value read0Ptr = getRuntimeRealPointer(builder, loc, launchOp,
-                                               k.readArrays[0], k.elementType);
+        Value read0Ptr = getRuntimeElementPointer(
+            builder, loc, launchOp, k.readArrays[0], k.elementType);
 
         Value read1Ptr = read0Ptr;
         if (k.readArrays.size() >= 2) {
-          read1Ptr = getRuntimeRealPointer(builder, loc, launchOp,
-                                           k.readArrays[1], k.elementType);
+          read1Ptr = getRuntimeElementPointer(builder, loc, launchOp,
+                                              k.readArrays[1], k.elementType);
         }
 
         if (!read0Ptr || !read1Ptr) {
@@ -977,7 +1032,7 @@ struct FNACCLowerToRuntimePass
           return;
         }
 
-        Value resultPtr = getRuntimeScalarRealPointer(
+        Value resultPtr = getRuntimeScalarElementPointer(
             builder, loc, k.reductionScalarRef, k.elementType);
 
         llvm::SmallVector<Type> argTypes;
@@ -1012,12 +1067,10 @@ struct FNACCLowerToRuntimePass
         continue;
       }
 
-      StringRef runtimeName = k.elementType == fir::fnacc::ElementType::F64
-                                  ? "__fnacc_launch_f64_v1"
-                                  : "__fnacc_launch_f32_v1";
+      StringRef runtimeName = getElementwiseRuntimeName(k.elementType);
 
-      FloatType realTy = getMLIRFloatType(builder, k.elementType);
-      Type realRefTy = fir::ReferenceType::get(realTy);
+      Type elementTy = getMLIRElementType(builder, k.elementType);
+      Type elementRefTy = fir::ReferenceType::get(elementTy);
 
       if (k.readArrays.empty() || k.readArrays.size() > 3) {
         launchOp.emitError(
@@ -1027,21 +1080,21 @@ struct FNACCLowerToRuntimePass
         return;
       }
 
-      Value read0Ptr = getRuntimeRealPointer(builder, loc, launchOp,
-                                             k.readArrays[0], k.elementType);
+      Value read0Ptr = getRuntimeElementPointer(builder, loc, launchOp,
+                                                k.readArrays[0], k.elementType);
 
       Value read1Ptr = read0Ptr;
       if (k.readArrays.size() >= 2)
-        read1Ptr = getRuntimeRealPointer(builder, loc, launchOp,
-                                         k.readArrays[1], k.elementType);
+        read1Ptr = getRuntimeElementPointer(builder, loc, launchOp,
+                                            k.readArrays[1], k.elementType);
 
       Value read2Ptr = read0Ptr;
       if (k.readArrays.size() >= 3)
-        read2Ptr = getRuntimeRealPointer(builder, loc, launchOp,
-                                         k.readArrays[2], k.elementType);
+        read2Ptr = getRuntimeElementPointer(builder, loc, launchOp,
+                                            k.readArrays[2], k.elementType);
 
-      Value writePtr = getRuntimeRealPointer(builder, loc, launchOp,
-                                             k.writeArray, k.elementType);
+      Value writePtr = getRuntimeElementPointer(builder, loc, launchOp,
+                                                k.writeArray, k.elementType);
 
       if (!read0Ptr || !read1Ptr || !read2Ptr || !writePtr) {
         signalPassFailure();
@@ -1101,7 +1154,7 @@ struct FNACCLowerToRuntimePass
 
       if (scalarCount > 3) {
         launchOp.emitError(
-            "FNACC generic runtime supports at most three f32 or f64 scalars");
+            "FNACC generic runtime supports at most three scalar values");
         signalPassFailure();
         return;
       }
@@ -1112,14 +1165,11 @@ struct FNACCLowerToRuntimePass
       Value numScalarsValue =
           arith::ConstantIntOp::create(builder, loc, scalarCount, 32);
 
-      auto zeroAttr = builder.getFloatAttr(realTy, 0.0);
+      Value zeroElement = createZeroElement(builder, loc, elementTy);
 
-      Value zeroReal =
-          arith::ConstantOp::create(builder, loc, realTy, zeroAttr);
-
-      Value scalar0Value = zeroReal;
-      Value scalar1Value = zeroReal;
-      Value scalar2Value = zeroReal;
+      Value scalar0Value = zeroElement;
+      Value scalar1Value = zeroElement;
+      Value scalar2Value = zeroElement;
 
       if (scalarCount >= 1)
         scalar0Value = fir::LoadOp::create(builder, loc, k.scalarRefs[0]);
@@ -1138,13 +1188,13 @@ struct FNACCLowerToRuntimePass
       argTypes.push_back(blockZValue.getType());
       argTypes.push_back(numReadArraysValue.getType());
       argTypes.push_back(numScalarsValue.getType());
-      argTypes.push_back(realRefTy);
-      argTypes.push_back(realRefTy);
-      argTypes.push_back(realRefTy);
-      argTypes.push_back(realRefTy);
-      argTypes.push_back(realTy);
-      argTypes.push_back(realTy);
-      argTypes.push_back(realTy);
+      argTypes.push_back(elementRefTy);
+      argTypes.push_back(elementRefTy);
+      argTypes.push_back(elementRefTy);
+      argTypes.push_back(elementRefTy);
+      argTypes.push_back(elementTy);
+      argTypes.push_back(elementTy);
+      argTypes.push_back(elementTy);
       argTypes.push_back(extentXValue.getType());
       argTypes.push_back(extentYValue.getType());
       argTypes.push_back(extentZValue.getType());

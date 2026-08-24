@@ -5,6 +5,14 @@
 // RUN: FileCheck %s --check-prefix=TTIR --input-file=%t.ttir
 // RUN: FileCheck %s --check-prefix=JSON --input-file=%t.json
 // RUN: python3 -m json.tool %t.json > /dev/null
+// RUN: fir-opt \
+// RUN:   --fnacc-assign-kernel-ids \
+// RUN:   --fnacc-lower-to-triton="ttir-output=%t.fallback.ttir json-output=%t.fallback.json backend=cuda-tile fallback-backend=triton allow-backend-fallback=true" \
+// RUN:   %s -o /dev/null 2>&1 | FileCheck %s --check-prefix=FALLBACK
+// RUN: not fir-opt \
+// RUN:   --fnacc-assign-kernel-ids \
+// RUN:   --fnacc-lower-to-triton="ttir-output=%t.no-fallback.ttir json-output=%t.no-fallback.json backend=cuda-tile allow-backend-fallback=false" \
+// RUN:   %s -o /dev/null 2>&1 | FileCheck %s --check-prefix=NO-FALLBACK
 
 module {
   func.func @kernel1d(
@@ -122,3 +130,5 @@ module {
 // JSON: "tile": [16, 16, 1]
 // JSON: "grid": ["cdiv(extent_x, tile_x)", "cdiv(extent_y, tile_y)", "1"]
 
+// FALLBACK: warning: requested backend 'cuda-tile' is not registered; falling back to 'triton'
+// NO-FALLBACK: error: FNACC backend selection failed: requested backend 'cuda-tile' is not registered

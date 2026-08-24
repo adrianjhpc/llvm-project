@@ -14,6 +14,6 @@ subroutine fnacc_expr_unsupported_intrinsic(n, a, b, c)
   end do
 end subroutine
 
-! CHECK: error: FNACC Triton cannot emit launch:
+! CHECK: error: FNACC cannot plan launch:
 ! CHECK-SAME: unsupported operation
 

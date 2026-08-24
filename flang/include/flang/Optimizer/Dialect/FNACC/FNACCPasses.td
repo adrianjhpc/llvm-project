@@ -8,8 +8,8 @@ def FNACCAssignKernelIds : Pass<"fnacc-assign-kernel-ids", "mlir::ModuleOp"> {
   let description = [{
     Walks fnacc.launch operations and attaches stable `fnacc.kernel_id`
     and `fnacc.kernel_name` attributes. Later FNACC passes use these
-    attributes to keep generated Triton kernels and host runtime calls
-    consistent.
+    attributes to keep generated device kernels and host runtime calls
+    consistent across FNACC backends.
   }];
   let constructor = "fir::fnacc::createFNACCAssignKernelIdsPass()";
   let dependentDialects = [
@@ -47,7 +47,7 @@ def FNACCEmitFortranAliases
 }
 
 def FNACCLowerToTriton : Pass<"fnacc-lower-to-triton", "mlir::ModuleOp"> {
-  let summary = "Emit Triton textual IR for elementwise fnacc.launch regions";
+  let summary = "Plan FNACC kernels and emit them with the Triton backend";
   let constructor = "fir::fnacc::createFNACCLowerToTritonPass()";
 
   let options = [
@@ -68,7 +68,16 @@ def FNACCLowerToTriton : Pass<"fnacc-lower-to-triton", "mlir::ModuleOp"> {
            "Number of Triton pipeline stages">,
     Option<"f64MatmulStrategy", "f64-matmul-strategy", "std::string",
            "\"reduce\"",
-           "Strategy for f64 matmul lowering: dot, reduce, or fma">
+           "Strategy for f64 matmul lowering: dot, reduce, or fma">,
+    Option<"backend", "backend", "std::string",
+           "\"auto\"",
+           "Preferred FNACC device-code backend: auto or triton">,
+    Option<"fallbackBackend", "fallback-backend", "std::string",
+           "\"triton\"",
+           "Backend used when the preferred backend cannot lower a kernel">,
+    Option<"allowBackendFallback", "allow-backend-fallback", "bool",
+           "true",
+           "Allow per-kernel fallback to fallback-backend">
   ];
 
   let dependentDialects = [
@@ -94,4 +103,3 @@ def FNACCLowerToRuntime : Pass<"fnacc-lower-to-runtime", "mlir::ModuleOp"> {
 }
 
 #endif // FORTRAN_OPTIMIZER_DIALECT_FNACC_PASSES
-

@@ -23,9 +23,9 @@ subroutine bad_step(n, a, b, c)
   end do
 end subroutine
 
-! CHECK: error: FNACC Triton cannot emit launch:
+! CHECK: error: FNACC cannot plan launch:
 ! CHECK-SAME: loop lower bound must be constant 1
 
-! CHECK: error: FNACC Triton cannot emit launch:
+! CHECK: error: FNACC cannot plan launch:
 ! CHECK-SAME: loop step must be constant 1
 

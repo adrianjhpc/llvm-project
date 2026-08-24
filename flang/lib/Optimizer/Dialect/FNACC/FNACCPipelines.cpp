@@ -40,6 +40,21 @@ struct FNACCPipelineOptions
       llvm::cl::desc("Strategy for f64 matmul lowering: dot, reduce, or fma"),
       llvm::cl::init("reduce")};
 
+  Option<std::string> backend{
+      *this, "backend",
+      llvm::cl::desc("Preferred FNACC device-code backend: auto or triton"),
+      llvm::cl::init("auto")};
+
+  Option<std::string> fallbackBackend{
+      *this, "fallback-backend",
+      llvm::cl::desc("FNACC backend used when the preferred backend cannot "
+                     "lower a kernel"),
+      llvm::cl::init("triton")};
+
+  Option<bool> allowBackendFallback{
+      *this, "allow-backend-fallback",
+      llvm::cl::desc("Allow per-kernel fallback to fallback-backend"),
+      llvm::cl::init(true)};
 };
 
 void buildFNACCPipeline(mlir::OpPassManager &pm,
@@ -48,7 +63,8 @@ void buildFNACCPipeline(mlir::OpPassManager &pm,
 
   pm.addPass(createFNACCLowerToTritonPass(
       options.ttirOutput, options.jsonOutput, options.numWarps,
-      options.threadsPerWarp, options.numStages, options.f64MatmulStrategy));
+      options.threadsPerWarp, options.numStages, options.f64MatmulStrategy,
+      options.backend, options.fallbackBackend, options.allowBackendFallback));
 
   pm.addPass(createFNACCLowerToRuntimePass());
 

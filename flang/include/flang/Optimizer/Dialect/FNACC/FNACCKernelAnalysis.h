@@ -11,6 +11,7 @@
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/SmallVector.h"
 
+#include <cstdint>
 #include <memory>
 #include <optional>
 #include <string>
@@ -70,6 +71,7 @@ enum class ElementwiseExprKind {
   ArrayLoad,
   ScalarLoad,
   ConstantReal,
+  ConstantInteger,
 
   // Unary arithmetic.
   NegF,
@@ -80,6 +82,7 @@ enum class ElementwiseExprKind {
   SinF,
   CosF,
   TanhF,
+  AbsI,
 
   // Binary arithmetic.
   AddF,
@@ -90,6 +93,12 @@ enum class ElementwiseExprKind {
   MaxF,
   MinNumF,
   MaxNumF,
+  AddI,
+  SubI,
+  MulI,
+  DivSI,
+  MinSI,
+  MaxSI,
 
   // Comparisons.
   CmpOLT,
@@ -98,6 +107,12 @@ enum class ElementwiseExprKind {
   CmpOGE,
   CmpOEQ,
   CmpONE,
+  CmpSLT,
+  CmpSLE,
+  CmpSGT,
+  CmpSGE,
+  CmpIEQ,
+  CmpINE,
 
   // Conditional value selection.
   Select
@@ -111,11 +126,12 @@ struct ElementwiseExpr {
 
   mlir::Value source;
   double realValue = 0.0;
+  int64_t integerValue = 0;
 
   llvm::SmallVector<std::unique_ptr<ElementwiseExpr>> operands;
 };
 
-enum class ElementType { Unknown, F32, F64 };
+enum class ElementType { Unknown, I8, I16, I32, I64, F32, F64 };
 
 enum class ScalarCaptureKind { Reference, Value };
 

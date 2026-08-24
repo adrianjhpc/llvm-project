@@ -15,6 +15,6 @@ subroutine fnacc_expr_too_many_scalars(n, a, c, s0, s1, s2, s3)
   end do
 end subroutine
 
-! CHECK: error: FNACC Triton cannot emit launch:
+! CHECK: error: FNACC cannot plan launch:
 ! CHECK-SAME: expression tree supports at most three scalar
 

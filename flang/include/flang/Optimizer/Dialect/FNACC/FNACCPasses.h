@@ -14,11 +14,12 @@ std::unique_ptr<mlir::Pass> createFNACCAssignKernelIdsPass();
 std::unique_ptr<mlir::Pass> createFNACCOutlineKernelsPass();
 std::unique_ptr<mlir::Pass> createFNACCEmitFortranAliasesPass();
 std::unique_ptr<mlir::Pass> createFNACCLowerToTritonPass();
-std::unique_ptr<mlir::Pass>
-createFNACCLowerToTritonPass(llvm::StringRef ttirOutput,
-                             llvm::StringRef jsonOutput, int32_t numWarps,
-                             int32_t threadsPerWarp, int32_t numStages,
-                             llvm::StringRef f64MatmulStrategy);
+std::unique_ptr<mlir::Pass> createFNACCLowerToTritonPass(
+    llvm::StringRef ttirOutput, llvm::StringRef jsonOutput, int32_t numWarps,
+    int32_t threadsPerWarp, int32_t numStages,
+    llvm::StringRef f64MatmulStrategy, llvm::StringRef backend = "auto",
+    llvm::StringRef fallbackBackend = "triton",
+    bool allowBackendFallback = true);
 std::unique_ptr<mlir::Pass> createFNACCLowerToRuntimePass();
 
 void registerFNACCPipelines();
