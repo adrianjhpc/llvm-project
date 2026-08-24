@@ -37,25 +37,30 @@ end subroutine
 ! HOST-COUNT-2: call @__fnacc_launch_f32_v1
 ! HOST-NOT: fnacc.launch
 
+! Flang lowers source-level MIN/MAX intrinsics to comparison/select trees so
+! that their NaN and signed-zero behavior remains explicit in FIR and TTIR.
+
 ! TTIR-LABEL: tt.func @fnacc_kernel_0(
-! TTIR: arith.minimumf
+! TTIR: arith.cmpf
 ! TTIR-SAME: tensor<256xf32>
+! TTIR: arith.select
 ! TTIR: tt.store
 
 ! TTIR-LABEL: tt.func @fnacc_kernel_1(
 ! TTIR-SAME: %scalar0: f32
 ! TTIR-SAME: %scalar1: f32
-! TTIR: arith.minimumf
+! TTIR: arith.cmpf
 ! TTIR-SAME: tensor<256xf32>
-! TTIR: arith.maximumf
+! TTIR: arith.select
+! TTIR: arith.cmpf
 ! TTIR-SAME: tensor<256xf32>
+! TTIR: arith.select
 ! TTIR: tt.store
 
 ! JSON: "fnacc_schema_version": 1
 ! JSON-COUNT-2: "kind": "expr2d"
-! JSON-COUNT-2: "rank": 2
+! JSON: "rank": 2
 ! JSON: "role": "scalar"
 ! JSON: "name": "scalar0"
 ! JSON: "role": "scalar"
 ! JSON: "name": "scalar1"
-

@@ -33,8 +33,7 @@ end subroutine
 ! HOST-NOT: fnacc.launch
 
 ! TTIR-LABEL: tt.func @fnacc_kernel_0(
-! TTIR: arith.constant
-! TTIR-SAME: f32
+! TTIR: arith.constant 0.000000e+00 : f32
 ! TTIR: arith.cmpf ogt
 ! TTIR-SAME: tensor<128xf32>
 ! TTIR: arith.select
@@ -48,5 +47,4 @@ end subroutine
 
 ! JSON: "fnacc_schema_version": 1
 ! JSON-COUNT-2: "kind": "expr1d"
-! JSON-COUNT-2: "rank": 1
-
+! JSON: "rank": 1

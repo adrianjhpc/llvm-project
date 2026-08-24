@@ -1,7 +1,9 @@
 // RUN: fir-opt \
 // RUN:   --fnacc-assign-kernel-ids \
 // RUN:   --fnacc-lower-to-triton="ttir-output=%t.ttir json-output=%t.json" \
-// RUN:   %s -o /dev/null
+// RUN:   --fnacc-lower-to-runtime \
+// RUN:   %s -o %t.host.fir
+// RUN: FileCheck %s --input-file=%t.host.fir
 // RUN: FileCheck %s --check-prefix=TTIR --input-file=%t.ttir
 // RUN: FileCheck %s --check-prefix=JSON --input-file=%t.json
 // RUN: python3 -m json.tool %t.json > /dev/null
@@ -81,4 +83,3 @@ module {
 // JSON: "name": "scalar0"
 // JSON: "role": "scalar"
 // JSON: "name": "scalar1"
-

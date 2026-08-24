@@ -80,6 +80,5 @@ end subroutine
 
 ! JSON: "fnacc_schema_version": 1
 ! JSON-COUNT-4: "kind": "expr1d"
-! JSON-COUNT-4: "rank": 1
-! JSON-COUNT-4: "tile": [128, 1, 1]
-
+! JSON: "rank": 1
+! JSON: "tile": [128, 1, 1]

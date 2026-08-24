@@ -44,23 +44,32 @@ end subroutine
 ! HOST-COUNT-3: call @__fnacc_launch_f32_v1
 ! HOST-NOT: fnacc.launch
 
+! Flang currently lowers the MIN/MAX intrinsics to comparisons and selects.
+! Keeping that form preserves its exact NaN and signed-zero behavior.  Direct
+! arith.minimumf/maximumf inputs are also supported by FNACC, but these
+! source-level tests must check the FIR form that Flang actually produces.
+
 ! TTIR-LABEL: tt.func @fnacc_kernel_0(
-! TTIR: arith.minimumf
+! TTIR: arith.cmpf
 ! TTIR-SAME: tensor<128xf32>
+! TTIR: arith.select
 ! TTIR: tt.store
 
 ! TTIR-LABEL: tt.func @fnacc_kernel_1(
-! TTIR: arith.maximumf
+! TTIR: arith.cmpf
 ! TTIR-SAME: tensor<128xf32>
+! TTIR: arith.select
 ! TTIR: tt.store
 
 ! TTIR-LABEL: tt.func @fnacc_kernel_2(
 ! TTIR-SAME: %scalar0: f32
 ! TTIR-SAME: %scalar1: f32
-! TTIR: arith.maximumf
+! TTIR: arith.cmpf
 ! TTIR-SAME: tensor<128xf32>
-! TTIR: arith.minimumf
+! TTIR: arith.select
+! TTIR: arith.cmpf
 ! TTIR-SAME: tensor<128xf32>
+! TTIR: arith.select
 ! TTIR: tt.store
 
 ! JSON: "fnacc_schema_version": 1
@@ -69,4 +78,3 @@ end subroutine
 ! JSON: "type": "f32"
 ! JSON: "name": "scalar1"
 ! JSON: "type": "f32"
-

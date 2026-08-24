@@ -88,7 +88,8 @@ enum class ElementwiseExprKind {
   DivF,
   MinF,
   MaxF,
-  PowF,
+  MinNumF,
+  MaxNumF,
 
   // Comparisons.
   CmpOLT,
@@ -174,7 +175,7 @@ struct ElementwiseKernel {
 
   llvm::SmallVector<mlir::Value> scalarRefs;
 
-//  llvm::SmallVector<ScalarCapture> scalarCaptures;
+  //  llvm::SmallVector<ScalarCapture> scalarCaptures;
 
   mlir::Operation *computeOp = nullptr;
 

@@ -5,6 +5,7 @@
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/IR/Matchers.h"
+#include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "llvm/ADT/APFloat.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallPtrSet.h"
@@ -41,18 +42,36 @@ static Value stripFirConvert(Value v) {
   return v;
 }
 
+/// Return a stable identity for an array base.
+///
+/// A single allocatable or assumed-shape array can be materialized multiple
+/// times inside a launch as distinct fir.load/fir.box_addr chains. Those SSA
+/// values are different, but they all describe the same runtime array when
+/// they originate from the same descriptor.
+static Value getArrayIdentity(Value value) {
+  value = stripFirConvert(value);
+
+  auto boxAddr = value.getDefiningOp<fir::BoxAddrOp>();
+  if (!boxAddr)
+    return value;
+
+  Value box = stripFirConvert(boxAddr->getOperand(0));
+  if (auto load = box.getDefiningOp<fir::LoadOp>())
+    return stripFirConvert(load.getMemref());
+
+  return box;
+}
+
+static bool sameArrayBase(Value lhs, Value rhs) {
+  return lhs && rhs && getArrayIdentity(lhs) == getArrayIdentity(rhs);
+}
+
 static void markConsumed(ElementwiseKernel &kernel, Operation *op) {
   if (!op)
     return;
 
   if (!llvm::is_contained(kernel.consumedOps, op))
     kernel.consumedOps.push_back(op);
-}
-
-static void markConsumedValueDefinition(ElementwiseKernel &kernel,
-                                        Value value) {
-  if (Operation *definingOp = value.getDefiningOp())
-    markConsumed(kernel, definingOp);
 }
 
 /// Mark a value's launch-local backward slice.
@@ -232,18 +251,68 @@ static bool isAcceptedStructuralOperation(Operation *op) {
              arith::ConstantIndexOp, fir::ShapeOp, fir::ShapeShiftOp>(op);
 }
 
-static void markBackwardSlice(ElementwiseKernel &kernel, Operation *root,
-                              fir::fnacc::LaunchOp launchOp) {
-  if (!root || !launchOp->isProperAncestor(root) ||
-      llvm::is_contained(kernel.consumedOps, root))
-    return;
+static bool sameValueAfterFirConvert(Value lhs, Value rhs) {
+  return lhs && rhs && stripFirConvert(lhs) == stripFirConvert(rhs);
+}
 
-  markConsumed(kernel, root);
+static bool isRecognizedKernelStore(const ElementwiseKernel &kernel,
+                                    fir::StoreOp store) {
+  if (llvm::is_contained(kernel.consumedOps, store.getOperation()))
+    return true;
 
-  for (Value operand : root->getOperands()) {
-    if (Operation *def = operand.getDefiningOp())
-      markBackwardSlice(kernel, def, launchOp);
+  Value memref = stripFirConvert(store.getMemref());
+
+  if (sameValueAfterFirConvert(memref, kernel.innerIndMemref) ||
+      sameValueAfterFirConvert(memref, kernel.outerIndMemref) ||
+      sameValueAfterFirConvert(memref, kernel.reductionIndMemref) ||
+      sameValueAfterFirConvert(memref, kernel.accumulatorMemref) ||
+      sameValueAfterFirConvert(memref, kernel.reductionScalarRef))
+    return true;
+
+  auto arrayCoor = memref.getDefiningOp<fir::ArrayCoorOp>();
+  return arrayCoor && sameArrayBase(arrayCoor.getMemref(), kernel.writeArray);
+}
+
+static Operation *findDiscardedSideEffect(
+    fir::fnacc::LaunchOp launchOp, const ElementwiseKernel &kernel) {
+  Operation *unsupported = nullptr;
+
+  launchOp.walk([&](Operation *op) {
+    if (unsupported || op == launchOp.getOperation() ||
+        llvm::is_contained(kernel.consumedOps, op) ||
+        isAcceptedStructuralOperation(op))
+      return;
+
+    if (auto store = dyn_cast<fir::StoreOp>(op)) {
+      if (!isRecognizedKernelStore(kernel, store))
+        unsupported = op;
+      return;
+    }
+
+    // Loads and operations with no memory effects are safe parts of a
+    // recognized expression. Any other unaccounted operation would be erased
+    // by host lowering, so reject the launch instead of silently discarding
+    // its effects.
+    if (isa<fir::LoadOp>(op) || isMemoryEffectFree(op))
+      return;
+
+    unsupported = op;
+  });
+
+  return unsupported;
+}
+
+static ElementwiseRecognitionResult validateRecognizedKernel(
+    fir::fnacc::LaunchOp launchOp, ElementwiseRecognitionResult result) {
+  ElementwiseKernel kernel = std::move(result.getKernel());
+
+  if (Operation *unsupported = findDiscardedSideEffect(launchOp, kernel)) {
+    std::string reason = "unsupported operation would be discarded: ";
+    reason += unsupported->getName().getStringRef().str();
+    return fail(unsupported, reason);
   }
+
+  return ElementwiseRecognitionResult::success(std::move(kernel));
 }
 
 /// Return true if `v` is an integer constant equal to `expected`.
@@ -556,6 +625,17 @@ static unsigned getOrAddValueIndex(llvm::SmallVectorImpl<Value> &values,
   return values.size() - 1;
 }
 
+static unsigned getOrAddArrayIndex(llvm::SmallVectorImpl<Value> &arrays,
+                                   Value array) {
+  for (auto it : llvm::enumerate(arrays)) {
+    if (sameArrayBase(it.value(), array))
+      return it.index();
+  }
+
+  arrays.push_back(array);
+  return arrays.size() - 1;
+}
+
 static std::optional<double> getRealConstantValue(Value v) {
   v = stripFirConvert(v);
 
@@ -651,10 +731,10 @@ recognizeElementwiseExpr(Value value, const ArrayAccessInfo &accesses,
   int readIndex = findReadValueIndex(accesses.readValues, value);
   if (readIndex >= 0) {
     Value arrayBase = accesses.readArrays[readIndex];
-    getOrAddValueIndex(kernel.readArrays, arrayBase);
+    unsigned arrayIndex = getOrAddArrayIndex(kernel.readArrays, arrayBase);
 
     auto expression = makeExpr(ElementwiseExprKind::ArrayLoad);
-    expression->source = arrayBase;
+    expression->source = kernel.readArrays[arrayIndex];
     return expression;
   }
 
@@ -765,7 +845,7 @@ recognizeElementwiseExpr(Value value, const ArrayAccessInfo &accesses,
   // differ across MLIR revisions.
   StringRef operationName = operation->getName().getStringRef();
 
-  if (operationName == "arith.minimumf" || operationName == "arith.minnumf") {
+  if (operationName == "arith.minimumf") {
     if (operation->getNumOperands() != 2) {
       reason = "floating-point minimum operation is not binary";
       return nullptr;
@@ -776,7 +856,7 @@ recognizeElementwiseExpr(Value value, const ArrayAccessInfo &accesses,
         operation->getOperand(1), accesses, kernel, reason);
   }
 
-  if (operationName == "arith.maximumf" || operationName == "arith.maxnumf") {
+  if (operationName == "arith.maximumf") {
     if (operation->getNumOperands() != 2) {
       reason = "floating-point maximum operation is not binary";
       return nullptr;
@@ -784,6 +864,31 @@ recognizeElementwiseExpr(Value value, const ArrayAccessInfo &accesses,
 
     return recognizeBinaryElementwiseExpr(
         ElementwiseExprKind::MaxF, operation->getOperand(0),
+        operation->getOperand(1), accesses, kernel, reason);
+  }
+
+  // Do not collapse minnum/maxnum into minimum/maximum: their NaN behavior is
+  // different, and changing the operation while emitting TTIR would be a
+  // silent semantic change.
+  if (operationName == "arith.minnumf") {
+    if (operation->getNumOperands() != 2) {
+      reason = "floating-point minnum operation is not binary";
+      return nullptr;
+    }
+
+    return recognizeBinaryElementwiseExpr(
+        ElementwiseExprKind::MinNumF, operation->getOperand(0),
+        operation->getOperand(1), accesses, kernel, reason);
+  }
+
+  if (operationName == "arith.maxnumf") {
+    if (operation->getNumOperands() != 2) {
+      reason = "floating-point maxnum operation is not binary";
+      return nullptr;
+    }
+
+    return recognizeBinaryElementwiseExpr(
+        ElementwiseExprKind::MaxNumF, operation->getOperand(0),
         operation->getOperand(1), accesses, kernel, reason);
   }
 
@@ -865,7 +970,7 @@ static bool detectGenericExpr(ElementwiseKernel &k, const ArrayAccessInfo &info,
   }
 
   if (k.scalarRefs.size() > 3) {
-    reason = "expression tree supports at most three scalar f32 values";
+    reason = "expression tree supports at most three scalar real values";
     return false;
   }
 
@@ -932,8 +1037,13 @@ static bool collectArrayAccessesFromBody(Block *body, unsigned expectedRank,
     return false;
   }
 
-  if (info.readArrays.size() < minReads || info.readArrays.size() > maxReads ||
-      info.readValues.size() < minReads || info.readValues.size() > maxReads) {
+  llvm::SmallVector<Value> uniqueReadArrays;
+  for (Value array : info.readArrays)
+    getOrAddArrayIndex(uniqueReadArrays, array);
+
+  if (uniqueReadArrays.size() < minReads ||
+      uniqueReadArrays.size() > maxReads ||
+      info.readArrays.size() != info.readValues.size()) {
     reason = "kernel has unsupported number of read arrays";
     return false;
   }
@@ -1062,7 +1172,7 @@ static bool collectArrayAccesses1D(ElementwiseKernel &k, fir::DoLoopOp loop,
     return false;
   }
 
-  if (info.readArrays.empty() || info.readArrays.size() > 3) {
+  if (info.readArrays.empty()) {
     reason = "kernel expected one to three read arrays";
     return false;
   }
@@ -2187,7 +2297,7 @@ recognizeElementwiseKernel(fir::fnacc::LaunchOp launchOp) {
   if (launchOp->hasAttr("fnacc.reduction_slots")) {
     auto rRed = recognizeReduction1D(launchOp);
     if (rRed.succeeded())
-      return rRed;
+      return validateRecognizedKernel(launchOp, std::move(rRed));
 
     std::string reason = "not a supported FNACC reduction kernel; ";
     reason += rRed.getFailure().reason;
@@ -2197,16 +2307,16 @@ recognizeElementwiseKernel(fir::fnacc::LaunchOp launchOp) {
   // Try matmul first because it is also a 2-D loop nest.
   auto rMatmul = recognizeMatMul2D(launchOp);
   if (rMatmul.succeeded())
-    return rMatmul;
+    return validateRecognizedKernel(launchOp, std::move(rMatmul));
 
   // Try 2-D before 1-D because 2-D kernels have one top-level loop too.
   auto r2 = recognize2D(launchOp);
   if (r2.succeeded())
-    return r2;
+    return validateRecognizedKernel(launchOp, std::move(r2));
 
   auto r1 = recognize1D(launchOp);
   if (r1.succeeded())
-    return r1;
+    return validateRecognizedKernel(launchOp, std::move(r1));
 
   std::string reason = "not a supported FNACC kernel; ";
   reason += "matmul failure: ";

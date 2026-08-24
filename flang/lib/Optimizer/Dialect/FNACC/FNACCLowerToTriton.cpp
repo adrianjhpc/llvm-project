@@ -164,7 +164,9 @@ static StringRef ttArith(Operation *op) {
     return "arith.subf";
   if (isa<arith::MulFOp>(op))
     return "arith.mulf";
-  return "arith.divf";
+  if (isa<arith::DivFOp>(op))
+    return "arith.divf";
+  llvm_unreachable("unsupported binary FNACC arithmetic operation");
 }
 
 static StringRef ttArithForExprKind(fir::fnacc::ElementwiseExprKind kind) {
@@ -181,6 +183,10 @@ static StringRef ttArithForExprKind(fir::fnacc::ElementwiseExprKind kind) {
     return "arith.minimumf";
   case fir::fnacc::ElementwiseExprKind::MaxF:
     return "arith.maximumf";
+  case fir::fnacc::ElementwiseExprKind::MinNumF:
+    return "arith.minnumf";
+  case fir::fnacc::ElementwiseExprKind::MaxNumF:
+    return "arith.maxnumf";
   default:
     llvm_unreachable("not a binary arithmetic expression kind");
   }
@@ -404,7 +410,9 @@ static std::string emitExprVector(const fir::fnacc::ElementwiseKernel &k,
   case fir::fnacc::ElementwiseExprKind::MulF:
   case fir::fnacc::ElementwiseExprKind::DivF:
   case fir::fnacc::ElementwiseExprKind::MinF:
-  case fir::fnacc::ElementwiseExprKind::MaxF: {
+  case fir::fnacc::ElementwiseExprKind::MaxF:
+  case fir::fnacc::ElementwiseExprKind::MinNumF:
+  case fir::fnacc::ElementwiseExprKind::MaxNumF: {
     assert(expr.operands.size() == 2 &&
            "binary expression requires two operands");
 
@@ -453,11 +461,8 @@ static std::string emitExprVector(const fir::fnacc::ElementwiseKernel &k,
     return result;
   }
 
-  case fir::fnacc::ElementwiseExprKind::PowF:
-    llvm_unreachable("PowF emission has not been implemented");
   default:
-    llvm_unreachable(std::to_string(expr.kind)
-                     << " operation has not been implememented yet");
+    llvm_unreachable("unsupported FNACC expression reached TTIR emission");
   }
 }
 
