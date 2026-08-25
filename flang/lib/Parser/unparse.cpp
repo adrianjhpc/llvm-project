@@ -2936,6 +2936,7 @@ public:
     Put(")");
   }
   void Unparse(const FnACCReleaseAllDirective &) { Word("RELEASE ALL"); }
+  void Unparse(const FnACCWaitDirective &) { Word("WAIT"); }
   void Unparse(const FnACCStandaloneConstruct &x) {
     Word("!$FNACC");
     Put(" ");

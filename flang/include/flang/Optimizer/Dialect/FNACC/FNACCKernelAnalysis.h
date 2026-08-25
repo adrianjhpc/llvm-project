@@ -140,6 +140,19 @@ struct ScalarCapture {
   mlir::Value value;
 };
 
+/// Classification of scalar storage referenced by a parallel loop.
+///
+/// ReadOnlyCapture is materialized outside fnacc.launch and passed by value.
+/// IterationPrivate is assigned and consumed within one logical loop
+/// iteration; its defining expression is promoted to device SSA. A remaining
+/// mutable reference is unsafe because it would otherwise become one uniform
+/// kernel argument shared by all logical iterations.
+enum class ScalarReferenceKind {
+  ReadOnlyCapture,
+  IterationPrivate,
+  UnsupportedMutable
+};
+
 struct ElementwiseKernel {
   int32_t rank = 1;
 
@@ -189,7 +202,13 @@ struct ElementwiseKernel {
   llvm::SmallVector<mlir::Value> readArrays;
   mlir::Value writeArray;
 
+  /// Host-visible, read-only scalar references passed to the kernel by value.
   llvm::SmallVector<mlir::Value> scalarRefs;
+
+  /// Scalar references proven iteration-private and promoted into the
+  /// expression tree. They are recorded for diagnostics and validation only;
+  /// they are deliberately absent from the runtime ABI.
+  llvm::SmallVector<mlir::Value> privateScalarRefs;
 
   //  llvm::SmallVector<ScalarCapture> scalarCaptures;
 

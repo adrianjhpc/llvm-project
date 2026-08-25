@@ -1344,7 +1344,7 @@ static FNACCContextState &fnaccCreateContextState(
   state.context = context;
   state.retainedPrimaryContext = retainedPrimaryContext;
   FNACC_CUDA_CHECK(cuCtxSetCurrent(state.context));
-  FNACC_CUDA_CHECK(cuStreamCreate(&state.stream, CU_STREAM_NON_BLOCKING));
+  FNACC_CUDA_CHECK(cuStreamCreate(&state.stream, CU_STREAM_DEFAULT));
   FNACC_CUDA_CHECK(
       cuEventCreate(&state.completionEvent, CU_EVENT_DISABLE_TIMING));
 
@@ -1439,6 +1439,17 @@ static void fnaccSynchronizeActiveContext() {
   FNACCContextState &state{fnaccActiveContextState()};
   if (state.stream)
     fnaccWaitForStream(state.stream, state.completionEvent);
+}
+
+extern "C" void __fnacc_wait() {
+  FNACC_RUNTIME_GUARD();
+  FNACCCurrentContextGuard contextGuard;
+  fnaccEnsureCurrentContext();
+
+  if (fnaccDebugEnabled())
+    std::fprintf(stderr, "FNACC: wait for active runtime stream\n");
+
+  fnaccWaitForRuntimeStream();
 }
 
 static FNACCReductionWorkspace &fnaccGetReductionWorkspace() {

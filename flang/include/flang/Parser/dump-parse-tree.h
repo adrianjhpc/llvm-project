@@ -379,6 +379,7 @@ public:
   NODE(parser, FnACCUpdateDeviceDirective)
   NODE(parser, FnACCReleaseDirective)
   NODE(parser, FnACCReleaseAllDirective)
+  NODE(parser, FnACCWaitDirective)
   NODE(parser, FnACCEnterDataDirective)
   NODE(parser, FnACCExitDataDirective)
   NODE(parser, FnACCEnterDataClause)

@@ -72,6 +72,17 @@ def FNACC_ReleaseAllOp : FNACC_Op<"release_all", []> {
   let assemblyFormat = "attr-dict";
 }
 
+def FNACC_WaitOp : FNACC_Op<"wait", []> {
+  let summary = "Wait for preceding FNACC work";
+  let description = [{
+    Waits until all work previously submitted to the FNACC runtime stream for
+    the active CUDA context has completed. FNACC currently has one stream per
+    context, so this operation has no queue operands.
+  }];
+
+  let assemblyFormat = "attr-dict";
+}
+
 def FNACC_CopyinOp : FNACC_Op<"copyin", []> {
   let summary = "Begin FNACC device lifetime and copy host data to device";
   let arguments = (ins AnyType:$var);

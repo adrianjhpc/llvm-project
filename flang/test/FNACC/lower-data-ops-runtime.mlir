@@ -10,6 +10,7 @@ module {
     fnacc.update_device %a : !fir.ref<!fir.array<?xf32>>
     fnacc.release %a, %b : !fir.ref<!fir.array<?xf32>>, !fir.ref<!fir.array<?xf32>>
     fnacc.release_all
+    fnacc.wait
 
     return
   }
@@ -19,6 +20,7 @@ module {
 // CHECK-DAG: func.func private @__fnacc_update_device(!fir.ref<i8>)
 // CHECK-DAG: func.func private @__fnacc_release(!fir.ref<i8>)
 // CHECK-DAG: func.func private @__fnacc_release_all()
+// CHECK-DAG: func.func private @__fnacc_wait()
 
 // CHECK-LABEL: func.func @data_ops
 // CHECK: fir.convert {{.*}} : (!fir.ref<!fir.array<?xf32>>) -> !fir.ref<i8>
@@ -28,9 +30,10 @@ module {
 // CHECK: call @__fnacc_release
 // CHECK: call @__fnacc_release
 // CHECK: call @__fnacc_release_all
+// CHECK: call @__fnacc_wait
 
 // CHECK-NOT: fnacc.update_host
 // CHECK-NOT: fnacc.update_device
 // CHECK-NOT: fnacc.release
 // CHECK-NOT: fnacc.release_all
-
+// CHECK-NOT: fnacc.wait

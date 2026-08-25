@@ -438,7 +438,46 @@ static fir::fnacc::ElementType getSupportedElementType(Type type) {
   return fir::fnacc::ElementType::Unknown;
 }
 
-static std::optional<Value> getScalarElementRefFromValue(Value v) {
+struct ScalarReferenceInfo {
+  ScalarReferenceKind kind = ScalarReferenceKind::ReadOnlyCapture;
+  Value reference;
+  fir::LoadOp load;
+  fir::StoreOp definingStore;
+};
+
+static bool scalarReferenceIsUsedAfterLaunch(Value reference,
+                                             fir::fnacc::LaunchOp launchOp) {
+  Block *launchBlock = launchOp->getBlock();
+
+  for (Operation *user : reference.getUsers()) {
+    if (launchOp->isProperAncestor(user))
+      continue;
+
+    // Find the operation containing this use that is directly nested in the
+    // launch's block. This also catches uses inside a host-side fir.if after
+    // the launch.
+    Operation *blockOperation = user;
+    while (blockOperation && blockOperation->getBlock() != launchBlock)
+      blockOperation = blockOperation->getParentOp();
+
+    if (blockOperation && blockOperation != launchOp.getOperation() &&
+        launchOp->isBeforeInBlock(blockOperation))
+      return true;
+  }
+
+  return false;
+}
+
+/// Classify a scalar load before it is admitted to the kernel ABI.
+///
+/// A reference with no stores in fnacc.launch is a read-only capture. A
+/// reference with exactly one store in the same innermost loop block, before
+/// every load, is an iteration-private temporary and can be promoted to SSA by
+/// recursively recognizing the stored value. Everything else is explicitly
+/// unsupported mutable state; in particular, loop-carried and conditionally
+/// assigned scalars must not be silently captured as uniform kernel values.
+static std::optional<ScalarReferenceInfo>
+classifyScalarElementReference(Value v) {
   v = stripFirConvert(v);
 
   auto load = v.getDefiningOp<fir::LoadOp>();
@@ -461,7 +500,69 @@ static std::optional<Value> getScalarElementRefFromValue(Value v) {
   if (getSupportedElementType(eleTy) == fir::fnacc::ElementType::Unknown)
     return std::nullopt;
 
-  return memref;
+  ScalarReferenceInfo info;
+  info.reference = memref;
+  info.load = load;
+
+  auto launchOp = load->getParentOfType<fir::fnacc::LaunchOp>();
+  if (!launchOp)
+    return info;
+
+  llvm::SmallVector<fir::StoreOp> stores;
+  llvm::SmallVector<fir::LoadOp> loads;
+  launchOp.walk([&](Operation *op) {
+    if (auto candidateStore = dyn_cast<fir::StoreOp>(op)) {
+      if (sameValueAfterFirConvert(candidateStore.getMemref(), memref))
+        stores.push_back(candidateStore);
+      return;
+    }
+
+    if (auto candidateLoad = dyn_cast<fir::LoadOp>(op))
+      if (sameValueAfterFirConvert(candidateLoad.getMemref(), memref))
+        loads.push_back(candidateLoad);
+  });
+
+  if (stores.empty())
+    return info;
+
+  info.kind = ScalarReferenceKind::UnsupportedMutable;
+  if (stores.size() != 1)
+    return info;
+
+  // Private values have no copy-out semantics. Do not promote a scalar whose
+  // host value is observed after the parallel region.
+  if (scalarReferenceIsUsedAfterLaunch(memref, launchOp))
+    return info;
+
+  fir::StoreOp store = stores.front();
+  fir::DoLoopOp storeLoop = store->getParentOfType<fir::DoLoopOp>();
+  fir::DoLoopOp loadLoop = load->getParentOfType<fir::DoLoopOp>();
+
+  // The store and every load must execute in the same logical iteration. The
+  // same-block order requirement also rejects read-before-write and
+  // loop-carried forms such as tmp = tmp + a(i).
+  if (!storeLoop || storeLoop != loadLoop ||
+      store->getBlock() != load->getBlock())
+    return info;
+
+  for (fir::LoadOp candidateLoad : loads) {
+    if (candidateLoad->getBlock() != store->getBlock() ||
+        !store->isBeforeInBlock(candidateLoad))
+      return info;
+  }
+
+  info.kind = ScalarReferenceKind::IterationPrivate;
+  info.definingStore = store;
+  return info;
+}
+
+static std::optional<Value> getReadOnlyScalarCaptureRef(Value value) {
+  std::optional<ScalarReferenceInfo> info =
+      classifyScalarElementReference(value);
+  if (!info || info->kind != ScalarReferenceKind::ReadOnlyCapture)
+    return std::nullopt;
+
+  return info->reference;
 }
 
 static fir::fnacc::ElementType getScalarRefElementType(Value memref) {
@@ -796,13 +897,34 @@ recognizeElementwiseExpr(Value value, const ArrayAccessInfo &accesses,
     return expression;
   }
 
-  // Fortran scalar integer or real variable captured by reference.
-  if (auto scalarRef = getScalarElementRefFromValue(value)) {
-    getOrAddValueIndex(kernel.scalarRefs, *scalarRef);
+  // Classify scalar storage before deciding whether it belongs in the ABI.
+  if (auto scalar = classifyScalarElementReference(value)) {
+    switch (scalar->kind) {
+    case ScalarReferenceKind::ReadOnlyCapture: {
+      getOrAddValueIndex(kernel.scalarRefs, scalar->reference);
 
-    auto expression = makeExpr(ElementwiseExprKind::ScalarLoad);
-    expression->source = *scalarRef;
-    return expression;
+      auto expression = makeExpr(ElementwiseExprKind::ScalarLoad);
+      expression->source = scalar->reference;
+      return expression;
+    }
+
+    case ScalarReferenceKind::IterationPrivate: {
+      getOrAddValueIndex(kernel.privateScalarRefs, scalar->reference);
+      markConsumed(kernel, scalar->load.getOperation());
+      markConsumed(kernel, scalar->definingStore.getOperation());
+
+      auto expression = recognizeElementwiseExpr(
+          scalar->definingStore.getValue(), accesses, kernel, reason);
+      if (!expression && reason.empty())
+        reason = "iteration-private scalar has unsupported defining value";
+      return expression;
+    }
+
+    case ScalarReferenceKind::UnsupportedMutable:
+      reason = "mutable scalar reference is neither iteration-private nor a "
+               "reduction";
+      return nullptr;
+    }
   }
 
   // Floating-point constant.
@@ -1091,6 +1213,7 @@ static bool detectGenericExpr(ElementwiseKernel &k, const ArrayAccessInfo &info,
   k.writeArray = info.writeArray;
   k.readArrays.clear();
   k.scalarRefs.clear();
+  k.privateScalarRefs.clear();
   k.computeOp = info.storedValue.getDefiningOp();
 
   auto expr = recognizeElementwiseExpr(info.storedValue, info, k, reason);
@@ -1246,11 +1369,11 @@ static bool detectSaxpy1D(ElementwiseKernel &k, const ArrayAccessInfo &info,
     std::optional<Value> scalarRef;
 
     if (scaledArrayIndex >= 0) {
-      scalarRef = getScalarElementRefFromValue(mulRhs);
+      scalarRef = getReadOnlyScalarCaptureRef(mulRhs);
     } else {
       scaledArrayIndex = findReadValueIndex(info.readValues, mulRhs);
       if (scaledArrayIndex >= 0)
-        scalarRef = getScalarElementRefFromValue(mulLhs);
+        scalarRef = getReadOnlyScalarCaptureRef(mulLhs);
     }
 
     if (scaledArrayIndex < 0 || !scalarRef)

@@ -64,6 +64,8 @@ TYPE_PARSER(construct<FnACCReleaseAllDirective>(
     ("RELEASE"_tok >> "ALL"_tok >> pure(true)) ||
     ("RELEASE_ALL"_tok >> pure(true))))
 
+TYPE_PARSER(construct<FnACCWaitDirective>("WAIT"_tok >> pure(true)))
+
 TYPE_PARSER(construct<FnACCCopyinClause>(
     "COPYIN"_tok >> parenthesized(nonemptyList(name))))
 
@@ -82,21 +84,15 @@ TYPE_PARSER(construct<FnACCEnterDataClause>(Parser<FnACCCopyinClause>{}) ||
 TYPE_PARSER(construct<FnACCExitDataClause>(Parser<FnACCCopyoutClause>{}) ||
     construct<FnACCExitDataClause>(Parser<FnACCDeleteClause>{}))
 
-TYPE_PARSER(sourced(construct<FnACCEnterDataDirective>(
-    "ENTER"_tok >> "DATA"_tok >>
-    many(
-        construct<FnACCEnterDataClause>(
-            Parser<FnACCCopyinClause>{}) ||
-        construct<FnACCEnterDataClause>(
-            Parser<FnACCCreateClause>{})))))
+TYPE_PARSER(
+    sourced(construct<FnACCEnterDataDirective>("ENTER"_tok >> "DATA"_tok >>
+        many(construct<FnACCEnterDataClause>(Parser<FnACCCopyinClause>{}) ||
+            construct<FnACCEnterDataClause>(Parser<FnACCCreateClause>{})))))
 
-TYPE_PARSER(sourced(construct<FnACCExitDataDirective>(
-    "EXIT"_tok >> "DATA"_tok >>
-    many(
-        construct<FnACCExitDataClause>(
-            Parser<FnACCCopyoutClause>{}) ||
-        construct<FnACCExitDataClause>(
-            Parser<FnACCDeleteClause>{})))))
+TYPE_PARSER(
+    sourced(construct<FnACCExitDataDirective>("EXIT"_tok >> "DATA"_tok >>
+        many(construct<FnACCExitDataClause>(Parser<FnACCCopyoutClause>{}) ||
+            construct<FnACCExitDataClause>(Parser<FnACCDeleteClause>{})))))
 
 TYPE_PARSER(construct<FnACCStandaloneConstruct>(startfnaccLine >>
                 Parser<FnACCEnterDataDirective>{} / endOfLine) ||
@@ -109,6 +105,8 @@ TYPE_PARSER(construct<FnACCStandaloneConstruct>(startfnaccLine >>
     construct<FnACCStandaloneConstruct>(
         startfnaccLine >> Parser<FnACCReleaseAllDirective>{} / endOfLine) ||
     construct<FnACCStandaloneConstruct>(
-        startfnaccLine >> Parser<FnACCReleaseDirective>{} / endOfLine))
+        startfnaccLine >> Parser<FnACCReleaseDirective>{} / endOfLine) ||
+    construct<FnACCStandaloneConstruct>(
+        startfnaccLine >> Parser<FnACCWaitDirective>{} / endOfLine))
 
 } // namespace Fortran::parser

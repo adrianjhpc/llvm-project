@@ -3815,6 +3815,10 @@ private:
 
             [&](const Fortran::parser::FnACCReleaseAllDirective &) {
               fir::fnacc::ReleaseAllOp::create(*builder, loc);
+            },
+
+            [&](const Fortran::parser::FnACCWaitDirective &) {
+              fir::fnacc::WaitOp::create(*builder, loc);
             }},
         fnacc.u);
   }

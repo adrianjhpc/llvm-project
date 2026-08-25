@@ -748,7 +748,7 @@ static LogicalResult lowerFNACCDataOpsToRuntime(ModuleOp module,
     if (isa<fir::fnacc::UpdateHostOp, fir::fnacc::UpdateDeviceOp,
             fir::fnacc::ReleaseOp, fir::fnacc::ReleaseAllOp,
             fir::fnacc::CopyinOp, fir::fnacc::CreateOp, fir::fnacc::CopyoutOp,
-            fir::fnacc::DeleteOp>(op)) {
+            fir::fnacc::DeleteOp, fir::fnacc::WaitOp>(op)) {
       dataOps.push_back(op);
     }
   });
@@ -891,6 +891,16 @@ static LogicalResult lowerFNACCDataOpsToRuntime(ModuleOp module,
 
       createRuntimeCall(module, builder, loc, "__fnacc_release_all",
                         ValueRange{});
+
+      op->erase();
+      continue;
+    }
+
+    if (auto wait = dyn_cast<fir::fnacc::WaitOp>(op)) {
+      Location loc = wait.getLoc();
+      builder.setInsertionPoint(wait);
+
+      createRuntimeCall(module, builder, loc, "__fnacc_wait", ValueRange{});
 
       op->erase();
       continue;

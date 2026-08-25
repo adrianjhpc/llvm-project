@@ -2244,6 +2244,9 @@ public:
   // !$fnacc release all
   void Post(const parser::FnACCReleaseAllDirective &) {}
 
+  // !$fnacc wait
+  void Post(const parser::FnACCWaitDirective &) {}
+
   void Post(const parser::FnACCCopyinClause &clause) {
     auto &names{const_cast<std::list<parser::Name> &>(clause.v)};
     for (parser::Name &name : names)

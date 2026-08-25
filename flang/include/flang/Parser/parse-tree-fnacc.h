@@ -53,6 +53,7 @@ struct FnACCConstruct {
 //   !$fnacc update device(a, b)
 //   !$fnacc release(a, b)
 //   !$fnacc release all
+//   !$fnacc wait
 
 struct FnACCUpdateHostDirective {
   TUPLE_CLASS_BOILERPLATE(FnACCUpdateHostDirective);
@@ -71,6 +72,10 @@ struct FnACCReleaseDirective {
 
 struct FnACCReleaseAllDirective {
   WRAPPER_CLASS_BOILERPLATE(FnACCReleaseAllDirective, bool);
+};
+
+struct FnACCWaitDirective {
+  WRAPPER_CLASS_BOILERPLATE(FnACCWaitDirective, bool);
 };
 
 struct FnACCCopyinClause {
@@ -115,7 +120,7 @@ struct FnACCStandaloneConstruct {
   UNION_CLASS_BOILERPLATE(FnACCStandaloneConstruct);
   std::variant<FnACCUpdateHostDirective, FnACCUpdateDeviceDirective,
       FnACCReleaseDirective, FnACCReleaseAllDirective, FnACCEnterDataDirective,
-      FnACCExitDataDirective>
+      FnACCExitDataDirective, FnACCWaitDirective>
       u;
   CharBlock source;
 };
