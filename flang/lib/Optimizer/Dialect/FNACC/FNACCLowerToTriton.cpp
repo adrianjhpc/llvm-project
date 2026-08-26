@@ -328,6 +328,7 @@ static void emitTritonSaxpy1D(const fir::fnacc::ElementwiseKernel &k,
 struct ExprTritonEmitterState {
   int64_t block = 0;
   unsigned nextTmp = 0;
+  llvm::SmallVector<std::string> arrayAccessNames;
   llvm::SmallVector<bool> scalarSplatEmitted;
   llvm::SmallVector<std::string> scalarSplatNames;
 };
@@ -341,6 +342,11 @@ static std::string emitExprVector(const fir::fnacc::ElementwiseKernel &k,
 
   switch (expr.kind) {
   case fir::fnacc::ElementwiseExprKind::ArrayLoad: {
+    if (expr.arrayAccessIndex >= 0 &&
+        static_cast<unsigned>(expr.arrayAccessIndex) <
+            state.arrayAccessNames.size())
+      return state.arrayAccessNames[expr.arrayAccessIndex];
+
     int index = findValueIndex(k.readArrays, expr.source);
     assert(index >= 0 && "array load source not found in read array list");
 
@@ -986,6 +992,159 @@ static void emitTritonExpr2D(const fir::fnacc::ElementwiseKernel &k,
   os << "  %co = tt.addptr %cp, %offs : " << ptrVecTy << ", tensor<" << block
      << "xi32>\n";
   os << "  tt.store %co, " << result << ", %mask : " << ptrVecTy << "\n";
+
+  os << "  tt.return\n";
+  os << "}\n\n";
+}
+
+static void emitTritonStencil2D(const fir::fnacc::ElementwiseKernel &k,
+                                int64_t blockX, int64_t blockY,
+                                StringRef kernelName, llvm::raw_ostream &os) {
+  assert(k.kind == fir::fnacc::ElementwiseKernelKind::Stencil2D);
+  assert(!k.arrayArguments.empty() && !k.outputs.empty());
+
+  int64_t block = blockX * blockY;
+  std::string ptrTy = ptrType(k.elementType);
+  std::string ptrVecTy = ptrTensorType(block, k.elementType);
+  std::string elemTy = ttElementType(k.elementType).str();
+
+  os << "tt.func @" << kernelName << "(";
+  bool first = true;
+  auto parameter = [&](StringRef name, StringRef type) {
+    if (!first)
+      os << ", ";
+    first = false;
+    os << "%" << name << ": " << type;
+  };
+
+  for (unsigned i = 0; i < k.arrayArguments.size(); ++i)
+    parameter("array" + std::to_string(i), ptrTy);
+  for (unsigned i = 0; i < k.scalarRefs.size(); ++i)
+    parameter("scalar" + std::to_string(i), elemTy);
+  parameter("extent_x", "i32");
+  parameter("extent_y", "i32");
+  parameter("loop_lower_x", "i32");
+  parameter("loop_lower_y", "i32");
+  for (unsigned array = 0; array < k.arrayArguments.size(); ++array) {
+    parameter("array" + std::to_string(array) + "_lower0", "i32");
+    parameter("array" + std::to_string(array) + "_lower1", "i32");
+    parameter("array" + std::to_string(array) + "_stride0", "i32");
+    parameter("array" + std::to_string(array) + "_stride1", "i32");
+  }
+  os << ") attributes {noinline = false} {\n";
+
+  os << "  %pid_x = tt.get_program_id x : i32\n";
+  os << "  %pid_y = tt.get_program_id y : i32\n";
+  os << "  %bx = arith.constant " << blockX << " : i32\n";
+  os << "  %by = arith.constant " << blockY << " : i32\n";
+  os << "  %base_x = arith.muli %pid_x, %bx : i32\n";
+  os << "  %base_y = arith.muli %pid_y, %by : i32\n";
+  os << "  %range = tt.make_range {start = 0 : i32, end = " << block
+     << " : i32} : tensor<" << block << "xi32>\n";
+  os << "  %bx_s = tt.splat %bx : i32 -> tensor<" << block << "xi32>\n";
+  os << "  %local_x = arith.remui %range, %bx_s : tensor<" << block
+     << "xi32>\n";
+  os << "  %local_y = arith.divui %range, %bx_s : tensor<" << block
+     << "xi32>\n";
+  os << "  %base_x_s = tt.splat %base_x : i32 -> tensor<" << block << "xi32>\n";
+  os << "  %base_y_s = tt.splat %base_y : i32 -> tensor<" << block << "xi32>\n";
+  os << "  %ix0 = arith.addi %base_x_s, %local_x : tensor<" << block
+     << "xi32>\n";
+  os << "  %iy0 = arith.addi %base_y_s, %local_y : tensor<" << block
+     << "xi32>\n";
+  os << "  %extent_x_s = tt.splat %extent_x : i32 -> tensor<" << block
+     << "xi32>\n";
+  os << "  %extent_y_s = tt.splat %extent_y : i32 -> tensor<" << block
+     << "xi32>\n";
+  os << "  %mask_x = arith.cmpi slt, %ix0, %extent_x_s : tensor<" << block
+     << "xi32>\n";
+  os << "  %mask_y = arith.cmpi slt, %iy0, %extent_y_s : tensor<" << block
+     << "xi32>\n";
+  os << "  %mask = arith.andi %mask_x, %mask_y : tensor<" << block << "xi1>\n";
+  os << "  %loop_lower_x_s = tt.splat %loop_lower_x : i32 -> tensor<" << block
+     << "xi32>\n";
+  os << "  %loop_lower_y_s = tt.splat %loop_lower_y : i32 -> tensor<" << block
+     << "xi32>\n";
+  os << "  %source_x = arith.addi %ix0, %loop_lower_x_s : tensor<" << block
+     << "xi32>\n";
+  os << "  %source_y = arith.addi %iy0, %loop_lower_y_s : tensor<" << block
+     << "xi32>\n";
+
+  auto emitLinearOffset = [&](unsigned array, ArrayRef<int64_t> offsets,
+                              StringRef stem) {
+    std::string x = "%" + stem.str() + "_x";
+    std::string y = "%" + stem.str() + "_y";
+    std::string xAdjusted = "%source_x";
+    std::string yAdjusted = "%source_y";
+    if (offsets[0] != 0) {
+      os << "  %" << stem << "_dx = arith.constant " << offsets[0]
+         << " : i32\n";
+      os << "  %" << stem << "_dx_s = tt.splat %" << stem
+         << "_dx : i32 -> tensor<" << block << "xi32>\n";
+      os << "  %" << stem << "_source_x = arith.addi %source_x, %" << stem
+         << "_dx_s : tensor<" << block << "xi32>\n";
+      xAdjusted = "%" + stem.str() + "_source_x";
+    }
+    if (offsets[1] != 0) {
+      os << "  %" << stem << "_dy = arith.constant " << offsets[1]
+         << " : i32\n";
+      os << "  %" << stem << "_dy_s = tt.splat %" << stem
+         << "_dy : i32 -> tensor<" << block << "xi32>\n";
+      os << "  %" << stem << "_source_y = arith.addi %source_y, %" << stem
+         << "_dy_s : tensor<" << block << "xi32>\n";
+      yAdjusted = "%" + stem.str() + "_source_y";
+    }
+    os << "  %" << stem << "_lower0_s = tt.splat %array" << array
+       << "_lower0 : i32 -> tensor<" << block << "xi32>\n";
+    os << "  %" << stem << "_lower1_s = tt.splat %array" << array
+       << "_lower1 : i32 -> tensor<" << block << "xi32>\n";
+    os << "  " << x << " = arith.subi " << xAdjusted << ", %" << stem
+       << "_lower0_s : tensor<" << block << "xi32>\n";
+    os << "  " << y << " = arith.subi " << yAdjusted << ", %" << stem
+       << "_lower1_s : tensor<" << block << "xi32>\n";
+    os << "  %" << stem << "_stride0_s = tt.splat %array" << array
+       << "_stride0 : i32 -> tensor<" << block << "xi32>\n";
+    os << "  %" << stem << "_stride1_s = tt.splat %array" << array
+       << "_stride1 : i32 -> tensor<" << block << "xi32>\n";
+    os << "  %" << stem << "_xpart = arith.muli " << x << ", %" << stem
+       << "_stride0_s : tensor<" << block << "xi32>\n";
+    os << "  %" << stem << "_ypart = arith.muli " << y << ", %" << stem
+       << "_stride1_s : tensor<" << block << "xi32>\n";
+    os << "  %" << stem << "_offset = arith.addi %" << stem << "_xpart, %"
+       << stem << "_ypart : tensor<" << block << "xi32>\n";
+  };
+
+  ExprTritonEmitterState state;
+  state.block = block;
+  state.scalarSplatEmitted.resize(k.scalarRefs.size(), false);
+  state.scalarSplatNames.resize(k.scalarRefs.size());
+  state.arrayAccessNames.resize(k.arrayAccesses.size());
+
+  for (auto [index, access] : llvm::enumerate(k.arrayAccesses)) {
+    std::string stem = "access" + std::to_string(index);
+    emitLinearOffset(access.arrayArgumentIndex, access.offsets, stem);
+    os << "  %" << stem << "_base = tt.splat %array"
+       << access.arrayArgumentIndex << " : " << ptrTy << " -> " << ptrVecTy
+       << "\n";
+    os << "  %" << stem << "_ptr = tt.addptr %" << stem << "_base, %" << stem
+       << "_offset : " << ptrVecTy << ", tensor<" << block << "xi32>\n";
+    os << "  %" << stem << "_value = tt.load %" << stem
+       << "_ptr, %mask : " << ptrVecTy << "\n";
+    state.arrayAccessNames[index] = "%" + stem + "_value";
+  }
+
+  for (auto [index, output] : llvm::enumerate(k.outputs)) {
+    std::string result = emitExprVector(k, *output.expression, state, os);
+    std::string stem = "output" + std::to_string(index);
+    emitLinearOffset(output.arrayArgumentIndex, output.offsets, stem);
+    os << "  %" << stem << "_base = tt.splat %array"
+       << output.arrayArgumentIndex << " : " << ptrTy << " -> " << ptrVecTy
+       << "\n";
+    os << "  %" << stem << "_ptr = tt.addptr %" << stem << "_base, %" << stem
+       << "_offset : " << ptrVecTy << ", tensor<" << block << "xi32>\n";
+    os << "  tt.store %" << stem << "_ptr, " << result
+       << ", %mask : " << ptrVecTy << "\n";
+  }
 
   os << "  tt.return\n";
   os << "}\n\n";
@@ -1648,6 +1807,8 @@ static StringRef jsonParameterRole(fir::fnacc::FNACCKernelParameterRole role) {
     return "read";
   case Role::Write:
     return "write";
+  case Role::ReadWrite:
+    return "read_write";
   case Role::Partials:
     return "partials";
   case Role::Scalar:
@@ -1658,6 +1819,16 @@ static StringRef jsonParameterRole(fir::fnacc::FNACCKernelParameterRole role) {
     return "extent_y";
   case Role::ExtentZ:
     return "extent_k";
+  case Role::LoopLowerX:
+    return "loop_lower_x";
+  case Role::LoopLowerY:
+    return "loop_lower_y";
+  case Role::LoopLowerZ:
+    return "loop_lower_z";
+  case Role::ArrayLowerBound:
+    return "array_lower_bound";
+  case Role::ArrayStride:
+    return "array_stride";
   }
   llvm_unreachable("unknown FNACC ABI parameter role");
 }
@@ -1679,7 +1850,12 @@ static void emitJsonABI(const fir::fnacc::FNACCKernelABI &abi,
     os << "        {\"slot\": " << parameter.slot << ", \"role\": \""
        << jsonParameterRole(parameter.role) << "\", \"name\": \""
        << parameter.name << "\", \"type\": \"" << jsonParameterType(parameter)
-       << "\"}";
+       << "\"";
+    if (parameter.arrayIndex >= 0)
+      os << ", \"array_index\": " << parameter.arrayIndex;
+    if (parameter.dimension >= 0)
+      os << ", \"dimension\": " << parameter.dimension;
+    os << "}";
   }
   os << "\n      ],\n";
 
@@ -1735,6 +1911,13 @@ static void emitJsonDescriptor(const fir::fnacc::FNACCKernelPlan &plan,
      << backend.getPrivatePointerArgumentCount(plan) << ",\n";
   os << "      \"triton_hidden_ptr_args\": "
      << backend.getPrivatePointerArgumentCount(plan) << ",\n";
+
+  if (k.kind == fir::fnacc::ElementwiseKernelKind::Stencil2D) {
+    os << "      \"launch_abi_version\": 2,\n";
+    os << "      \"array_count\": " << k.arrayArguments.size() << ",\n";
+    os << "      \"scalar_count\": " << k.scalarRefs.size() << ",\n";
+    os << "      \"output_count\": " << k.outputs.size() << ",\n";
+  }
 
   if (plan.reductionStage)
     os << "      \"reduction_stage_id\": " << plan.reductionStage->id << ",\n";
@@ -1884,6 +2067,8 @@ public:
         } else {
           emitTritonMatMul2DF32(kernel, blockX, blockY, blockZ, plan.name, os);
         }
+      } else if (kernel.kind == Kind::Stencil2D) {
+        emitTritonStencil2D(kernel, blockX, blockY, plan.name, os);
       } else if (kernel.kind == Kind::Expr2D) {
         emitTritonExpr2D(kernel, blockX, blockY, plan.name, os);
       } else {
@@ -2040,6 +2225,7 @@ struct FNACCLowerToTritonPass
       case fir::fnacc::ElementwiseKernelKind::Saxpy1D:
       case fir::fnacc::ElementwiseKernelKind::Expr1D:
       case fir::fnacc::ElementwiseKernelKind::Expr2D:
+      case fir::fnacc::ElementwiseKernelKind::Stencil2D:
         hasSimpleElementwiseLaunch = true;
         break;
 

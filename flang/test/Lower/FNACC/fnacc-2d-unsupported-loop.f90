@@ -14,22 +14,5 @@ subroutine bad_2d_step(n, m, a, b, c)
   end do
 end subroutine
 
-subroutine bad_2d_lower_bound(n, m, a, b, c)
-  integer :: n, m
-  real :: a(0:n, m), b(0:n, m), c(0:n, m)
-  integer :: i, j
-
-  !$fnacc parallel tile(16, 16)
-  do j = 1, m
-    do i = 0, n
-      c(i, j) = a(i, j) + b(i, j)
-    end do
-  end do
-end subroutine
-
 ! CHECK: error: FNACC cannot plan launch:
 ! CHECK-SAME: loop step must be constant 1
-
-! CHECK: error: FNACC cannot plan launch:
-! CHECK-SAME: loop lower bound must be constant 1
-

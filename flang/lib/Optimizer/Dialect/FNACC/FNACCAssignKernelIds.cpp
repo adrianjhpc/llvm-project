@@ -5,12 +5,14 @@
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinOps.h"
 
+#include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/StringExtras.h"
-#include "llvm/ADT/StringSet.h"
 #include "llvm/ADT/StringRef.h"
+#include "llvm/ADT/StringSet.h"
 
-#include <cstddef>
+#include <cstdint>
+#include <cstdlib>
 #include <limits>
 #include <string>
 
@@ -26,6 +28,15 @@ namespace {
 static constexpr llvm::StringLiteral kKernelIdAttrName = "fnacc.kernel_id";
 static constexpr llvm::StringLiteral kKernelNameAttrName = "fnacc.kernel_name";
 
+static uint32_t fnv1a32(llvm::StringRef text) {
+  uint32_t hash = 2166136261u;
+  for (unsigned char byte : text.bytes()) {
+    hash ^= byte;
+    hash *= 16777619u;
+  }
+  return hash;
+}
+
 struct FNACCAssignKernelIdsPass
     : public fir::fnacc::impl::FNACCAssignKernelIdsBase<
           FNACCAssignKernelIdsPass> {
@@ -38,7 +49,7 @@ struct FNACCAssignKernelIdsPass
     bool invalid = false;
 
     // Validate pre-existing IDs before assigning any new ones. In particular,
-    // never let a preserved ID collide with a walk-order generated ID.
+    // never let a preserved ID collide with a generated ID.
     module.walk([&](fir::fnacc::LaunchOp launchOp) {
       auto existingId = launchOp->getAttrOfType<IntegerAttr>(kKernelIdAttrName);
       if (!existingId)
@@ -56,10 +67,6 @@ struct FNACCAssignKernelIdsPass
         launchOp.emitError("duplicate FNACC kernel id ") << id;
         invalid = true;
       }
-
-      if (auto function = launchOp->getParentOfType<mlir::func::FuncOp>()) {
-        function->setAttr("fnacc.contains_launch", builder.getUnitAttr());
-      }
     });
 
     if (invalid) {
@@ -67,34 +74,53 @@ struct FNACCAssignKernelIdsPass
       return;
     }
 
-    int32_t nextId = 0;
+    llvm::DenseMap<Operation *, unsigned> localOrdinals;
+    int32_t nextSequentialId = 0;
+    const char *bundleKey = std::getenv("FNACC_KERNEL_BUNDLE_KEY");
+    bool useBundleStableIds = bundleKey && bundleKey[0] != '\0';
     llvm::StringSet<> usedNames;
 
     module.walk([&](fir::fnacc::LaunchOp launchOp) {
+      Operation *scope = module.getOperation();
+      std::string scopeName = "module";
+      if (auto function = launchOp->getParentOfType<mlir::func::FuncOp>()) {
+        scope = function.getOperation();
+        scopeName = function.getSymName().str();
+      }
+      unsigned ordinal = localOrdinals[scope]++;
+
       auto existingId = launchOp->getAttrOfType<IntegerAttr>(kKernelIdAttrName);
       int32_t id = 0;
 
       if (existingId) {
         id = static_cast<int32_t>(existingId.getInt());
+      } else if (useBundleStableIds) {
+        std::string identity = std::string(bundleKey) + ":" + scopeName + "#" +
+                               std::to_string(ordinal);
+        // Keep the top two bits clear so a module can allocate nearby
+        // synthetic reduction-stage IDs without signed overflow.
+        id = static_cast<int32_t>(fnv1a32(identity) & 0x3fffffffU);
+        while (!usedIds.insert(id).second)
+          id = (id + 1) & 0x3fffffff;
+        launchOp->setAttr(kKernelIdAttrName, builder.getI32IntegerAttr(id));
       } else {
-        while (usedIds.count(nextId) != 0) {
-          if (nextId == std::numeric_limits<int32_t>::max()) {
+        while (usedIds.count(nextSequentialId) != 0) {
+          if (nextSequentialId == std::numeric_limits<int32_t>::max()) {
             launchOp.emitError("exhausted FNACC i32 kernel id space");
             invalid = true;
             return;
           }
-          ++nextId;
+          ++nextSequentialId;
         }
-        id = nextId;
-        if (nextId < std::numeric_limits<int32_t>::max())
-          ++nextId;
+        id = nextSequentialId;
         usedIds.insert(id);
+        if (nextSequentialId < std::numeric_limits<int32_t>::max())
+          ++nextSequentialId;
         launchOp->setAttr(kKernelIdAttrName, builder.getI32IntegerAttr(id));
       }
 
-      if (auto function = launchOp->getParentOfType<mlir::func::FuncOp>()) {
+      if (auto function = launchOp->getParentOfType<mlir::func::FuncOp>())
         function->setAttr("fnacc.contains_launch", builder.getUnitAttr());
-      }
 
       if (!launchOp->hasAttr(kKernelNameAttrName)) {
         std::string name = "fnacc_kernel_" + std::to_string(id);

@@ -51,11 +51,17 @@ inline llvm::StringRef fnaccDeviceImageKindName(FNACCDeviceImageKind kind) {
 enum class FNACCKernelParameterRole {
   Read,
   Write,
+  ReadWrite,
   Partials,
   Scalar,
   ExtentX,
   ExtentY,
-  ExtentZ
+  ExtentZ,
+  LoopLowerX,
+  LoopLowerY,
+  LoopLowerZ,
+  ArrayLowerBound,
+  ArrayStride
 };
 
 enum class FNACCKernelParameterPassing { DevicePointer, Value };
@@ -69,6 +75,8 @@ struct FNACCKernelParameter {
   FNACCKernelParameterPassing passing = FNACCKernelParameterPassing::Value;
   ElementType elementType = ElementType::Unknown;
   std::string name;
+  int32_t arrayIndex = -1;
+  int32_t dimension = -1;
 };
 
 struct FNACCPackBinding {

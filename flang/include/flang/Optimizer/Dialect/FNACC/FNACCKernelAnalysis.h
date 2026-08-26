@@ -20,9 +20,11 @@ namespace fir::fnacc {
 
 enum class ElementwiseExtentSourceKind {
   Unknown,
+  ConstantInteger,
   Value,
   LoadIntegerRef,
-  BoxDim
+  BoxDim,
+  BoxLowerBound
 };
 
 struct ElementwiseExtentSource {
@@ -42,6 +44,9 @@ struct ElementwiseExtentSource {
   //   outside the launch and use result #1, the extent.
   mlir::Value value;
 
+  // For ConstantInteger.
+  int64_t constantValue = 0;
+
   // For BoxDim. Zero-based dimension number.
   unsigned dim = 0;
 };
@@ -51,6 +56,7 @@ enum class ElementwiseKernelKind {
   Saxpy1D,
   Expr1D,
   Expr2D,
+  Stencil2D,
   MatMul2D,
   ReductionSum1D,
   ReductionDot1D,
@@ -125,6 +131,9 @@ struct ElementwiseExpr {
   ElementwiseExprResultKind resultKind = ElementwiseExprResultKind::Element;
 
   mlir::Value source;
+  // Index in ElementwiseKernel::arrayAccesses. This distinguishes two loads
+  // from the same array at different stencil offsets.
+  int32_t arrayAccessIndex = -1;
   double realValue = 0.0;
   int64_t integerValue = 0;
 
@@ -138,6 +147,27 @@ enum class ScalarCaptureKind { Reference, Value };
 struct ScalarCapture {
   ScalarCaptureKind kind;
   mlir::Value value;
+};
+
+struct ElementwiseArrayAccess {
+  mlir::Value array;
+  mlir::Value loadedValue;
+  unsigned arrayArgumentIndex = 0;
+  llvm::SmallVector<int64_t, 3> offsets;
+};
+
+struct ElementwiseOutput {
+  mlir::Value array;
+  mlir::Value storedValue;
+  unsigned arrayArgumentIndex = 0;
+  llvm::SmallVector<int64_t, 3> offsets;
+  std::unique_ptr<ElementwiseExpr> expression;
+};
+
+struct ElementwiseArrayArgument {
+  mlir::Value array;
+  bool read = false;
+  bool write = false;
 };
 
 /// Classification of scalar storage referenced by a parallel loop.
@@ -191,6 +221,9 @@ struct ElementwiseKernel {
   ElementwiseExtentSource extentX;
   ElementwiseExtentSource extentY;
   ElementwiseExtentSource extentZ;
+  ElementwiseExtentSource loopLowerX;
+  ElementwiseExtentSource loopLowerY;
+  ElementwiseExtentSource loopLowerZ;
 
   mlir::Value innerIndMemref;
   mlir::Value outerIndMemref;
@@ -201,6 +234,13 @@ struct ElementwiseKernel {
 
   llvm::SmallVector<mlir::Value> readArrays;
   mlir::Value writeArray;
+
+  /// Variadic, descriptor-aware ABI used by Stencil2D. Array accesses retain
+  /// their constant affine offsets, and each output owns an expression root.
+  llvm::SmallVector<ElementwiseArrayArgument> arrayArguments;
+  llvm::SmallVector<ElementwiseArrayAccess> arrayAccesses;
+  llvm::SmallVector<ElementwiseOutput> outputs;
+  llvm::SmallVector<mlir::Value> writeArrays;
 
   /// Host-visible, read-only scalar references passed to the kernel by value.
   llvm::SmallVector<mlir::Value> scalarRefs;

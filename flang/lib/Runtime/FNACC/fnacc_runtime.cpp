@@ -591,6 +591,11 @@ struct FNACCKernelDesc {
   // value denotes older metadata that requires the host-side fallback.
   int32_t reductionStageId = -1;
 
+  int32_t launchAbiVersion = 1;
+  int32_t arrayCount = 0;
+  int32_t scalarCount = 0;
+  int32_t outputCount = 0;
+
   enum class ReductionOperator { Add, Multiply, Min, Max };
   ReductionOperator reductionOp = ReductionOperator::Add;
 
@@ -665,15 +670,14 @@ struct FNACCEmbeddedKernelBundle {
   std::vector<int32_t> imageKind;
   const char *jsonData = nullptr;
   std::size_t jsonSize = 0;
-  bool registered = false;
 };
 
 // The generated bundle is registered from a constructor in another
 // translation unit.  A function-local static prevents that constructor from
 // writing into namespace-scope vectors before their constructors have run.
-static FNACCEmbeddedKernelBundle &fnaccGetEmbeddedKernelBundle() {
-  static FNACCEmbeddedKernelBundle bundle;
-  return bundle;
+static std::vector<FNACCEmbeddedKernelBundle> &fnaccGetEmbeddedKernelBundles() {
+  static std::vector<FNACCEmbeddedKernelBundle> bundles;
+  return bundles;
 }
 
 static FNACCKernelRegistry fnaccRegistry;
@@ -785,50 +789,47 @@ static const char *fnaccEmbeddedImageKindName(int32_t kind) {
   }
 }
 
-static bool fnaccHasEmbeddedDeviceBundle() {
-  const FNACCEmbeddedKernelBundle &bundle = fnaccGetEmbeddedKernelBundle();
-  if (bundle.imageData.empty())
+static bool fnaccHasEmbeddedBundles() {
+  const auto &bundles = fnaccGetEmbeddedKernelBundles();
+  if (bundles.empty())
     return false;
-
-  if (bundle.imageData.size() != bundle.imageSize.size() ||
-      bundle.imageData.size() != bundle.imageKind.size())
-    return false;
-
-  for (std::size_t i = 0; i < bundle.imageData.size(); ++i) {
-    if (!bundle.imageData[i] || bundle.imageSize[i] == 0 ||
-        (bundle.imageKind[i] != FNACCEmbeddedKernelBundle::PTX &&
-            bundle.imageKind[i] != FNACCEmbeddedKernelBundle::Cubin))
+  for (const FNACCEmbeddedKernelBundle &bundle : bundles) {
+    if (!bundle.jsonData || bundle.jsonSize == 0 || bundle.imageData.empty() ||
+        bundle.imageData.size() != bundle.imageSize.size() ||
+        bundle.imageData.size() != bundle.imageKind.size())
       return false;
+    for (std::size_t i = 0; i < bundle.imageData.size(); ++i) {
+      if (!bundle.imageData[i] || bundle.imageSize[i] == 0 ||
+          (bundle.imageKind[i] != FNACCEmbeddedKernelBundle::PTX &&
+              bundle.imageKind[i] != FNACCEmbeddedKernelBundle::Cubin))
+        return false;
+    }
   }
-
   return true;
 }
 
-static std::vector<std::string> fnaccGetImagesFromEmbeddedBundle() {
+static std::vector<std::string> fnaccGetImagesFromEmbeddedBundles() {
   std::vector<std::string> result;
 
-  if (!fnaccHasEmbeddedDeviceBundle())
+  if (!fnaccHasEmbeddedBundles())
     return result;
 
-  const FNACCEmbeddedKernelBundle &bundle = fnaccGetEmbeddedKernelBundle();
-  for (std::size_t i = 0; i < bundle.imageData.size(); ++i) {
-    const char *bytes = static_cast<const char *>(bundle.imageData[i]);
-    result.emplace_back(bytes, bundle.imageSize[i]);
-
-    if (fnaccDebugEnabled()) {
-      std::fprintf(stderr,
-          "FNACC: loading embedded %s bundle entry %zu, bytes=%zu\n",
-          fnaccEmbeddedImageKindName(bundle.imageKind[i]), i,
-          bundle.imageSize[i]);
+  const auto &bundles = fnaccGetEmbeddedKernelBundles();
+  for (std::size_t bundleIndex = 0; bundleIndex < bundles.size();
+      ++bundleIndex) {
+    const FNACCEmbeddedKernelBundle &bundle = bundles[bundleIndex];
+    for (std::size_t i = 0; i < bundle.imageData.size(); ++i) {
+      const char *bytes = static_cast<const char *>(bundle.imageData[i]);
+      result.emplace_back(bytes, bundle.imageSize[i]);
+      if (fnaccDebugEnabled()) {
+        std::fprintf(stderr,
+            "FNACC: loading embedded %s bundle=%zu entry=%zu bytes=%zu\n",
+            fnaccEmbeddedImageKindName(bundle.imageKind[i]), bundleIndex, i,
+            bundle.imageSize[i]);
+      }
     }
   }
-
   return result;
-}
-
-static bool fnaccHasEmbeddedJson() {
-  const FNACCEmbeddedKernelBundle &bundle = fnaccGetEmbeddedKernelBundle();
-  return bundle.jsonData && bundle.jsonSize > 0;
 }
 
 static std::string fnaccReadTextFile(const char *path) {
@@ -895,8 +896,8 @@ static std::vector<std::string> fnaccGetPtxTexts(
       return fnaccGetPtxTextsFromDirectory(kernels);
   }
 
-  if (fnaccHasEmbeddedDeviceBundle())
-    return fnaccGetImagesFromEmbeddedBundle();
+  if (fnaccHasEmbeddedBundles())
+    return fnaccGetImagesFromEmbeddedBundles();
 
   // Backwards-compatible fallback.
   return {fnaccReadTextFile("fnacc_kernels.ptx")};
@@ -912,8 +913,10 @@ static std::string fnaccGetJsonText() {
     return fnaccReadTextFile(jsonPath);
   }
 
-  if (fnaccHasEmbeddedJson()) {
-    const FNACCEmbeddedKernelBundle &bundle = fnaccGetEmbeddedKernelBundle();
+  if (fnaccHasEmbeddedBundles() &&
+      fnaccGetEmbeddedKernelBundles().size() == 1) {
+    const FNACCEmbeddedKernelBundle &bundle =
+        fnaccGetEmbeddedKernelBundles().front();
     if (fnaccDebugEnabled()) {
       std::fprintf(
           stderr, "FNACC: loading embedded JSON, bytes=%zu\n", bundle.jsonSize);
@@ -1007,6 +1010,10 @@ fnaccParseKernelDescsFromJson(const std::string &json) {
             objectText, "private_pointer_args", desc.tritonHiddenPtrArgs))
       jsonFindInt(
           objectText, "triton_hidden_ptr_args", desc.tritonHiddenPtrArgs);
+    jsonFindInt(objectText, "launch_abi_version", desc.launchAbiVersion);
+    jsonFindInt(objectText, "array_count", desc.arrayCount);
+    jsonFindInt(objectText, "scalar_count", desc.scalarCount);
+    jsonFindInt(objectText, "output_count", desc.outputCount);
 
     desc.pack = jsonParsePackEntries(objectText);
     jsonFindInt(objectText, "reduction_stage_id", desc.reductionStageId);
@@ -1054,6 +1061,14 @@ fnaccParseKernelDescsFromJson(const std::string &json) {
           "FNACC error: kernel id %d requires %d private pointer parameters; "
           "this runtime ABI supports exactly 2\n",
           desc.id, desc.tritonHiddenPtrArgs);
+      std::abort();
+    }
+    if (desc.kind == "stencil2d" &&
+        (desc.launchAbiVersion != 2 || desc.arrayCount <= 0 ||
+            desc.scalarCount < 0 || desc.outputCount <= 0)) {
+      std::fprintf(stderr,
+          "FNACC error: invalid stencil2d ABI metadata for kernel id %d\n",
+          desc.id);
       std::abort();
     }
 
@@ -1280,24 +1295,51 @@ static void fnaccEnsureInitialized() {
         stderr, "FNACC: runtime build id: %s\n", FNACC_RUNTIME_BUILD_ID);
 
   FNACC_CUDA_CHECK(cuInit(0));
-  std::string json = fnaccGetJsonText();
+  auto parseOneJson = [&](const std::string &json, int32_t imageBase) {
+    int32_t schemaVersion = 0;
+    if (!jsonFindInt(json, "fnacc_schema_version", schemaVersion)) {
+      std::fprintf(
+          stderr, "FNACC error: kernel JSON is missing fnacc_schema_version\n");
+      std::abort();
+    }
+    if (schemaVersion != FNACC_SUPPORTED_SCHEMA_VERSION) {
+      std::fprintf(stderr,
+          "FNACC error: unsupported kernel JSON schema version %d; "
+          "runtime supports version %d\n",
+          schemaVersion, FNACC_SUPPORTED_SCHEMA_VERSION);
+      std::abort();
+    }
 
-  int32_t schemaVersion = 0;
-  if (!jsonFindInt(json, "fnacc_schema_version", schemaVersion)) {
-    std::fprintf(
-        stderr, "FNACC error: kernel JSON is missing fnacc_schema_version\n");
-    std::abort();
+    auto kernels = fnaccParseKernelDescsFromJson(json);
+    for (auto &entry : kernels) {
+      FNACCKernelDesc &desc = entry.second;
+      desc.ptxIndex += imageBase;
+      for (const auto &existing : fnaccRegistry.kernels) {
+        if (existing.first == desc.id || existing.second.name == desc.name) {
+          std::fprintf(stderr,
+              "FNACC error: embedded bundles contain colliding kernel "
+              "identity id=%d name='%s'\n",
+              desc.id, desc.name.c_str());
+          std::abort();
+        }
+      }
+      fnaccRegistry.kernels.emplace(entry.first, std::move(desc));
+    }
+  };
+
+  const char *jsonOverride = std::getenv("FNACC_KERNELS_JSON");
+  bool useEmbeddedBundles =
+      (!jsonOverride || jsonOverride[0] == '\0') && fnaccHasEmbeddedBundles();
+  if (useEmbeddedBundles) {
+    int32_t imageBase = 0;
+    for (const FNACCEmbeddedKernelBundle &bundle :
+        fnaccGetEmbeddedKernelBundles()) {
+      parseOneJson(std::string(bundle.jsonData, bundle.jsonSize), imageBase);
+      imageBase += static_cast<int32_t>(bundle.imageData.size());
+    }
+  } else {
+    parseOneJson(fnaccGetJsonText(), 0);
   }
-
-  if (schemaVersion != FNACC_SUPPORTED_SCHEMA_VERSION) {
-    std::fprintf(stderr,
-        "FNACC error: unsupported kernel JSON schema version %d; "
-        "runtime supports version %d\n",
-        schemaVersion, FNACC_SUPPORTED_SCHEMA_VERSION);
-    std::abort();
-  }
-
-  fnaccRegistry.kernels = fnaccParseKernelDescsFromJson(json);
 
   fnaccRegistry.ptxTexts = fnaccGetPtxTexts(fnaccRegistry.kernels);
 
@@ -2554,6 +2596,271 @@ extern "C" void __fnacc_launch_nd_f32(int32_t kernelId, int32_t rank,
   FNACC_CUDA_CHECK(cuMemFree(dA));
   FNACC_CUDA_CHECK(cuMemFree(dB));
   FNACC_CUDA_CHECK(cuMemFree(dC));
+}
+
+// -------------------------------------------------------------------------- //
+// Public runtime ABI v2: variadic descriptor-aware stencil launches
+// -------------------------------------------------------------------------- //
+
+struct FNACCPendingArrayV2 {
+  void *host = nullptr;
+  std::size_t bytes = 0;
+  int32_t flags = 0;
+  int64_t lower[3] = {1, 1, 1};
+  int64_t stride[3] = {1, 0, 0};
+  bool bound = false;
+};
+
+struct FNACCPendingScalarV2 {
+  alignas(8) uint64_t storage = 0;
+  std::size_t bytes = 0;
+  bool bound = false;
+};
+
+struct FNACCPendingLaunchV2 {
+  bool active = false;
+  CUcontext context = nullptr;
+  int32_t kernelId = -1;
+  int32_t rank = 0;
+  int32_t block[3] = {1, 1, 1};
+  int32_t extent[3] = {1, 1, 1};
+  int32_t loopLower[3] = {1, 1, 1};
+  std::vector<FNACCPendingArrayV2> arrays;
+  std::vector<FNACCPendingScalarV2> scalars;
+};
+
+static thread_local FNACCPendingLaunchV2 fnaccPendingLaunchV2;
+
+static void fnaccClearPendingLaunchV2() {
+  fnaccPendingLaunchV2 = FNACCPendingLaunchV2{};
+}
+
+extern "C" void __fnacc_begin_launch_v2(int32_t kernelId, int32_t rank,
+    int32_t blockX, int32_t blockY, int32_t blockZ, int32_t extentX,
+    int32_t extentY, int32_t extentZ, int32_t loopLowerX, int32_t loopLowerY,
+    int32_t loopLowerZ, int32_t arrayCount, int32_t scalarCount) {
+  FNACC_RUNTIME_GUARD();
+  FNACCCurrentContextGuard contextGuard;
+  fnaccEnsureCurrentContext();
+
+  if (fnaccPendingLaunchV2.active) {
+    std::fprintf(stderr,
+        "FNACC error: nested or incomplete v2 launch on the same host "
+        "thread\n");
+    std::abort();
+  }
+
+  const FNACCKernelDesc *desc = fnaccLookupKernelDesc(kernelId);
+  if (!desc || desc->kind != "stencil2d" || desc->launchAbiVersion != 2) {
+    std::fprintf(stderr,
+        "FNACC error: kernel id %d is not a stencil2d v2 kernel\n", kernelId);
+    std::abort();
+  }
+  if (rank != 2 || arrayCount != desc->arrayCount ||
+      scalarCount != desc->scalarCount || arrayCount <= 0 || scalarCount < 0) {
+    std::fprintf(stderr,
+        "FNACC error: v2 launch ABI count/rank mismatch for kernel id %d\n",
+        kernelId);
+    std::abort();
+  }
+  fnaccValidateHostLaunchAgainstDesc(kernelId, rank, blockX, blockY, blockZ);
+
+  FNACCPendingLaunchV2 &pending = fnaccPendingLaunchV2;
+  pending.active = true;
+  pending.context = fnaccRegistry.activeContext;
+  pending.kernelId = kernelId;
+  pending.rank = rank;
+  pending.block[0] = blockX;
+  pending.block[1] = blockY;
+  pending.block[2] = blockZ;
+  pending.extent[0] = extentX;
+  pending.extent[1] = extentY;
+  pending.extent[2] = extentZ;
+  pending.loopLower[0] = loopLowerX;
+  pending.loopLower[1] = loopLowerY;
+  pending.loopLower[2] = loopLowerZ;
+  pending.arrays.resize(static_cast<std::size_t>(arrayCount));
+  pending.scalars.resize(static_cast<std::size_t>(scalarCount));
+}
+
+extern "C" void __fnacc_bind_array_v2(int32_t slot, void *host, int64_t bytes,
+    int32_t flags, int64_t lowerX, int64_t lowerY, int64_t lowerZ,
+    int64_t strideX, int64_t strideY, int64_t strideZ) {
+  FNACC_RUNTIME_GUARD();
+  if (!fnaccPendingLaunchV2.active || slot < 0 ||
+      static_cast<std::size_t>(slot) >= fnaccPendingLaunchV2.arrays.size() ||
+      !host || bytes <= 0 || (flags & 3) == 0 || (flags & ~3) != 0) {
+    std::fprintf(stderr, "FNACC error: invalid v2 array binding\n");
+    std::abort();
+  }
+
+  FNACCPendingArrayV2 &array = fnaccPendingLaunchV2.arrays[slot];
+  if (array.bound) {
+    std::fprintf(stderr, "FNACC error: v2 array slot %d bound twice\n", slot);
+    std::abort();
+  }
+  array.host = host;
+  array.bytes = static_cast<std::size_t>(bytes);
+  array.flags = flags;
+  array.lower[0] = lowerX;
+  array.lower[1] = lowerY;
+  array.lower[2] = lowerZ;
+  array.stride[0] = strideX;
+  array.stride[1] = strideY;
+  array.stride[2] = strideZ;
+  array.bound = true;
+}
+
+template <typename T> static void fnaccBindScalarV2(int32_t slot, T value) {
+  FNACC_RUNTIME_GUARD();
+  if (!fnaccPendingLaunchV2.active || slot < 0 ||
+      static_cast<std::size_t>(slot) >= fnaccPendingLaunchV2.scalars.size()) {
+    std::fprintf(stderr, "FNACC error: invalid v2 scalar binding\n");
+    std::abort();
+  }
+  FNACCPendingScalarV2 &scalar = fnaccPendingLaunchV2.scalars[slot];
+  if (scalar.bound) {
+    std::fprintf(stderr, "FNACC error: v2 scalar slot %d bound twice\n", slot);
+    std::abort();
+  }
+  static_assert(sizeof(T) <= sizeof(scalar.storage));
+  std::memcpy(&scalar.storage, &value, sizeof(T));
+  scalar.bytes = sizeof(T);
+  scalar.bound = true;
+}
+
+#define FNACC_DEFINE_SCALAR_BINDER(SUFFIX, TYPE) \
+  extern "C" void __fnacc_bind_scalar_##SUFFIX##_v2( \
+      int32_t slot, TYPE value) { \
+    fnaccBindScalarV2<TYPE>(slot, value); \
+  }
+
+FNACC_DEFINE_SCALAR_BINDER(i8, int8_t)
+FNACC_DEFINE_SCALAR_BINDER(i16, int16_t)
+FNACC_DEFINE_SCALAR_BINDER(i32, int32_t)
+FNACC_DEFINE_SCALAR_BINDER(i64, int64_t)
+FNACC_DEFINE_SCALAR_BINDER(f32, float)
+FNACC_DEFINE_SCALAR_BINDER(f64, double)
+
+#undef FNACC_DEFINE_SCALAR_BINDER
+
+static int32_t fnaccCheckedI32Layout(int64_t value, const char *what) {
+  if (value < std::numeric_limits<int32_t>::min() ||
+      value > std::numeric_limits<int32_t>::max()) {
+    std::fprintf(
+        stderr, "FNACC error: %s does not fit the device i32 ABI\n", what);
+    std::abort();
+  }
+  return static_cast<int32_t>(value);
+}
+
+extern "C" void __fnacc_commit_launch_v2() {
+  FNACC_RUNTIME_GUARD();
+  FNACCCurrentContextGuard contextGuard;
+  fnaccEnsureCurrentContext();
+
+  FNACCPendingLaunchV2 &pending = fnaccPendingLaunchV2;
+  if (!pending.active || pending.context != fnaccRegistry.activeContext) {
+    std::fprintf(stderr,
+        "FNACC error: v2 launch committed without its original CUDA "
+        "context\n");
+    std::abort();
+  }
+  for (const FNACCPendingArrayV2 &array : pending.arrays)
+    if (!array.bound) {
+      std::fprintf(stderr, "FNACC error: incomplete v2 array bindings\n");
+      std::abort();
+    }
+  for (const FNACCPendingScalarV2 &scalar : pending.scalars)
+    if (!scalar.bound) {
+      std::fprintf(stderr, "FNACC error: incomplete v2 scalar bindings\n");
+      std::abort();
+    }
+
+  if (pending.extent[0] <= 0 || pending.extent[1] <= 0) {
+    fnaccClearPendingLaunchV2();
+    return;
+  }
+
+  const FNACCKernelDesc *desc = fnaccLookupKernelDesc(pending.kernelId);
+  CUfunction function = getKernelFunction(pending.kernelId);
+  unsigned cudaBlockX = fnaccCudaThreadsPerCTA(pending.kernelId);
+  fnaccValidateCudaBlockSize(function, pending.kernelId, cudaBlockX);
+  fnaccValidateSupportedHiddenPtrArgCount(pending.kernelId);
+
+  std::vector<FNACCDeviceArg> deviceArgs;
+  std::vector<CUdeviceptr> devicePointers;
+  deviceArgs.reserve(pending.arrays.size());
+  devicePointers.reserve(pending.arrays.size());
+  for (std::size_t slot = 0; slot < pending.arrays.size(); ++slot) {
+    FNACCPendingArrayV2 &array = pending.arrays[slot];
+    int32_t target = fnaccEffectivePackTargetForSlot(
+        desc, static_cast<int32_t>(slot), array.host);
+    FNACCDeviceArg device = (array.flags & 1)
+        ? fnaccPrepareReadBuffer(
+              array.host, array.bytes, target, static_cast<int32_t>(slot))
+        : fnaccPrepareWriteBuffer(
+              array.host, array.bytes, target, static_cast<int32_t>(slot));
+    devicePointers.push_back(device.ptr);
+    deviceArgs.push_back(device);
+  }
+
+  std::vector<int32_t> layoutValues;
+  layoutValues.reserve(pending.arrays.size() * 4);
+  for (const FNACCPendingArrayV2 &array : pending.arrays) {
+    layoutValues.push_back(
+        fnaccCheckedI32Layout(array.lower[0], "array lower bound X"));
+    layoutValues.push_back(
+        fnaccCheckedI32Layout(array.lower[1], "array lower bound Y"));
+    layoutValues.push_back(
+        fnaccCheckedI32Layout(array.stride[0], "array stride X"));
+    layoutValues.push_back(
+        fnaccCheckedI32Layout(array.stride[1], "array stride Y"));
+  }
+
+  std::vector<void *> arguments;
+  arguments.reserve(devicePointers.size() + pending.scalars.size() + 6 +
+      layoutValues.size() + 2);
+  for (CUdeviceptr &pointer : devicePointers)
+    arguments.push_back(&pointer);
+  for (FNACCPendingScalarV2 &scalar : pending.scalars)
+    arguments.push_back(&scalar.storage);
+  arguments.push_back(&pending.extent[0]);
+  arguments.push_back(&pending.extent[1]);
+  arguments.push_back(&pending.loopLower[0]);
+  arguments.push_back(&pending.loopLower[1]);
+  for (int32_t &value : layoutValues)
+    arguments.push_back(&value);
+  FNACCHiddenTritonArgs hidden;
+  arguments.push_back(&hidden.hidden0);
+  arguments.push_back(&hidden.hidden1);
+
+  unsigned gridX =
+      fnaccCdiv(pending.extent[0], pending.block[0], "v2 grid dimension X");
+  unsigned gridY =
+      fnaccCdiv(pending.extent[1], pending.block[1], "v2 grid dimension Y");
+  if (fnaccDebugEnabled()) {
+    std::fprintf(stderr,
+        "FNACC: launch stencil2d v2 kernel id=%d arrays=%zu scalars=%zu "
+        "grid=(%u,%u,1) extent=(%d,%d) lower=(%d,%d)\n",
+        pending.kernelId, pending.arrays.size(), pending.scalars.size(), gridX,
+        gridY, pending.extent[0], pending.extent[1], pending.loopLower[0],
+        pending.loopLower[1]);
+  }
+
+  FNACC_CUDA_CHECK(cuLaunchKernel(function, gridX, gridY, 1, cudaBlockX, 1, 1,
+      0, fnaccActiveContextState().stream, arguments.data(), nullptr));
+  fnaccWaitForRuntimeStream();
+
+  for (std::size_t slot = 0; slot < pending.arrays.size(); ++slot) {
+    FNACCPendingArrayV2 &array = pending.arrays[slot];
+    if ((array.flags & 2) && deviceArgs[slot].target == FNACC_PACK_TARGET_HOST)
+      fnaccCopyBackWriteBuffer(array.host, deviceArgs[slot], array.bytes);
+  }
+  for (const FNACCDeviceArg &device : deviceArgs)
+    fnaccReleaseDeviceArg(device);
+
+  fnaccClearPendingLaunchV2();
 }
 
 // -------------------------------------------------------------------------- //
@@ -4409,13 +4716,6 @@ extern "C" void __fnacc_release_all() {
 static void fnaccRegisterEmbeddedDeviceBundle(const void *const *imageData,
     const std::size_t *imageSizes, const int32_t *imageKinds,
     std::size_t imageCount, const char *jsonData, std::size_t jsonSize) {
-  FNACCEmbeddedKernelBundle &bundle = fnaccGetEmbeddedKernelBundle();
-  if (bundle.registered) {
-    std::fprintf(stderr,
-        "FNACC error: multiple embedded kernel bundles were registered. "
-        "Compile all FNACC kernels as one bundle so kernel IDs stay unique.\n");
-    std::abort();
-  }
   if (!imageData || !imageSizes || !imageKinds || imageCount == 0 ||
       !jsonData || jsonSize == 0) {
     std::fprintf(stderr, "FNACC error: invalid embedded kernel bundle\n");
@@ -4431,12 +4731,13 @@ static void fnaccRegisterEmbeddedDeviceBundle(const void *const *imageData,
     }
   }
 
+  FNACCEmbeddedKernelBundle bundle;
   bundle.imageData.assign(imageData, imageData + imageCount);
   bundle.imageSize.assign(imageSizes, imageSizes + imageCount);
   bundle.imageKind.assign(imageKinds, imageKinds + imageCount);
   bundle.jsonData = jsonData;
   bundle.jsonSize = jsonSize;
-  bundle.registered = true;
+  fnaccGetEmbeddedKernelBundles().push_back(std::move(bundle));
 }
 
 extern "C" void __fnacc_register_embedded_device_bundle(

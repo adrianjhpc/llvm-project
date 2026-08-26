@@ -99,6 +99,26 @@ static StringRef getReductionRuntimeName(fir::fnacc::ElementType type) {
   llvm_unreachable("unhandled FNACC reduction element type");
 }
 
+static StringRef getScalarBindRuntimeName(fir::fnacc::ElementType type) {
+  switch (type) {
+  case fir::fnacc::ElementType::I8:
+    return "__fnacc_bind_scalar_i8_v2";
+  case fir::fnacc::ElementType::I16:
+    return "__fnacc_bind_scalar_i16_v2";
+  case fir::fnacc::ElementType::I32:
+    return "__fnacc_bind_scalar_i32_v2";
+  case fir::fnacc::ElementType::I64:
+    return "__fnacc_bind_scalar_i64_v2";
+  case fir::fnacc::ElementType::F32:
+    return "__fnacc_bind_scalar_f32_v2";
+  case fir::fnacc::ElementType::F64:
+    return "__fnacc_bind_scalar_f64_v2";
+  case fir::fnacc::ElementType::Unknown:
+    llvm_unreachable("unknown FNACC scalar element type");
+  }
+  llvm_unreachable("unhandled FNACC scalar element type");
+}
+
 static Value createZeroElement(OpBuilder &builder, Location loc, Type type) {
   if (auto integerType = dyn_cast<IntegerType>(type))
     return arith::ConstantOp::create(builder, loc, type,
@@ -320,6 +340,10 @@ materializeExtentValue(OpBuilder &builder, Location loc,
   using Kind = fir::fnacc::ElementwiseExtentSourceKind;
 
   switch (source.kind) {
+  case Kind::ConstantInteger:
+    return constantI32(builder, loc,
+                       static_cast<int32_t>(source.constantValue));
+
   case Kind::LoadIntegerRef: {
     if (isDefinedInsideLaunch(launchOp, source.value)) {
       launchOp.emitError(
@@ -343,6 +367,17 @@ materializeExtentValue(OpBuilder &builder, Location loc,
 
     Value extent = dims.getExtent();
     return convertToI32(builder, loc, extent);
+  }
+
+  case Kind::BoxLowerBound: {
+    if (isDefinedInsideLaunch(launchOp, source.value)) {
+      launchOp.emitError(
+          "FNACC array lower-bound descriptor is defined inside launch");
+      return {};
+    }
+    Value dim = arith::ConstantIndexOp::create(builder, loc, source.dim);
+    auto dims = fir::BoxDimsOp::create(builder, loc, source.value, dim);
+    return convertToI32(builder, loc, dims.getLowerBound());
   }
 
   case Kind::Value:
@@ -376,6 +411,22 @@ materializeExtentValue(OpBuilder &builder, Location loc,
   }
 
   llvm_unreachable("unhandled FNACC extent source");
+}
+
+static Value
+materializeTripExtent(OpBuilder &builder, Location loc,
+                      fir::fnacc::LaunchOp launchOp,
+                      const fir::fnacc::ElementwiseExtentSource &upper,
+                      const fir::fnacc::ElementwiseExtentSource &lower) {
+  Value upperValue = materializeExtentValue(builder, loc, launchOp, upper);
+  Value lowerValue = materializeExtentValue(builder, loc, launchOp, lower);
+  if (!upperValue || !lowerValue)
+    return {};
+
+  Value difference =
+      arith::SubIOp::create(builder, loc, upperValue, lowerValue);
+  return arith::AddIOp::create(builder, loc, difference,
+                               constantI32(builder, loc, 1));
 }
 
 static std::optional<int64_t> getElementByteSize(Type elementType) {
@@ -654,6 +705,130 @@ tryCreateStaticSequenceExtents(OpBuilder &builder, Location loc,
   }
 
   return extents;
+}
+
+static std::optional<llvm::SmallVector<Value, 3>>
+tryGetLowerBoundsFromShapeValue(OpBuilder &builder, Location loc,
+                                Value shapeValue) {
+  if (!shapeValue)
+    return std::nullopt;
+  shapeValue = stripFirConvert(shapeValue);
+
+  llvm::SmallVector<Value, 3> lowerBounds;
+  if (auto shapeOp = shapeValue.getDefiningOp<fir::ShapeOp>()) {
+    for (unsigned dim = 0; dim < shapeOp.getExtents().size(); ++dim)
+      lowerBounds.push_back(constantI64(builder, loc, 1));
+    return lowerBounds;
+  }
+
+  if (auto shapeShiftOp = shapeValue.getDefiningOp<fir::ShapeShiftOp>()) {
+    for (Value origin : shapeShiftOp.getOrigins())
+      lowerBounds.push_back(convertToI64(builder, loc, origin));
+    return lowerBounds;
+  }
+
+  return std::nullopt;
+}
+
+struct FNACCLaunchArrayArgs {
+  Value pointer;
+  Value bytes;
+  llvm::SmallVector<Value, 3> lowerBounds;
+  llvm::SmallVector<Value, 3> elementStrides;
+};
+
+static std::optional<FNACCLaunchArrayArgs>
+tryCreateLaunchArrayArgs(OpBuilder &builder, Location loc,
+                         fir::fnacc::LaunchOp launchOp, Value arrayLike,
+                         fir::fnacc::ElementType elementType) {
+  std::optional<Value> runtimeVisible =
+      getRuntimeVisibleArrayLike(launchOp, arrayLike);
+  if (!runtimeVisible)
+    return std::nullopt;
+
+  std::optional<int64_t> elementBytes =
+      getElementByteSize(getMLIRElementType(builder, elementType));
+  if (!elementBytes)
+    return std::nullopt;
+
+  FNACCLaunchArrayArgs args;
+  Value elementPointer =
+      getRuntimeElementPointer(builder, loc, launchOp, arrayLike, elementType);
+  if (!elementPointer)
+    return std::nullopt;
+  args.pointer = convertToOpaqueRuntimePtr(builder, loc, elementPointer);
+
+  if (getBoxTypeFromBoxLike(runtimeVisible->getType())) {
+    Value boxValue = loadBoxIfNeeded(builder, loc, *runtimeVisible);
+    auto boxTy = cast<fir::BoxType>(boxValue.getType());
+    Type storageType = boxTy.getEleTy();
+    while (auto heapTy = dyn_cast<fir::HeapType>(storageType))
+      storageType = heapTy.getEleTy();
+    while (auto pointerTy = dyn_cast<fir::PointerType>(storageType))
+      storageType = pointerTy.getEleTy();
+    auto sequenceType = dyn_cast<fir::SequenceType>(storageType);
+    if (!sequenceType || sequenceType.getDimension() < 1 ||
+        sequenceType.getDimension() > 3)
+      return std::nullopt;
+
+    Value bytes = constantI64(builder, loc, *elementBytes);
+    for (unsigned dim = 0; dim < sequenceType.getDimension(); ++dim) {
+      Value dimValue = arith::ConstantIndexOp::create(builder, loc, dim);
+      auto dimensions =
+          fir::BoxDimsOp::create(builder, loc, boxValue, dimValue);
+      Value extent = convertToI64(builder, loc, dimensions.getExtent());
+      Value byteStride = convertToI64(builder, loc, dimensions.getByteStride());
+      args.lowerBounds.push_back(
+          convertToI64(builder, loc, dimensions.getLowerBound()));
+      args.elementStrides.push_back(arith::DivSIOp::create(
+          builder, loc, byteStride, constantI64(builder, loc, *elementBytes)));
+      bytes = arith::MulIOp::create(builder, loc, bytes, extent);
+    }
+    args.bytes = bytes;
+    return args;
+  }
+
+  Value value = stripFirConvert(*runtimeVisible);
+  Value baseAddress = value;
+  Value shape;
+  if (auto declareOp = value.getDefiningOp<fir::DeclareOp>()) {
+    baseAddress = declareOp.getMemref();
+    shape = declareOp.getShape();
+  }
+
+  std::optional<Type> objectType = getReferencedObjectType(baseAddress);
+  auto sequenceType = objectType ? dyn_cast<fir::SequenceType>(*objectType)
+                                 : fir::SequenceType{};
+  if (!sequenceType || sequenceType.getDimension() < 1 ||
+      sequenceType.getDimension() > 3)
+    return std::nullopt;
+
+  std::optional<llvm::SmallVector<Value, 3>> extents =
+      tryGetExtentsFromShapeValue(shape);
+  if (!extents)
+    extents = tryCreateStaticSequenceExtents(builder, loc, sequenceType);
+  if (!extents || extents->size() != sequenceType.getDimension())
+    return std::nullopt;
+
+  std::optional<llvm::SmallVector<Value, 3>> lowerBounds =
+      tryGetLowerBoundsFromShapeValue(builder, loc, shape);
+  if (!lowerBounds) {
+    llvm::SmallVector<Value, 3> ones(sequenceType.getDimension(),
+                                     constantI64(builder, loc, 1));
+    lowerBounds = std::move(ones);
+  }
+  args.lowerBounds = *lowerBounds;
+
+  Value stride = constantI64(builder, loc, 1);
+  Value bytes = constantI64(builder, loc, *elementBytes);
+  for (Value extent : *extents) {
+    Value extentI64 = convertToI64(builder, loc, extent);
+    args.elementStrides.push_back(stride);
+    stride = arith::MulIOp::create(builder, loc, stride, extentI64);
+    bytes = arith::MulIOp::create(builder, loc, bytes, extentI64);
+  }
+  args.bytes = bytes;
+  return args;
 }
 
 static std::optional<FNACCByteSizedArgs>
@@ -958,9 +1133,14 @@ struct FNACCLowerToRuntimePass
       // contiguous storage. Preserve box strides long enough to reject a
       // non-contiguous assumed-shape actual argument before its base pointer
       // is passed to the CUDA runtime.
-      for (Value readArray : k.readArrays)
-        validateContiguousBoxForLaunch(module, builder, loc, readArray);
-      validateContiguousBoxForLaunch(module, builder, loc, k.writeArray);
+      if (k.kind == fir::fnacc::ElementwiseKernelKind::Stencil2D) {
+        for (const auto &array : k.arrayArguments)
+          validateContiguousBoxForLaunch(module, builder, loc, array.array);
+      } else {
+        for (Value readArray : k.readArrays)
+          validateContiguousBoxForLaunch(module, builder, loc, readArray);
+        validateContiguousBoxForLaunch(module, builder, loc, k.writeArray);
+      }
 
       int32_t stableKernelId = getKernelId(launchOp, fallbackKernelId);
 
@@ -978,13 +1158,20 @@ struct FNACCLowerToRuntimePass
       Value blockZValue =
           arith::ConstantIntOp::create(builder, loc, blockShape.z, 32);
 
+      bool isStencil2D = k.kind == fir::fnacc::ElementwiseKernelKind::Stencil2D;
       Value extentXValue =
-          materializeExtentValue(builder, loc, launchOp, k.extentX);
+          isStencil2D
+              ? materializeTripExtent(builder, loc, launchOp, k.extentX,
+                                      k.loopLowerX)
+              : materializeExtentValue(builder, loc, launchOp, k.extentX);
 
       Value extentYValue;
       if (k.rank == 2) {
         extentYValue =
-            materializeExtentValue(builder, loc, launchOp, k.extentY);
+            isStencil2D
+                ? materializeTripExtent(builder, loc, launchOp, k.extentY,
+                                        k.loopLowerY)
+                : materializeExtentValue(builder, loc, launchOp, k.extentY);
       } else {
         extentYValue = arith::ConstantIntOp::create(builder, loc, 1, 32);
       }
@@ -998,6 +1185,21 @@ struct FNACCLowerToRuntimePass
       }
 
       if (!extentXValue || !extentYValue || !extentZValue) {
+        signalPassFailure();
+        return;
+      }
+
+      Value loopLowerXValue =
+          isStencil2D
+              ? materializeExtentValue(builder, loc, launchOp, k.loopLowerX)
+              : constantI32(builder, loc, 1);
+      Value loopLowerYValue =
+          isStencil2D
+              ? materializeExtentValue(builder, loc, launchOp, k.loopLowerY)
+              : constantI32(builder, loc, 1);
+      Value loopLowerZValue = constantI32(builder, loc, 1);
+
+      if (!loopLowerXValue || !loopLowerYValue) {
         signalPassFailure();
         return;
       }
@@ -1073,6 +1275,67 @@ struct FNACCLowerToRuntimePass
 
         launchOp.erase();
 
+        ++fallbackKernelId;
+        continue;
+      }
+
+      if (isStencil2D) {
+        llvm::SmallVector<Value> beginOperands{
+            kernelIdValue,
+            rankValue,
+            blockXValue,
+            blockYValue,
+            blockZValue,
+            extentXValue,
+            extentYValue,
+            extentZValue,
+            loopLowerXValue,
+            loopLowerYValue,
+            loopLowerZValue,
+            constantI32(builder, loc, k.arrayArguments.size()),
+            constantI32(builder, loc, k.scalarRefs.size())};
+        createRuntimeCall(module, builder, loc, "__fnacc_begin_launch_v2",
+                          beginOperands);
+
+        for (auto [index, array] : llvm::enumerate(k.arrayArguments)) {
+          auto layout = tryCreateLaunchArrayArgs(builder, loc, launchOp,
+                                                 array.array, k.elementType);
+          if (!layout || layout->lowerBounds.size() < 2 ||
+              layout->elementStrides.size() < 2) {
+            launchOp.emitError(
+                "FNACC stencil array requires a contiguous rank-2 explicit "
+                "shape or descriptor-backed layout");
+            signalPassFailure();
+            return;
+          }
+
+          int32_t flags = (array.read ? 1 : 0) | (array.write ? 2 : 0);
+          llvm::SmallVector<Value> bindOperands{
+              constantI32(builder, loc, index),
+              layout->pointer,
+              layout->bytes,
+              constantI32(builder, loc, flags),
+              layout->lowerBounds[0],
+              layout->lowerBounds[1],
+              constantI64(builder, loc, 1),
+              layout->elementStrides[0],
+              layout->elementStrides[1],
+              constantI64(builder, loc, 0)};
+          createRuntimeCall(module, builder, loc, "__fnacc_bind_array_v2",
+                            bindOperands);
+        }
+
+        StringRef scalarBindName = getScalarBindRuntimeName(k.elementType);
+        for (auto [index, scalarRef] : llvm::enumerate(k.scalarRefs)) {
+          Value scalarValue = fir::LoadOp::create(builder, loc, scalarRef);
+          createRuntimeCall(
+              module, builder, loc, scalarBindName,
+              ValueRange{constantI32(builder, loc, index), scalarValue});
+        }
+
+        createRuntimeCall(module, builder, loc, "__fnacc_commit_launch_v2",
+                          ValueRange{});
+        launchOp.erase();
         ++fallbackKernelId;
         continue;
       }

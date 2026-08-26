@@ -248,6 +248,35 @@ getLoopExtentSource(fir::DoLoopOp loop) {
   return source;
 }
 
+static fir::fnacc::ElementwiseExtentSource getIntegerSource(Value value) {
+  value = stripFirConvert(value);
+
+  llvm::APInt constant;
+  if (matchPattern(value, m_ConstantInt(&constant)) &&
+      constant.getBitWidth() <= 64) {
+    ElementwiseExtentSource source;
+    source.kind = ElementwiseExtentSourceKind::ConstantInteger;
+    source.constantValue = constant.getSExtValue();
+    return source;
+  }
+
+  if (auto ref = getIntegerRefFromLoadLike(value)) {
+    ElementwiseExtentSource source;
+    source.kind = ElementwiseExtentSourceKind::LoadIntegerRef;
+    source.value = *ref;
+    return source;
+  }
+
+  ElementwiseExtentSource source;
+  source.kind = ElementwiseExtentSourceKind::Value;
+  source.value = value;
+  return source;
+}
+
+static ElementwiseExtentSource getLoopLowerSource(fir::DoLoopOp loop) {
+  return getIntegerSource(loop.getLowerBound());
+}
+
 static bool isAcceptedStructuralOperation(Operation *op) {
   return isa<fir::ResultOp, fir::fnacc::TerminatorOp, arith::ConstantOp,
              arith::ConstantIndexOp, fir::ShapeOp, fir::ShapeShiftOp>(op);
@@ -255,6 +284,19 @@ static bool isAcceptedStructuralOperation(Operation *op) {
 
 static bool sameValueAfterFirConvert(Value lhs, Value rhs) {
   return lhs && rhs && stripFirConvert(lhs) == stripFirConvert(rhs);
+}
+
+static bool scalarReferenceIsUsedAfterLaunch(Value reference,
+                                             fir::fnacc::LaunchOp launchOp);
+
+static Value getScalarStorageRoot(Value value) {
+  while (true) {
+    value = stripFirConvert(value);
+    auto declareOp = value.getDefiningOp<fir::DeclareOp>();
+    if (!declareOp)
+      return value;
+    value = declareOp.getMemref();
+  }
 }
 
 static bool isRecognizedKernelStore(const ElementwiseKernel &kernel,
@@ -272,7 +314,46 @@ static bool isRecognizedKernelStore(const ElementwiseKernel &kernel,
     return true;
 
   auto arrayCoor = memref.getDefiningOp<fir::ArrayCoorOp>();
-  return arrayCoor && sameArrayBase(arrayCoor.getMemref(), kernel.writeArray);
+  if (!arrayCoor) {
+    // An iteration-local temporary which is assigned but never read has no
+    // observable value after the parallel loop. CloverLeaf contains a few of
+    // these source-level diagnostics temporaries (for example
+    // min_cell_volume). Do not turn such dead stores into shared kernel
+    // state, but permit host lowering to erase them.
+    auto refTy = dyn_cast<fir::ReferenceType>(memref.getType());
+    Type elementType = refTy ? refTy.getEleTy() : Type{};
+    bool supportedScalar =
+        elementType && (elementType.isF32() || elementType.isF64() ||
+                        elementType.isInteger(8) || elementType.isInteger(16) ||
+                        elementType.isInteger(32) || elementType.isInteger(64));
+    if (supportedScalar) {
+      // Only an alloca-backed compiler temporary may be discarded as a dead
+      // iteration-private value. A dummy argument, global, or other
+      // host-visible scalar is an observable kernel output even when this
+      // launch does not load it. In particular, do not accept an arbitrary
+      // side-effecting scalar store merely because the reference has no load
+      // users.
+      Value storageRoot = getScalarStorageRoot(memref);
+      if (!storageRoot.getDefiningOp<fir::AllocaOp>())
+        return false;
+
+      bool hasLoad = llvm::any_of(memref.getUsers(), [](Operation *user) {
+        return isa<fir::LoadOp>(user);
+      });
+      auto launchOp = store->getParentOfType<fir::fnacc::LaunchOp>();
+      return launchOp && !hasLoad &&
+             !scalarReferenceIsUsedAfterLaunch(memref, launchOp) &&
+             !scalarReferenceIsUsedAfterLaunch(storageRoot, launchOp);
+    }
+    return false;
+  }
+
+  if (sameArrayBase(arrayCoor.getMemref(), kernel.writeArray))
+    return true;
+
+  return llvm::any_of(kernel.writeArrays, [&](Value array) {
+    return sameArrayBase(arrayCoor.getMemref(), array);
+  });
 }
 
 static Operation *findDiscardedSideEffect(fir::fnacc::LaunchOp launchOp,
@@ -340,24 +421,8 @@ static bool isConstantIntegerValue(Value v, int64_t expected) {
   return intValue.getSExtValue() == expected;
 }
 
-/// For now FNACC only supports canonical Fortran loops:
-///
-///   do i = 1, n
-///
-/// That corresponds to:
-///
-///   lower bound = constant 1
-///   step        = constant 1
-///
-/// The generated Triton coordinates are zero-based offsets, so supporting
-/// arbitrary lower bounds requires additional offset correction.
 static bool verifyLoopLowerBoundAndStep(fir::DoLoopOp loop, StringRef loopName,
                                         std::string &reason) {
-  if (!isConstantIntegerValue(loop.getLowerBound(), 1)) {
-    reason = loopName.str() + " loop lower bound must be constant 1";
-    return false;
-  }
-
   if (!isConstantIntegerValue(loop.getStep(), 1)) {
     reason = loopName.str() + " loop step must be constant 1";
     return false;
@@ -420,6 +485,47 @@ static bool indexIsLoadOf(Value v, Value expectedMemref) {
 
     return false;
   }
+}
+
+static std::optional<int64_t> getIndexConstant(Value value) {
+  value = stripFirConvert(value);
+  llvm::APInt constant;
+  if (!matchPattern(value, m_ConstantInt(&constant)) ||
+      constant.getBitWidth() > 64)
+    return std::nullopt;
+  return constant.getSExtValue();
+}
+
+/// Match `induction + constant` after FIR converts. Fortran subscripts such as
+/// j, j+1 and k-2 all reach this helper. Products or cross-dimensional index
+/// expressions are intentionally rejected.
+static std::optional<int64_t> matchAffineIndex(Value value,
+                                               Value inductionMemref) {
+  value = stripFirConvert(value);
+
+  if (auto load = value.getDefiningOp<fir::LoadOp>())
+    return load.getMemref() == inductionMemref ? std::optional<int64_t>(0)
+                                               : std::nullopt;
+
+  if (auto add = value.getDefiningOp<arith::AddIOp>()) {
+    if (auto constant = getIndexConstant(add.getRhs())) {
+      if (auto base = matchAffineIndex(add.getLhs(), inductionMemref))
+        return *base + *constant;
+    }
+    if (auto constant = getIndexConstant(add.getLhs())) {
+      if (auto base = matchAffineIndex(add.getRhs(), inductionMemref))
+        return *base + *constant;
+    }
+  }
+
+  if (auto sub = value.getDefiningOp<arith::SubIOp>()) {
+    if (auto constant = getIndexConstant(sub.getRhs())) {
+      if (auto base = matchAffineIndex(sub.getLhs(), inductionMemref))
+        return *base - *constant;
+    }
+  }
+
+  return std::nullopt;
 }
 
 static fir::fnacc::ElementType getSupportedElementType(Type type) {
@@ -611,12 +717,16 @@ static fir::fnacc::ElementType getArrayElementType(Value v) {
 
 static bool inferAndCheckElementType(ElementwiseKernel &k,
                                      std::string &reason) {
-  if (!k.writeArray) {
+  Value representativeWrite = k.writeArray;
+  if (!representativeWrite && !k.writeArrays.empty())
+    representativeWrite = k.writeArrays.front();
+
+  if (!representativeWrite) {
     reason = "kernel has no write array";
     return false;
   }
 
-  fir::fnacc::ElementType type = getArrayElementType(k.writeArray);
+  fir::fnacc::ElementType type = getArrayElementType(representativeWrite);
   if (type == fir::fnacc::ElementType::Unknown) {
     reason = "write array must be integer(1/2/4/8) or real(4/8)";
     return false;
@@ -625,6 +735,13 @@ static bool inferAndCheckElementType(ElementwiseKernel &k,
   for (Value read : k.readArrays) {
     fir::fnacc::ElementType readType = getArrayElementType(read);
     if (readType != type) {
+      reason = "all read/write arrays must have the same element type";
+      return false;
+    }
+  }
+
+  for (Value write : k.writeArrays) {
+    if (getArrayElementType(write) != type) {
       reason = "all read/write arrays must have the same element type";
       return false;
     }
@@ -644,9 +761,21 @@ static bool inferAndCheckElementType(ElementwiseKernel &k,
 struct ArrayAccessInfo {
   llvm::SmallVector<Value> readArrays;
   llvm::SmallVector<Value> readValues;
+  llvm::SmallVector<llvm::SmallVector<int64_t, 3>> readOffsets;
 
   Value writeArray;
   Value storedValue;
+  llvm::SmallVector<Value> writeArrays;
+  llvm::SmallVector<Value> storedValues;
+  llvm::SmallVector<llvm::SmallVector<int64_t, 3>> writeOffsets;
+
+  bool hasNonZeroOffset() const {
+    auto hasOffset = [](ArrayRef<int64_t> offsets) {
+      return llvm::any_of(offsets, [](int64_t value) { return value != 0; });
+    };
+    return llvm::any_of(readOffsets, hasOffset) ||
+           llvm::any_of(writeOffsets, hasOffset);
+  }
 };
 
 static int findReadValueIndex(ArrayRef<Value> readValues, Value v) {
@@ -894,6 +1023,7 @@ recognizeElementwiseExpr(Value value, const ArrayAccessInfo &accesses,
 
     auto expression = makeExpr(ElementwiseExprKind::ArrayLoad);
     expression->source = kernel.readArrays[arrayIndex];
+    expression->arrayAccessIndex = readIndex;
     return expression;
   }
 
@@ -1238,12 +1368,84 @@ static bool detectGenericExpr(ElementwiseKernel &k, const ArrayAccessInfo &info,
   return true;
 }
 
-static bool collectArrayAccessesFromBody(Block *body, unsigned expectedRank,
-                                         ArrayRef<Value> expectedIndexMemrefs,
-                                         ArrayAccessInfo &info,
-                                         std::string &reason,
-                                         unsigned minReads = 1,
-                                         unsigned maxReads = 3) {
+static unsigned getOrAddArrayArgument(ElementwiseKernel &kernel, Value array,
+                                      bool read, bool write) {
+  for (auto [index, argument] : llvm::enumerate(kernel.arrayArguments)) {
+    if (!sameArrayBase(argument.array, array))
+      continue;
+    argument.read |= read;
+    argument.write |= write;
+    return index;
+  }
+
+  ElementwiseArrayArgument argument;
+  argument.array = array;
+  argument.read = read;
+  argument.write = write;
+  kernel.arrayArguments.push_back(argument);
+  return kernel.arrayArguments.size() - 1;
+}
+
+static bool detectStencil2D(ElementwiseKernel &kernel,
+                            const ArrayAccessInfo &info, std::string &reason) {
+  kernel.kind = ElementwiseKernelKind::Stencil2D;
+  kernel.rank = 2;
+  kernel.readArrays.clear();
+  kernel.writeArrays.clear();
+  kernel.arrayArguments.clear();
+  kernel.arrayAccesses.clear();
+  kernel.outputs.clear();
+  kernel.scalarRefs.clear();
+  kernel.privateScalarRefs.clear();
+
+  for (unsigned index = 0; index < info.readValues.size(); ++index) {
+    Value array = info.readArrays[index];
+    getOrAddArrayIndex(kernel.readArrays, array);
+    unsigned arrayArgumentIndex =
+        getOrAddArrayArgument(kernel, array, true, false);
+
+    ElementwiseArrayAccess access;
+    access.array = array;
+    access.loadedValue = info.readValues[index];
+    access.arrayArgumentIndex = arrayArgumentIndex;
+    access.offsets = info.readOffsets[index];
+    kernel.arrayAccesses.push_back(std::move(access));
+  }
+
+  for (Value array : info.writeArrays) {
+    getOrAddArrayIndex(kernel.writeArrays, array);
+    getOrAddArrayArgument(kernel, array, false, true);
+  }
+
+  if (kernel.writeArrays.empty()) {
+    reason = "stencil kernel has no output arrays";
+    return false;
+  }
+  kernel.writeArray = kernel.writeArrays.front();
+
+  for (unsigned index = 0; index < info.storedValues.size(); ++index) {
+    ElementwiseOutput output;
+    output.array = info.writeArrays[index];
+    output.storedValue = info.storedValues[index];
+    output.arrayArgumentIndex =
+        getOrAddArrayArgument(kernel, output.array, false, true);
+    output.offsets = info.writeOffsets[index];
+    output.expression =
+        recognizeElementwiseExpr(output.storedValue, info, kernel, reason);
+    if (!output.expression)
+      return false;
+    kernel.outputs.push_back(std::move(output));
+  }
+
+  kernel.computeOp = kernel.outputs.front().storedValue.getDefiningOp();
+  return inferAndCheckElementType(kernel, reason);
+}
+
+static bool collectArrayAccessesFromBody(
+    Block *body, unsigned expectedRank, ArrayRef<Value> expectedIndexMemrefs,
+    ArrayAccessInfo &info, std::string &reason, unsigned minReads = 1,
+    unsigned maxReads = 3, bool allowMultipleWrites = false,
+    bool allowAffineOffsets = false) {
   if (!body) {
     reason = "loop has no body";
     return false;
@@ -1260,11 +1462,15 @@ static bool collectArrayAccessesFromBody(Block *body, unsigned expectedRank,
       return false;
     }
 
+    llvm::SmallVector<int64_t, 3> offsets;
     for (unsigned i = 0; i < expectedRank; ++i) {
-      if (!indexIsLoadOf(indices[i], expectedIndexMemrefs[i])) {
-        reason = "array index is not a load of the expected induction variable";
+      std::optional<int64_t> offset =
+          matchAffineIndex(indices[i], expectedIndexMemrefs[i]);
+      if (!offset || (!allowAffineOffsets && *offset != 0)) {
+        reason = "array index is not an affine induction-variable subscript";
         return false;
       }
+      offsets.push_back(*offset);
     }
 
     Value base = ac.getMemref();
@@ -1273,14 +1479,20 @@ static bool collectArrayAccessesFromBody(Block *body, unsigned expectedRank,
       if (auto load = dyn_cast<fir::LoadOp>(user)) {
         info.readArrays.push_back(base);
         info.readValues.push_back(load.getResult());
+        info.readOffsets.push_back(offsets);
       } else if (auto st = dyn_cast<fir::StoreOp>(user)) {
-        if (info.writeArray) {
+        if (info.writeArray && !allowMultipleWrites) {
           reason = "kernel has more than one write array";
           return false;
         }
 
-        info.writeArray = base;
-        info.storedValue = st.getValue();
+        if (!info.writeArray) {
+          info.writeArray = base;
+          info.storedValue = st.getValue();
+        }
+        info.writeArrays.push_back(base);
+        info.storedValues.push_back(st.getValue());
+        info.writeOffsets.push_back(offsets);
       } else {
         reason = "array_coor result has unsupported user";
         return false;
@@ -1298,7 +1510,7 @@ static bool collectArrayAccessesFromBody(Block *body, unsigned expectedRank,
     getOrAddArrayIndex(uniqueReadArrays, array);
 
   if (uniqueReadArrays.size() < minReads ||
-      uniqueReadArrays.size() > maxReads ||
+      (maxReads != 0 && uniqueReadArrays.size() > maxReads) ||
       info.readArrays.size() != info.readValues.size()) {
     reason = "kernel has unsupported number of read arrays";
     return false;
@@ -1488,8 +1700,16 @@ static bool collectArrayAccesses2D(ElementwiseKernel &k,
   indexMemrefs.push_back(outerIndMemref);
 
   if (!collectArrayAccessesFromBody(innerLoop.getBody(), 2, indexMemrefs, info,
-                                    reason, 1, 3))
+                                    reason, 1, 0, true, true))
     return false;
+
+  bool canonicalPointwise =
+      isConstantIntegerValue(innerLoop.getLowerBound(), 1) &&
+      isConstantIntegerValue(k.outerLoop.getLowerBound(), 1) &&
+      !info.hasNonZeroOffset() && info.storedValues.size() == 1;
+
+  if (!canonicalPointwise)
+    return detectStencil2D(k, info, reason);
 
   // Existing direct binary 2-D form:
   //
@@ -1515,10 +1735,16 @@ static bool collectArrayAccesses2D(ElementwiseKernel &k,
   if (detectGenericExpr(k, info, 2, exprReason))
     return true;
 
+  std::string stencilReason;
+  if (detectStencil2D(k, info, stencilReason))
+    return true;
+
   reason = "unsupported 2-D expression; binary failure: ";
   reason += binaryReason;
   reason += "; expression-tree failure: ";
   reason += exprReason;
+  reason += "; stencil failure: ";
+  reason += stencilReason;
 
   return false;
 }
@@ -1963,6 +2189,9 @@ recognizeReduction1D(fir::fnacc::LaunchOp launchOp) {
   std::string loopReason;
   if (!verifyLoopLowerBoundAndStep(loop, "reduction", loopReason))
     return fail(loop.getOperation(), loopReason);
+  if (!isConstantIntegerValue(loop.getLowerBound(), 1))
+    return fail(loop.getOperation(),
+                "reduction loop lower bound must be constant 1");
 
   ElementwiseExtentSource extentX = getLoopExtentSource(loop);
 
@@ -2003,6 +2232,7 @@ recognizeReduction1D(fir::fnacc::LaunchOp launchOp) {
   k.rank = 1;
   k.loop1D = loop;
   k.extentX = extentX;
+  k.loopLowerX = getLoopLowerSource(loop);
   k.innerIndMemref = indMemref;
   k.reductionScalarRef = *reductionScalar;
   k.reductionOperator = *reductionOp;
@@ -2010,12 +2240,15 @@ recognizeReduction1D(fir::fnacc::LaunchOp launchOp) {
   k.scalarRefs.clear();
 
   switch (extentX.kind) {
+  case ElementwiseExtentSourceKind::ConstantInteger:
+    break;
   case ElementwiseExtentSourceKind::Value:
     markLaunchLocalBackwardSlice(k, launchOp, extentX.value);
     break;
 
   case ElementwiseExtentSourceKind::LoadIntegerRef:
   case ElementwiseExtentSourceKind::BoxDim:
+  case ElementwiseExtentSourceKind::BoxLowerBound:
     // These sources intentionally retain a value defined outside the launch.
     break;
 
@@ -2349,6 +2582,11 @@ recognizeMatMul2D(fir::fnacc::LaunchOp launchOp) {
 
   if (!verifyLoopLowerBoundAndStep(pLoop, "matmul p", loopReason))
     return fail(pLoop.getOperation(), loopReason);
+  if (!isConstantIntegerValue(jLoop.getLowerBound(), 1) ||
+      !isConstantIntegerValue(iLoop.getLowerBound(), 1) ||
+      !isConstantIntegerValue(pLoop.getLowerBound(), 1))
+    return fail(iLoop.getOperation(),
+                "matmul loop lower bounds must be constant 1");
 
   Value jMemref = findInductionMemref(jLoop);
   Value iMemref = findInductionMemref(iLoop);
@@ -2449,6 +2687,8 @@ static ElementwiseRecognitionResult recognize1D(fir::fnacc::LaunchOp launchOp) {
   std::string loopReason;
   if (!verifyLoopLowerBoundAndStep(loop, "1-D", loopReason))
     return fail(loop.getOperation(), loopReason);
+  if (!isConstantIntegerValue(loop.getLowerBound(), 1))
+    return fail(loop.getOperation(), "1-D loop lower bound must be constant 1");
 
   ElementwiseExtentSource extentX = getLoopExtentSource(loop);
 
@@ -2464,6 +2704,7 @@ static ElementwiseRecognitionResult recognize1D(fir::fnacc::LaunchOp launchOp) {
   k.rank = 1;
   k.loop1D = loop;
   k.extentX = extentX;
+  k.loopLowerX = getLoopLowerSource(loop);
   k.innerIndMemref = indMemref;
 
   markLoopBounds(k, launchOp, loop);
@@ -2545,6 +2786,8 @@ static ElementwiseRecognitionResult recognize2D(fir::fnacc::LaunchOp launchOp) {
   k.innerLoop = inner;
   k.extentY = extentY;
   k.extentX = extentX;
+  k.loopLowerY = getLoopLowerSource(outer);
+  k.loopLowerX = getLoopLowerSource(inner);
   k.outerIndMemref = outerIndMemref;
   k.innerIndMemref = innerIndMemref;
 
@@ -2649,6 +2892,13 @@ static llvm::SmallVector<unsigned>
 getKernelParameterSlotsForValue(const ElementwiseKernel &kernel, Value value) {
   llvm::SmallVector<unsigned> slots;
 
+  if (kernel.kind == ElementwiseKernelKind::Stencil2D) {
+    for (unsigned i = 0; i < kernel.arrayArguments.size(); ++i)
+      if (sameArrayBase(kernel.arrayArguments[i].array, value))
+        slots.push_back(i);
+    return slots;
+  }
+
   for (unsigned i = 0; i < kernel.readArrays.size(); ++i)
     if (kernel.readArrays[i] == value)
       slots.push_back(i);
@@ -2681,13 +2931,17 @@ static bool isReductionMetadataPackSlot(fir::fnacc::LaunchOp launchOp,
 static void appendABIParameter(FNACCKernelABI &abi,
                                FNACCKernelParameterRole role,
                                FNACCKernelParameterPassing passing,
-                               ElementType elementType, llvm::StringRef name) {
+                               ElementType elementType, llvm::StringRef name,
+                               int32_t arrayIndex = -1,
+                               int32_t dimension = -1) {
   FNACCKernelParameter parameter;
   parameter.slot = abi.parameters.size();
   parameter.role = role;
   parameter.passing = passing;
   parameter.elementType = elementType;
   parameter.name = name.str();
+  parameter.arrayIndex = arrayIndex;
+  parameter.dimension = dimension;
   abi.parameters.push_back(std::move(parameter));
 }
 
@@ -2696,22 +2950,17 @@ static FNACCKernelABI buildKernelABI(fir::fnacc::LaunchOp launchOp,
   FNACCKernelABI abi;
   bool isReduction = isReductionKernelKind(kernel.kind);
 
-  for (unsigned i = 0; i < kernel.readArrays.size(); ++i)
-    appendABIParameter(abi, FNACCKernelParameterRole::Read,
-                       FNACCKernelParameterPassing::DevicePointer,
-                       kernel.elementType, "read" + std::to_string(i));
-
-  if (isReduction) {
-    appendABIParameter(abi, FNACCKernelParameterRole::Partials,
-                       FNACCKernelParameterPassing::DevicePointer,
-                       kernel.elementType, "partials");
-    appendABIParameter(abi, FNACCKernelParameterRole::ExtentX,
-                       FNACCKernelParameterPassing::Value, ElementType::I32,
-                       "extent_x");
-  } else {
-    appendABIParameter(abi, FNACCKernelParameterRole::Write,
-                       FNACCKernelParameterPassing::DevicePointer,
-                       kernel.elementType, "write");
+  if (kernel.kind == ElementwiseKernelKind::Stencil2D) {
+    for (auto [index, array] : llvm::enumerate(kernel.arrayArguments)) {
+      FNACCKernelParameterRole role = FNACCKernelParameterRole::Read;
+      if (array.read && array.write)
+        role = FNACCKernelParameterRole::ReadWrite;
+      else if (array.write)
+        role = FNACCKernelParameterRole::Write;
+      appendABIParameter(abi, role, FNACCKernelParameterPassing::DevicePointer,
+                         kernel.elementType, "array" + std::to_string(index),
+                         index);
+    }
 
     for (unsigned i = 0; i < kernel.scalarRefs.size(); ++i)
       appendABIParameter(abi, FNACCKernelParameterRole::Scalar,
@@ -2721,16 +2970,68 @@ static FNACCKernelABI buildKernelABI(fir::fnacc::LaunchOp launchOp,
     appendABIParameter(abi, FNACCKernelParameterRole::ExtentX,
                        FNACCKernelParameterPassing::Value, ElementType::I32,
                        "extent_x");
+    appendABIParameter(abi, FNACCKernelParameterRole::ExtentY,
+                       FNACCKernelParameterPassing::Value, ElementType::I32,
+                       "extent_y");
+    appendABIParameter(abi, FNACCKernelParameterRole::LoopLowerX,
+                       FNACCKernelParameterPassing::Value, ElementType::I32,
+                       "loop_lower_x");
+    appendABIParameter(abi, FNACCKernelParameterRole::LoopLowerY,
+                       FNACCKernelParameterPassing::Value, ElementType::I32,
+                       "loop_lower_y");
 
-    if (kernel.rank == 2) {
-      appendABIParameter(abi, FNACCKernelParameterRole::ExtentY,
-                         FNACCKernelParameterPassing::Value, ElementType::I32,
-                         "extent_y");
-
-      if (kernel.kind == ElementwiseKernelKind::MatMul2D)
-        appendABIParameter(abi, FNACCKernelParameterRole::ExtentZ,
+    for (unsigned array = 0; array < kernel.arrayArguments.size(); ++array) {
+      for (unsigned dim = 0; dim < 2; ++dim)
+        appendABIParameter(abi, FNACCKernelParameterRole::ArrayLowerBound,
                            FNACCKernelParameterPassing::Value, ElementType::I32,
-                           "extent_k");
+                           "array" + std::to_string(array) + "_lower" +
+                               std::to_string(dim),
+                           array, dim);
+      for (unsigned dim = 0; dim < 2; ++dim)
+        appendABIParameter(abi, FNACCKernelParameterRole::ArrayStride,
+                           FNACCKernelParameterPassing::Value, ElementType::I32,
+                           "array" + std::to_string(array) + "_stride" +
+                               std::to_string(dim),
+                           array, dim);
+    }
+  } else {
+
+    for (unsigned i = 0; i < kernel.readArrays.size(); ++i)
+      appendABIParameter(abi, FNACCKernelParameterRole::Read,
+                         FNACCKernelParameterPassing::DevicePointer,
+                         kernel.elementType, "read" + std::to_string(i));
+
+    if (isReduction) {
+      appendABIParameter(abi, FNACCKernelParameterRole::Partials,
+                         FNACCKernelParameterPassing::DevicePointer,
+                         kernel.elementType, "partials");
+      appendABIParameter(abi, FNACCKernelParameterRole::ExtentX,
+                         FNACCKernelParameterPassing::Value, ElementType::I32,
+                         "extent_x");
+    } else {
+      appendABIParameter(abi, FNACCKernelParameterRole::Write,
+                         FNACCKernelParameterPassing::DevicePointer,
+                         kernel.elementType, "write");
+
+      for (unsigned i = 0; i < kernel.scalarRefs.size(); ++i)
+        appendABIParameter(abi, FNACCKernelParameterRole::Scalar,
+                           FNACCKernelParameterPassing::Value,
+                           kernel.elementType, "scalar" + std::to_string(i));
+
+      appendABIParameter(abi, FNACCKernelParameterRole::ExtentX,
+                         FNACCKernelParameterPassing::Value, ElementType::I32,
+                         "extent_x");
+
+      if (kernel.rank == 2) {
+        appendABIParameter(abi, FNACCKernelParameterRole::ExtentY,
+                           FNACCKernelParameterPassing::Value, ElementType::I32,
+                           "extent_y");
+
+        if (kernel.kind == ElementwiseKernelKind::MatMul2D)
+          appendABIParameter(abi, FNACCKernelParameterRole::ExtentZ,
+                             FNACCKernelParameterPassing::Value,
+                             ElementType::I32, "extent_k");
+      }
     }
   }
 
@@ -2835,6 +3136,8 @@ llvm::StringRef fnaccKernelKindName(ElementwiseKernelKind kind) {
     return "expr1d";
   case ElementwiseKernelKind::Expr2D:
     return "expr2d";
+  case ElementwiseKernelKind::Stencil2D:
+    return "stencil2d";
   case ElementwiseKernelKind::MatMul2D:
     return "matmul2d";
   case ElementwiseKernelKind::ReductionSum1D:
