@@ -18,14 +18,14 @@ subroutine vector_add_assumed_shape(a, b, c)
   end do
 end subroutine
 
-! HOST-DAG: func.func private @__fnacc_launch_f32_v1
 ! HOST-DAG: func.func private @__fnacc_validate_contiguous_desc
+! HOST-DAG: func.func private @__fnacc_begin_launch_v2
 
 ! HOST-LABEL: func.func @_QPvector_add_assumed_shape
 ! HOST: fir.box_dims
 ! HOST-COUNT-3: call @__fnacc_validate_contiguous_desc
 ! HOST: fir.box_addr
-! HOST: call @__fnacc_launch_f32_v1
+! HOST: call @__fnacc_begin_launch_v2
 ! HOST-NOT: fnacc.launch
 
 ! TTIR: tt.func @fnacc_kernel_0
@@ -41,4 +41,3 @@ end subroutine
 ! JSON: "kind": "binary"
 ! JSON: "rank": 1
 ! JSON: "tile": [128, 1, 1]
-

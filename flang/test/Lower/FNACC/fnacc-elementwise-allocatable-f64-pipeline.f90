@@ -17,7 +17,7 @@ subroutine fnacc_add_allocatable_f64(n, a, b, c)
   end do
 end subroutine
 
-! HOST-DAG: func.func private @__fnacc_launch_f64_v1
+! HOST-DAG: func.func private @__fnacc_begin_launch_v2
 
 ! HOST-LABEL: func.func @_QPfnacc_add_allocatable_f64
 ! HOST-NOT: fnacc.launch
@@ -29,7 +29,7 @@ end subroutine
 ! HOST: %[[B_ADDR:.*]] = fir.box_addr %[[B_BOX]] : (!fir.box<!fir.heap<!fir.array<?xf64>>>) -> !fir.heap<!fir.array<?xf64>>
 ! HOST: %[[C_BOX:.*]] = fir.load {{.*}} : !fir.ref<!fir.box<!fir.heap<!fir.array<?xf64>>>>
 ! HOST: %[[C_ADDR:.*]] = fir.box_addr %[[C_BOX]] : (!fir.box<!fir.heap<!fir.array<?xf64>>>) -> !fir.heap<!fir.array<?xf64>>
-! HOST: call @__fnacc_launch_f64_v1
+! HOST: call @__fnacc_begin_launch_v2
 ! HOST-NOT: fnacc.launch
 
 ! TTIR-LABEL: tt.func @fnacc_kernel_0

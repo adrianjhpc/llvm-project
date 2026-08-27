@@ -18,10 +18,10 @@ subroutine matrix_add_explicit_shape(n, m, a, b, c)
   end do
 end subroutine
 
-! HOST-DAG: func.func private @__fnacc_launch_f32_v1
+! HOST-DAG: func.func private @__fnacc_begin_launch_v2
 
 ! HOST-LABEL: func.func @_QPmatrix_add_explicit_shape
-! HOST: call @__fnacc_launch_f32_v1
+! HOST: call @__fnacc_begin_launch_v2
 ! HOST-NOT: fnacc.launch
 
 ! TTIR: tt.func @fnacc_kernel_0
@@ -39,4 +39,3 @@ end subroutine
 ! JSON: "kind": "binary"
 ! JSON: "rank": 2
 ! JSON: "tile": [16, 16, 1]
-

@@ -55,6 +55,7 @@ enum class ElementwiseKernelKind {
   BinaryArrayArray,
   Saxpy1D,
   Expr1D,
+  MultiExpr1D,
   Expr2D,
   Stencil2D,
   MatMul2D,
@@ -64,6 +65,10 @@ enum class ElementwiseKernelKind {
   ReductionMin1D,
   ReductionMax1D
 };
+
+/// Return true when the kernel uses the staged, dynamically-sized launch ABI.
+/// Reductions and matmul retain their specialized runtime entry points.
+bool usesVariadicLaunchABI(ElementwiseKernelKind kind);
 
 /// Stable values written to fnacc.reduction_ops and kernel JSON.
 enum class ReductionOperator : int32_t {
@@ -235,8 +240,8 @@ struct ElementwiseKernel {
   llvm::SmallVector<mlir::Value> readArrays;
   mlir::Value writeArray;
 
-  /// Variadic, descriptor-aware ABI used by Stencil2D. Array accesses retain
-  /// their constant affine offsets, and each output owns an expression root.
+  /// Unique array bindings for the variadic ABI. Stencil accesses retain their
+  /// constant affine offsets, and each stencil output owns an expression root.
   llvm::SmallVector<ElementwiseArrayArgument> arrayArguments;
   llvm::SmallVector<ElementwiseArrayAccess> arrayAccesses;
   llvm::SmallVector<ElementwiseOutput> outputs;

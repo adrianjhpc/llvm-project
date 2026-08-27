@@ -21,13 +21,13 @@ end subroutine
 
 ! HOST-DAG: func.func private @__fnacc_update_device_desc
 ! HOST-DAG: func.func private @__fnacc_update_host_desc
-! HOST-DAG: func.func private @__fnacc_launch_f32_v1
+! HOST-DAG: func.func private @__fnacc_begin_launch_v2
 ! HOST-DAG: func.func private @__fnacc_release_all
 
 ! HOST-LABEL: func.func @_QPupdate_then_launch
 ! HOST: call @__fnacc_update_device_desc
 ! HOST: call @__fnacc_update_device_desc
-! HOST: call @__fnacc_launch_f32_v1
+! HOST: call @__fnacc_begin_launch_v2
 ! HOST: call @__fnacc_update_host_desc
 ! HOST: call @__fnacc_release_all
 
@@ -35,4 +35,3 @@ end subroutine
 ! HOST-NOT: fnacc.update_host
 ! HOST-NOT: fnacc.launch
 ! HOST-NOT: fnacc.release_all
-

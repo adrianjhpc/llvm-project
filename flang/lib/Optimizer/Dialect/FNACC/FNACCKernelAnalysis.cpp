@@ -385,10 +385,33 @@ static Operation *findDiscardedSideEffect(fir::fnacc::LaunchOp launchOp,
   return unsupported;
 }
 
+static void populateVariadicArrayArguments(ElementwiseKernel &kernel) {
+  if (!usesVariadicLaunchABI(kernel.kind) || !kernel.outputs.empty())
+    return;
+
+  kernel.arrayArguments.clear();
+  auto addArray = [&](Value array, bool read, bool write) {
+    for (ElementwiseArrayArgument &argument : kernel.arrayArguments) {
+      if (!sameArrayBase(argument.array, array))
+        continue;
+      argument.read |= read;
+      argument.write |= write;
+      return;
+    }
+    kernel.arrayArguments.push_back({array, read, write});
+  };
+
+  for (Value array : kernel.readArrays)
+    addArray(array, true, false);
+  if (kernel.writeArray)
+    addArray(kernel.writeArray, false, true);
+}
+
 static ElementwiseRecognitionResult
 validateRecognizedKernel(fir::fnacc::LaunchOp launchOp,
                          ElementwiseRecognitionResult result) {
   ElementwiseKernel kernel = std::move(result.getKernel());
+  populateVariadicArrayArguments(kernel);
 
   if (Operation *unsupported = findDiscardedSideEffect(launchOp, kernel)) {
     std::string reason = "unsupported operation would be discarded: ";
@@ -1350,16 +1373,6 @@ static bool detectGenericExpr(ElementwiseKernel &k, const ArrayAccessInfo &info,
   if (!expr)
     return false;
 
-  if (k.readArrays.size() > 3) {
-    reason = "expression tree supports at most three read arrays";
-    return false;
-  }
-
-  if (k.scalarRefs.size() > 3) {
-    reason = "expression tree supports at most three scalar values";
-    return false;
-  }
-
   k.expression = std::move(expr);
 
   if (!inferAndCheckElementType(k, reason))
@@ -1384,6 +1397,61 @@ static unsigned getOrAddArrayArgument(ElementwiseKernel &kernel, Value array,
   argument.write = write;
   kernel.arrayArguments.push_back(argument);
   return kernel.arrayArguments.size() - 1;
+}
+
+static bool detectMultiExpr1D(ElementwiseKernel &kernel,
+                              const ArrayAccessInfo &info,
+                              std::string &reason) {
+  kernel.kind = ElementwiseKernelKind::MultiExpr1D;
+  kernel.rank = 1;
+  kernel.readArrays.clear();
+  kernel.writeArrays.clear();
+  kernel.arrayArguments.clear();
+  kernel.arrayAccesses.clear();
+  kernel.outputs.clear();
+  kernel.scalarRefs.clear();
+  kernel.privateScalarRefs.clear();
+
+  for (unsigned index = 0; index < info.readValues.size(); ++index) {
+    Value array = info.readArrays[index];
+    getOrAddArrayIndex(kernel.readArrays, array);
+    unsigned arrayArgumentIndex =
+        getOrAddArrayArgument(kernel, array, true, false);
+
+    ElementwiseArrayAccess access;
+    access.array = array;
+    access.loadedValue = info.readValues[index];
+    access.arrayArgumentIndex = arrayArgumentIndex;
+    access.offsets = info.readOffsets[index];
+    kernel.arrayAccesses.push_back(std::move(access));
+  }
+
+  for (Value array : info.writeArrays) {
+    getOrAddArrayIndex(kernel.writeArrays, array);
+    getOrAddArrayArgument(kernel, array, false, true);
+  }
+  if (kernel.writeArrays.empty()) {
+    reason = "multi-expression kernel has no output arrays";
+    return false;
+  }
+  kernel.writeArray = kernel.writeArrays.front();
+
+  for (unsigned index = 0; index < info.storedValues.size(); ++index) {
+    ElementwiseOutput output;
+    output.array = info.writeArrays[index];
+    output.storedValue = info.storedValues[index];
+    output.arrayArgumentIndex =
+        getOrAddArrayArgument(kernel, output.array, false, true);
+    output.offsets = info.writeOffsets[index];
+    output.expression =
+        recognizeElementwiseExpr(output.storedValue, info, kernel, reason);
+    if (!output.expression)
+      return false;
+    kernel.outputs.push_back(std::move(output));
+  }
+
+  kernel.computeOp = kernel.outputs.front().storedValue.getDefiningOp();
+  return inferAndCheckElementType(kernel, reason);
 }
 
 static bool detectStencil2D(ElementwiseKernel &kernel,
@@ -1632,7 +1700,8 @@ static bool collectArrayAccesses1D(ElementwiseKernel &k, fir::DoLoopOp loop,
   llvm::SmallVector<Value> indexMemrefs;
   indexMemrefs.push_back(indMemref);
 
-  if (!collectArrayAccessesFromBody(body, 1, indexMemrefs, info, reason, 1, 3))
+  if (!collectArrayAccessesFromBody(body, 1, indexMemrefs, info, reason, 1, 0,
+                                    true))
     return false;
 
   if (!info.writeArray) {
@@ -1641,9 +1710,12 @@ static bool collectArrayAccesses1D(ElementwiseKernel &k, fir::DoLoopOp loop,
   }
 
   if (info.readArrays.empty()) {
-    reason = "kernel expected one to three read arrays";
+    reason = "kernel expected at least one read array";
     return false;
   }
+
+  if (info.storedValues.size() > 1)
+    return detectMultiExpr1D(k, info, reason);
 
   // Existing direct form:
   //
@@ -1667,13 +1739,13 @@ static bool collectArrayAccesses1D(ElementwiseKernel &k, fir::DoLoopOp loop,
     return true;
   }
 
-  // Generic 1-D expression tree. Supports one to three read arrays and up to
-  // three scalar captures.
+  // Generic 1-D expression tree. Array and scalar captures are dynamically
+  // sized by the v2 launch ABI.
   //
   //   c(i) = alpha * a(i) + beta * b(i)
   //   c(i) = (a(i) + b(i)) * alpha
   //
-  // One-read expressions such as c(i) = a(i) + 1.0 require a future ABI update.
+  // One-read expressions such as c(i) = a(i) + 1.0 are supported.
   std::string exprReason;
   if (detectGenericExpr(k, info, 1, exprReason))
     return true;
@@ -2879,6 +2951,7 @@ static int32_t getPlannedParallelSubgroups(const ElementwiseKernel &kernel,
       kernel.elementType == ElementType::F64 && !kernel.scalarRefs.empty() &&
       (kernel.kind == ElementwiseKernelKind::Saxpy1D ||
        kernel.kind == ElementwiseKernelKind::Expr1D ||
+       kernel.kind == ElementwiseKernelKind::MultiExpr1D ||
        kernel.kind == ElementwiseKernelKind::Expr2D);
 
   if (isF64ScalarElementwise || isReductionKernelKind(kernel.kind) ||
@@ -2892,10 +2965,25 @@ static llvm::SmallVector<unsigned>
 getKernelParameterSlotsForValue(const ElementwiseKernel &kernel, Value value) {
   llvm::SmallVector<unsigned> slots;
 
-  if (kernel.kind == ElementwiseKernelKind::Stencil2D) {
-    for (unsigned i = 0; i < kernel.arrayArguments.size(); ++i)
-      if (sameArrayBase(kernel.arrayArguments[i].array, value))
-        slots.push_back(i);
+  if (usesVariadicLaunchABI(kernel.kind)) {
+    unsigned scalarBaseSlot = 0;
+    if (!kernel.outputs.empty()) {
+      for (unsigned i = 0; i < kernel.arrayArguments.size(); ++i)
+        if (sameArrayBase(kernel.arrayArguments[i].array, value))
+          slots.push_back(i);
+      scalarBaseSlot = kernel.arrayArguments.size();
+    } else {
+      for (unsigned i = 0; i < kernel.readArrays.size(); ++i)
+        if (sameArrayBase(kernel.readArrays[i], value))
+          slots.push_back(i);
+      if (sameArrayBase(kernel.writeArray, value))
+        slots.push_back(kernel.readArrays.size());
+      scalarBaseSlot = kernel.readArrays.size() + 1;
+    }
+
+    for (unsigned i = 0; i < kernel.scalarRefs.size(); ++i)
+      if (sameValueAfterFirConvert(kernel.scalarRefs[i], value))
+        slots.push_back(scalarBaseSlot + i);
     return slots;
   }
 
@@ -2932,8 +3020,8 @@ static void appendABIParameter(FNACCKernelABI &abi,
                                FNACCKernelParameterRole role,
                                FNACCKernelParameterPassing passing,
                                ElementType elementType, llvm::StringRef name,
-                               int32_t arrayIndex = -1,
-                               int32_t dimension = -1) {
+                               int32_t arrayIndex = -1, int32_t dimension = -1,
+                               int32_t scalarIndex = -1) {
   FNACCKernelParameter parameter;
   parameter.slot = abi.parameters.size();
   parameter.role = role;
@@ -2941,6 +3029,7 @@ static void appendABIParameter(FNACCKernelABI &abi,
   parameter.elementType = elementType;
   parameter.name = name.str();
   parameter.arrayIndex = arrayIndex;
+  parameter.scalarIndex = scalarIndex;
   parameter.dimension = dimension;
   abi.parameters.push_back(std::move(parameter));
 }
@@ -2950,52 +3039,74 @@ static FNACCKernelABI buildKernelABI(fir::fnacc::LaunchOp launchOp,
   FNACCKernelABI abi;
   bool isReduction = isReductionKernelKind(kernel.kind);
 
-  if (kernel.kind == ElementwiseKernelKind::Stencil2D) {
-    for (auto [index, array] : llvm::enumerate(kernel.arrayArguments)) {
-      FNACCKernelParameterRole role = FNACCKernelParameterRole::Read;
-      if (array.read && array.write)
-        role = FNACCKernelParameterRole::ReadWrite;
-      else if (array.write)
-        role = FNACCKernelParameterRole::Write;
-      appendABIParameter(abi, role, FNACCKernelParameterPassing::DevicePointer,
-                         kernel.elementType, "array" + std::to_string(index),
-                         index);
+  if (usesVariadicLaunchABI(kernel.kind)) {
+    auto findArrayIndex = [&](Value value) -> int32_t {
+      for (auto [index, argument] : llvm::enumerate(kernel.arrayArguments))
+        if (sameArrayBase(argument.array, value))
+          return static_cast<int32_t>(index);
+      llvm_unreachable("variadic kernel value has no array binding");
+    };
+
+    if (!kernel.outputs.empty()) {
+      for (auto [index, array] : llvm::enumerate(kernel.arrayArguments)) {
+        FNACCKernelParameterRole role = FNACCKernelParameterRole::Read;
+        if (array.read && array.write)
+          role = FNACCKernelParameterRole::ReadWrite;
+        else if (array.write)
+          role = FNACCKernelParameterRole::Write;
+        appendABIParameter(
+            abi, role, FNACCKernelParameterPassing::DevicePointer,
+            kernel.elementType, "array" + std::to_string(index), index);
+      }
+    } else {
+      for (unsigned i = 0; i < kernel.readArrays.size(); ++i)
+        appendABIParameter(abi, FNACCKernelParameterRole::Read,
+                           FNACCKernelParameterPassing::DevicePointer,
+                           kernel.elementType, "read" + std::to_string(i),
+                           findArrayIndex(kernel.readArrays[i]));
+      appendABIParameter(abi, FNACCKernelParameterRole::Write,
+                         FNACCKernelParameterPassing::DevicePointer,
+                         kernel.elementType, "write",
+                         findArrayIndex(kernel.writeArray));
     }
 
     for (unsigned i = 0; i < kernel.scalarRefs.size(); ++i)
       appendABIParameter(abi, FNACCKernelParameterRole::Scalar,
                          FNACCKernelParameterPassing::Value, kernel.elementType,
-                         "scalar" + std::to_string(i));
+                         "scalar" + std::to_string(i), -1, -1, i);
 
     appendABIParameter(abi, FNACCKernelParameterRole::ExtentX,
                        FNACCKernelParameterPassing::Value, ElementType::I32,
                        "extent_x");
-    appendABIParameter(abi, FNACCKernelParameterRole::ExtentY,
-                       FNACCKernelParameterPassing::Value, ElementType::I32,
-                       "extent_y");
-    appendABIParameter(abi, FNACCKernelParameterRole::LoopLowerX,
-                       FNACCKernelParameterPassing::Value, ElementType::I32,
-                       "loop_lower_x");
-    appendABIParameter(abi, FNACCKernelParameterRole::LoopLowerY,
-                       FNACCKernelParameterPassing::Value, ElementType::I32,
-                       "loop_lower_y");
+    if (kernel.rank >= 2)
+      appendABIParameter(abi, FNACCKernelParameterRole::ExtentY,
+                         FNACCKernelParameterPassing::Value, ElementType::I32,
+                         "extent_y");
 
-    for (unsigned array = 0; array < kernel.arrayArguments.size(); ++array) {
-      for (unsigned dim = 0; dim < 2; ++dim)
-        appendABIParameter(abi, FNACCKernelParameterRole::ArrayLowerBound,
-                           FNACCKernelParameterPassing::Value, ElementType::I32,
-                           "array" + std::to_string(array) + "_lower" +
-                               std::to_string(dim),
-                           array, dim);
-      for (unsigned dim = 0; dim < 2; ++dim)
-        appendABIParameter(abi, FNACCKernelParameterRole::ArrayStride,
-                           FNACCKernelParameterPassing::Value, ElementType::I32,
-                           "array" + std::to_string(array) + "_stride" +
-                               std::to_string(dim),
-                           array, dim);
+    if (kernel.kind == ElementwiseKernelKind::Stencil2D) {
+      appendABIParameter(abi, FNACCKernelParameterRole::LoopLowerX,
+                         FNACCKernelParameterPassing::Value, ElementType::I32,
+                         "loop_lower_x");
+      appendABIParameter(abi, FNACCKernelParameterRole::LoopLowerY,
+                         FNACCKernelParameterPassing::Value, ElementType::I32,
+                         "loop_lower_y");
+
+      for (unsigned array = 0; array < kernel.arrayArguments.size(); ++array) {
+        for (unsigned dim = 0; dim < 2; ++dim)
+          appendABIParameter(
+              abi, FNACCKernelParameterRole::ArrayLowerBound,
+              FNACCKernelParameterPassing::Value, ElementType::I32,
+              "array" + std::to_string(array) + "_lower" + std::to_string(dim),
+              array, dim);
+        for (unsigned dim = 0; dim < 2; ++dim)
+          appendABIParameter(
+              abi, FNACCKernelParameterRole::ArrayStride,
+              FNACCKernelParameterPassing::Value, ElementType::I32,
+              "array" + std::to_string(array) + "_stride" + std::to_string(dim),
+              array, dim);
+      }
     }
   } else {
-
     for (unsigned i = 0; i < kernel.readArrays.size(); ++i)
       appendABIParameter(abi, FNACCKernelParameterRole::Read,
                          FNACCKernelParameterPassing::DevicePointer,
@@ -3126,6 +3237,26 @@ bool isReductionKernelKind(ElementwiseKernelKind kind) {
          kind == ElementwiseKernelKind::ReductionMax1D;
 }
 
+bool usesVariadicLaunchABI(ElementwiseKernelKind kind) {
+  switch (kind) {
+  case ElementwiseKernelKind::BinaryArrayArray:
+  case ElementwiseKernelKind::Saxpy1D:
+  case ElementwiseKernelKind::Expr1D:
+  case ElementwiseKernelKind::MultiExpr1D:
+  case ElementwiseKernelKind::Expr2D:
+  case ElementwiseKernelKind::Stencil2D:
+    return true;
+  case ElementwiseKernelKind::MatMul2D:
+  case ElementwiseKernelKind::ReductionSum1D:
+  case ElementwiseKernelKind::ReductionDot1D:
+  case ElementwiseKernelKind::ReductionProduct1D:
+  case ElementwiseKernelKind::ReductionMin1D:
+  case ElementwiseKernelKind::ReductionMax1D:
+    return false;
+  }
+  llvm_unreachable("unknown FNACC kernel kind");
+}
+
 llvm::StringRef fnaccKernelKindName(ElementwiseKernelKind kind) {
   switch (kind) {
   case ElementwiseKernelKind::BinaryArrayArray:
@@ -3134,6 +3265,8 @@ llvm::StringRef fnaccKernelKindName(ElementwiseKernelKind kind) {
     return "saxpy1d";
   case ElementwiseKernelKind::Expr1D:
     return "expr1d";
+  case ElementwiseKernelKind::MultiExpr1D:
+    return "multi_expr1d";
   case ElementwiseKernelKind::Expr2D:
     return "expr2d";
   case ElementwiseKernelKind::Stencil2D:
@@ -3171,6 +3304,7 @@ buildFNACCKernelPlan(fir::fnacc::LaunchOp launchOp, int32_t fallbackId,
   plan.id = getPlannedKernelId(launchOp, fallbackId);
   plan.name = getPlannedKernelName(launchOp, plan.id);
   plan.kernel = std::move(kernel);
+  plan.usesVariadicABI = usesVariadicLaunchABI(plan.kernel.kind);
   plan.schedule.tile = getPlannedTileShape(launchOp, plan.kernel);
   plan.schedule.parallelSubgroups = getPlannedParallelSubgroups(
       plan.kernel, options.requestedParallelSubgroups);

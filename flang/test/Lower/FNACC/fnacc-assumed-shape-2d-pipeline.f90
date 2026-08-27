@@ -17,8 +17,8 @@ subroutine matrix_add_assumed_shape(a, b, c)
   end do
 end subroutine
 
-! HOST-DAG: func.func private @__fnacc_launch_f32_v1
 ! HOST-DAG: func.func private @__fnacc_validate_contiguous_desc
+! HOST-DAG: func.func private @__fnacc_begin_launch_v2
 
 ! HOST-LABEL: func.func @_QPmatrix_add_assumed_shape
 ! HOST: fir.box_dims
@@ -27,7 +27,7 @@ end subroutine
 ! HOST: fir.box_addr
 ! HOST: fir.box_addr
 ! HOST: fir.box_addr
-! HOST: call @__fnacc_launch_f32_v1
+! HOST: call @__fnacc_begin_launch_v2
 ! HOST-NOT: fnacc.launch
 
 ! TTIR: tt.func @fnacc_kernel_0
@@ -46,4 +46,3 @@ end subroutine
 ! JSON: "rank": 2
 ! JSON: "tile": [16, 16, 1]
 ! JSON: "grid": ["cdiv(extent_x, tile_x)", "cdiv(extent_y, tile_y)", "1"]
-

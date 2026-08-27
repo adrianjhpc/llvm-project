@@ -76,6 +76,7 @@ struct FNACCKernelParameter {
   ElementType elementType = ElementType::Unknown;
   std::string name;
   int32_t arrayIndex = -1;
+  int32_t scalarIndex = -1;
   int32_t dimension = -1;
 };
 
@@ -125,6 +126,7 @@ struct FNACCKernelPlan {
   int32_t id = -1;
   std::string name;
   ElementwiseKernel kernel;
+  bool usesVariadicABI = false;
   FNACCKernelSchedule schedule;
   FNACCKernelABI abi;
   std::optional<FNACCReductionStagePlan> reductionStage;

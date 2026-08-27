@@ -1,7 +1,8 @@
+
 // RUN: not fir-opt \
 // RUN:   --fnacc-assign-kernel-ids \
 // RUN:   --fnacc-lower-to-runtime \
-// RUN:   %s -o /dev/null 2>&1 | FileCheck %s
+// RUN:   %s | FileCheck %s
 
 module {
   func.func @unsupported_four_reads(
@@ -58,6 +59,12 @@ module {
   }
 }
 
-// CHECK: error: FNACC runtime cannot lower launch:
-// CHECK-SAME: unsupported number of read arrays
+// CHECK: func.func private @__fnacc_begin_launch_v2
+// CHECK: func.func private @__fnacc_bind_array_v2
+// CHECK: func.func private @__fnacc_commit_launch_v2
 
+// CHECK-LABEL: func.func @unsupported_four_reads
+// CHECK: call @__fnacc_begin_launch_v2
+// CHECK-COUNT-5: call @__fnacc_bind_array_v2
+// CHECK: call @__fnacc_commit_launch_v2
+// CHECK-NOT: fnacc.launch

@@ -56,10 +56,10 @@ module {
   }
 }
 
-// CHECK: %[[NREAD:.*]] = arith.constant 2 : i32
+// CHECK: %[[NARRAY:.*]] = arith.constant 3 : i32
 // CHECK: %[[NSCALAR:.*]] = arith.constant 2 : i32
-// CHECK: call @__fnacc_launch_f32_v1
-// CHECK-SAME: %[[NREAD]], %[[NSCALAR]]
+// CHECK: call @__fnacc_begin_launch_v2
+// CHECK-SAME: %[[NARRAY]], %[[NSCALAR]]
 
 // TTIR: tt.func @fnacc_kernel_0
 // TTIR-SAME: %read0: !tt.ptr<f32>

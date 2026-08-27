@@ -349,17 +349,7 @@ static std::string emitExprVector(const fir::fnacc::ElementwiseKernel &k,
 
     int index = findValueIndex(k.readArrays, expr.source);
     assert(index >= 0 && "array load source not found in read array list");
-
-    switch (index) {
-    case 0:
-      return "%read0v";
-    case 1:
-      return "%read1v";
-    case 2:
-      return "%read2v";
-    default:
-      llvm_unreachable("only three read arrays are supported");
-    }
+    return "%read" + std::to_string(index) + "v";
   }
 
   case fir::fnacc::ElementwiseExprKind::ScalarLoad: {
@@ -555,8 +545,7 @@ static void emitTritonExpr1D(const fir::fnacc::ElementwiseKernel &k,
                              int64_t block, StringRef kernelName,
                              llvm::raw_ostream &os) {
   assert(k.expression && "Expr1D kernel has no expression tree");
-  assert(!k.readArrays.empty() && k.readArrays.size() <= 3 &&
-         "Expr1D requires one to three read arrays");
+  assert(!k.readArrays.empty() && "Expr1D requires at least one read array");
 
   std::string ptrTy = ptrType(k.elementType);
   std::string elemTy = ttElementType(k.elementType).str();
@@ -586,12 +575,11 @@ static void emitTritonExpr1D(const fir::fnacc::ElementwiseKernel &k,
   os << "  %nS   = tt.splat %n : i32 -> tensor<" << block << "xi32>\n";
   os << "  %mask = arith.cmpi slt, %offs, %nS : tensor<" << block << "xi32>\n";
 
-  if (k.readArrays.size() >= 1)
-    emitLoad1D("%read0", "%read0v", block, k.elementType, os);
-  if (k.readArrays.size() >= 2)
-    emitLoad1D("%read1", "%read1v", block, k.elementType, os);
-  if (k.readArrays.size() >= 3)
-    emitLoad1D("%read2", "%read2v", block, k.elementType, os);
+  for (unsigned i = 0; i < k.readArrays.size(); ++i) {
+    std::string pointer = "%read" + std::to_string(i);
+    std::string value = "%read" + std::to_string(i) + "v";
+    emitLoad1D(pointer, value, block, k.elementType, os);
+  }
 
   ExprTritonEmitterState state;
   state.block = block;
@@ -601,6 +589,72 @@ static void emitTritonExpr1D(const fir::fnacc::ElementwiseKernel &k,
   std::string result = emitExprVector(k, *k.expression, state, os);
 
   emitStore1D("%c", result, block, k.elementType, os);
+
+  os << "  tt.return\n";
+  os << "}\n\n";
+}
+
+static void emitTritonMultiExpr1D(const fir::fnacc::ElementwiseKernel &k,
+                                  int64_t block, StringRef kernelName,
+                                  llvm::raw_ostream &os) {
+  assert(k.kind == fir::fnacc::ElementwiseKernelKind::MultiExpr1D);
+  assert(!k.arrayArguments.empty() && k.outputs.size() > 1);
+
+  std::string ptrTy = ptrType(k.elementType);
+  std::string ptrVecTy = ptrTensorType(block, k.elementType);
+  std::string elemTy = ttElementType(k.elementType).str();
+
+  os << "tt.func @" << kernelName << "(";
+  bool first = true;
+  auto parameter = [&](StringRef name, StringRef type) {
+    if (!first)
+      os << ", ";
+    first = false;
+    os << "%" << name << ": " << type;
+  };
+  for (unsigned i = 0; i < k.arrayArguments.size(); ++i)
+    parameter("array" + std::to_string(i), ptrTy);
+  for (unsigned i = 0; i < k.scalarRefs.size(); ++i)
+    parameter("scalar" + std::to_string(i), elemTy);
+  parameter("extent_x", "i32");
+  os << ") attributes {noinline = false} {\n";
+
+  os << "  %pid  = tt.get_program_id x : i32\n";
+  os << "  %blk  = arith.constant " << block << " : i32\n";
+  os << "  %base = arith.muli %pid, %blk : i32\n";
+  os << "  %rng  = tt.make_range {start = 0 : i32, end = " << block
+     << " : i32} : tensor<" << block << "xi32>\n";
+  os << "  %base_s = tt.splat %base : i32 -> tensor<" << block << "xi32>\n";
+  os << "  %offs = arith.addi %base_s, %rng : tensor<" << block << "xi32>\n";
+  os << "  %extent_s = tt.splat %extent_x : i32 -> tensor<" << block
+     << "xi32>\n";
+  os << "  %mask = arith.cmpi slt, %offs, %extent_s : tensor<" << block
+     << "xi32>\n";
+
+  ExprTritonEmitterState state;
+  state.block = block;
+  state.scalarSplatEmitted.resize(k.scalarRefs.size(), false);
+  state.scalarSplatNames.resize(k.scalarRefs.size());
+  state.arrayAccessNames.resize(k.arrayAccesses.size());
+
+  for (auto [index, access] : llvm::enumerate(k.arrayAccesses)) {
+    std::string source = "%array" + std::to_string(access.arrayArgumentIndex);
+    std::string stem = "%access" + std::to_string(index);
+    std::string value = stem + "v";
+    emitLoad1D(source, value, block, k.elementType, os);
+    state.arrayAccessNames[index] = value;
+  }
+
+  for (auto [index, output] : llvm::enumerate(k.outputs)) {
+    std::string result = emitExprVector(k, *output.expression, state, os);
+    std::string stem = "%output" + std::to_string(index);
+    os << "  " << stem << "p = tt.splat %array" << output.arrayArgumentIndex
+       << " : " << ptrTy << " -> " << ptrVecTy << "\n";
+    os << "  " << stem << "o = tt.addptr " << stem << "p, %offs : " << ptrVecTy
+       << ", tensor<" << block << "xi32>\n";
+    os << "  tt.store " << stem << "o, " << result << ", %mask : " << ptrVecTy
+       << "\n";
+  }
 
   os << "  tt.return\n";
   os << "}\n\n";
@@ -926,8 +980,7 @@ static void emitTritonExpr2D(const fir::fnacc::ElementwiseKernel &k,
                              int64_t blockX, int64_t blockY,
                              StringRef kernelName, llvm::raw_ostream &os) {
   assert(k.expression && "Expr2D kernel has no expression tree");
-  assert(!k.readArrays.empty() && k.readArrays.size() <= 3 &&
-         "Expr2D requires one to three read arrays");
+  assert(!k.readArrays.empty() && "Expr2D requires at least one read array");
 
   int64_t block = blockX * blockY;
   std::string ptrTy = ptrType(k.elementType);
@@ -974,12 +1027,11 @@ static void emitTritonExpr2D(const fir::fnacc::ElementwiseKernel &k,
   os << "  %jy_n = arith.muli %jy, %n_s : tensor<" << block << "xi32>\n";
   os << "  %offs = arith.addi %ix, %jy_n : tensor<" << block << "xi32>\n";
 
-  if (k.readArrays.size() >= 1)
-    emitLoad1D("%read0", "%read0v", block, k.elementType, os);
-  if (k.readArrays.size() >= 2)
-    emitLoad1D("%read1", "%read1v", block, k.elementType, os);
-  if (k.readArrays.size() >= 3)
-    emitLoad1D("%read2", "%read2v", block, k.elementType, os);
+  for (unsigned i = 0; i < k.readArrays.size(); ++i) {
+    std::string pointer = "%read" + std::to_string(i);
+    std::string value = "%read" + std::to_string(i) + "v";
+    emitLoad1D(pointer, value, block, k.elementType, os);
+  }
 
   ExprTritonEmitterState state;
   state.block = block;
@@ -1853,6 +1905,8 @@ static void emitJsonABI(const fir::fnacc::FNACCKernelABI &abi,
        << "\"";
     if (parameter.arrayIndex >= 0)
       os << ", \"array_index\": " << parameter.arrayIndex;
+    if (parameter.scalarIndex >= 0)
+      os << ", \"scalar_index\": " << parameter.scalarIndex;
     if (parameter.dimension >= 0)
       os << ", \"dimension\": " << parameter.dimension;
     os << "}";
@@ -1912,11 +1966,12 @@ static void emitJsonDescriptor(const fir::fnacc::FNACCKernelPlan &plan,
   os << "      \"triton_hidden_ptr_args\": "
      << backend.getPrivatePointerArgumentCount(plan) << ",\n";
 
-  if (k.kind == fir::fnacc::ElementwiseKernelKind::Stencil2D) {
+  if (plan.usesVariadicABI) {
     os << "      \"launch_abi_version\": 2,\n";
     os << "      \"array_count\": " << k.arrayArguments.size() << ",\n";
     os << "      \"scalar_count\": " << k.scalarRefs.size() << ",\n";
-    os << "      \"output_count\": " << k.outputs.size() << ",\n";
+    os << "      \"output_count\": "
+       << (k.outputs.empty() ? 1 : k.outputs.size()) << ",\n";
   }
 
   if (plan.reductionStage)
@@ -2078,6 +2133,8 @@ public:
       emitTritonReductionDot1D(kernel, blockX, plan.name, os);
     } else if (fir::fnacc::isReductionKernelKind(kernel.kind)) {
       emitTritonReduction1D(kernel, blockX, plan.name, os);
+    } else if (kernel.kind == Kind::MultiExpr1D) {
+      emitTritonMultiExpr1D(kernel, blockX, plan.name, os);
     } else if (kernel.kind == Kind::Expr1D) {
       emitTritonExpr1D(kernel, blockX, plan.name, os);
     } else if (kernel.kind == Kind::Saxpy1D) {
@@ -2224,6 +2281,7 @@ struct FNACCLowerToTritonPass
       case fir::fnacc::ElementwiseKernelKind::BinaryArrayArray:
       case fir::fnacc::ElementwiseKernelKind::Saxpy1D:
       case fir::fnacc::ElementwiseKernelKind::Expr1D:
+      case fir::fnacc::ElementwiseKernelKind::MultiExpr1D:
       case fir::fnacc::ElementwiseKernelKind::Expr2D:
       case fir::fnacc::ElementwiseKernelKind::Stencil2D:
         hasSimpleElementwiseLaunch = true;

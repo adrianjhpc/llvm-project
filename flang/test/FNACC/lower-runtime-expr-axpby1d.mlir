@@ -51,18 +51,15 @@ module {
   }
 }
 
-// CHECK: func.func private @__fnacc_launch_f32_v1
-// CHECK-SAME: i32, i32, i32, i32, i32, i32, i32
-// CHECK-SAME: !fir.ref<f32>, !fir.ref<f32>, !fir.ref<f32>, !fir.ref<f32>
-// CHECK-SAME: f32, f32, f32
-// CHECK-SAME: i32, i32, i32
+// CHECK: func.func private @__fnacc_begin_launch_v2
+// CHECK: func.func private @__fnacc_bind_array_v2
+// CHECK: func.func private @__fnacc_bind_scalar_f32_v2
+// CHECK: func.func private @__fnacc_commit_launch_v2
 
 // CHECK-LABEL: func.func @axpby1d
 // CHECK: fir.load %arg2 : !fir.ref<f32>
 // CHECK: fir.load %arg3 : !fir.ref<f32>
-// CHECK: call @__fnacc_launch_f32_v1
-// CHECK-SAME: i32, i32, i32, i32, i32, i32, i32
-// CHECK-SAME: !fir.ref<f32>, !fir.ref<f32>, !fir.ref<f32>, !fir.ref<f32>
-// CHECK-SAME: f32, f32, f32
-// CHECK-SAME: i32, i32, i32
-
+// CHECK: call @__fnacc_begin_launch_v2
+// CHECK-COUNT-3: call @__fnacc_bind_array_v2
+// CHECK-COUNT-2: call @__fnacc_bind_scalar_f32_v2
+// CHECK: call @__fnacc_commit_launch_v2

@@ -59,26 +59,6 @@ static Type getMLIRElementType(OpBuilder &builder,
   }
 }
 
-static StringRef getElementwiseRuntimeName(fir::fnacc::ElementType type) {
-  switch (type) {
-  case fir::fnacc::ElementType::I8:
-    return "__fnacc_launch_i8_v1";
-  case fir::fnacc::ElementType::I16:
-    return "__fnacc_launch_i16_v1";
-  case fir::fnacc::ElementType::I32:
-    return "__fnacc_launch_i32_v1";
-  case fir::fnacc::ElementType::I64:
-    return "__fnacc_launch_i64_v1";
-  case fir::fnacc::ElementType::F32:
-    return "__fnacc_launch_f32_v1";
-  case fir::fnacc::ElementType::F64:
-    return "__fnacc_launch_f64_v1";
-  case fir::fnacc::ElementType::Unknown:
-    llvm_unreachable("unknown FNACC element type");
-  }
-  llvm_unreachable("unhandled FNACC element type");
-}
-
 static StringRef getReductionRuntimeName(fir::fnacc::ElementType type) {
   switch (type) {
   case fir::fnacc::ElementType::I8:
@@ -117,16 +97,6 @@ static StringRef getScalarBindRuntimeName(fir::fnacc::ElementType type) {
     llvm_unreachable("unknown FNACC scalar element type");
   }
   llvm_unreachable("unhandled FNACC scalar element type");
-}
-
-static Value createZeroElement(OpBuilder &builder, Location loc, Type type) {
-  if (auto integerType = dyn_cast<IntegerType>(type))
-    return arith::ConstantOp::create(builder, loc, type,
-                                     builder.getIntegerAttr(integerType, 0));
-
-  auto floatType = cast<FloatType>(type);
-  return arith::ConstantOp::create(builder, loc, type,
-                                   builder.getFloatAttr(floatType, 0.0));
 }
 
 static BlockShape getBlockShape(fir::fnacc::LaunchOp launchOp,
@@ -730,6 +700,38 @@ tryGetLowerBoundsFromShapeValue(OpBuilder &builder, Location loc,
   return std::nullopt;
 }
 
+/// Recover the shape attached to an array access inside `launchOp`.
+///
+/// Hand-written FIR tests and some pre-declare lowering paths represent a
+/// dynamic explicit-shape array as a bare `!fir.ref<!fir.array<?x...>>`.  In
+/// that form the sequence type does not carry extents and there is no
+/// `fir.declare`, but each `fir.array_coor` still carries the authoritative
+/// `fir.shape` or `fir.shape_shift` value.  The shape must be defined outside
+/// the launch so it remains valid after runtime lowering erases the region.
+static std::optional<Value>
+tryGetLaunchArrayShape(fir::fnacc::LaunchOp launchOp, Value arrayLike) {
+  Value base = stripFirConvert(arrayLike);
+  std::optional<Value> result;
+
+  launchOp.walk([&](fir::ArrayCoorOp arrayCoor) {
+    if (stripFirConvert(arrayCoor.getMemref()) != base)
+      return WalkResult::advance();
+
+    Value shape = arrayCoor.getShape();
+    if (!shape)
+      return WalkResult::advance();
+
+    shape = stripFirConvert(shape);
+    if (isDefinedInsideLaunch(launchOp, shape))
+      return WalkResult::advance();
+
+    result = shape;
+    return WalkResult::interrupt();
+  });
+
+  return result;
+}
+
 struct FNACCLaunchArrayArgs {
   Value pointer;
   Value bytes;
@@ -794,6 +796,12 @@ tryCreateLaunchArrayArgs(OpBuilder &builder, Location loc,
   if (auto declareOp = value.getDefiningOp<fir::DeclareOp>()) {
     baseAddress = declareOp.getMemref();
     shape = declareOp.getShape();
+  }
+  if (!shape) {
+    if (std::optional<Value> launchShape =
+            tryGetLaunchArrayShape(launchOp, arrayLike)) {
+      shape = *launchShape;
+    }
   }
 
   std::optional<Type> objectType = getReferencedObjectType(baseAddress);
@@ -1133,7 +1141,8 @@ struct FNACCLowerToRuntimePass
       // contiguous storage. Preserve box strides long enough to reject a
       // non-contiguous assumed-shape actual argument before its base pointer
       // is passed to the CUDA runtime.
-      if (k.kind == fir::fnacc::ElementwiseKernelKind::Stencil2D) {
+      bool usesVariadicABI = fir::fnacc::usesVariadicLaunchABI(k.kind);
+      if (usesVariadicABI) {
         for (const auto &array : k.arrayArguments)
           validateContiguousBoxForLaunch(module, builder, loc, array.array);
       } else {
@@ -1279,7 +1288,7 @@ struct FNACCLowerToRuntimePass
         continue;
       }
 
-      if (isStencil2D) {
+      if (usesVariadicABI) {
         llvm::SmallVector<Value> beginOperands{
             kernelIdValue,
             rankValue,
@@ -1300,27 +1309,38 @@ struct FNACCLowerToRuntimePass
         for (auto [index, array] : llvm::enumerate(k.arrayArguments)) {
           auto layout = tryCreateLaunchArrayArgs(builder, loc, launchOp,
                                                  array.array, k.elementType);
-          if (!layout || layout->lowerBounds.size() < 2 ||
-              layout->elementStrides.size() < 2) {
+          if (!layout ||
+              layout->lowerBounds.size() < static_cast<unsigned>(k.rank) ||
+              layout->elementStrides.size() < static_cast<unsigned>(k.rank)) {
             launchOp.emitError(
-                "FNACC stencil array requires a contiguous rank-2 explicit "
+                "FNACC v2 array requires a contiguous rank-matched explicit "
                 "shape or descriptor-backed layout");
             signalPassFailure();
             return;
           }
 
           int32_t flags = (array.read ? 1 : 0) | (array.write ? 2 : 0);
+          auto lower = [&](unsigned dim) -> Value {
+            return dim < layout->lowerBounds.size()
+                       ? layout->lowerBounds[dim]
+                       : constantI64(builder, loc, 1);
+          };
+          auto stride = [&](unsigned dim) -> Value {
+            return dim < layout->elementStrides.size()
+                       ? layout->elementStrides[dim]
+                       : constantI64(builder, loc, dim == 0 ? 1 : 0);
+          };
           llvm::SmallVector<Value> bindOperands{
               constantI32(builder, loc, index),
               layout->pointer,
               layout->bytes,
               constantI32(builder, loc, flags),
-              layout->lowerBounds[0],
-              layout->lowerBounds[1],
-              constantI64(builder, loc, 1),
-              layout->elementStrides[0],
-              layout->elementStrides[1],
-              constantI64(builder, loc, 0)};
+              lower(0),
+              lower(1),
+              lower(2),
+              stride(0),
+              stride(1),
+              stride(2)};
           createRuntimeCall(module, builder, loc, "__fnacc_bind_array_v2",
                             bindOperands);
         }
@@ -1340,134 +1360,36 @@ struct FNACCLowerToRuntimePass
         continue;
       }
 
-      StringRef runtimeName = getElementwiseRuntimeName(k.elementType);
-
-      Type elementTy = getMLIRElementType(builder, k.elementType);
-      Type elementRefTy = fir::ReferenceType::get(elementTy);
-
-      if (k.readArrays.empty() || k.readArrays.size() > 3) {
-        launchOp.emitError(
-            "FNACC runtime lowering currently requires one to three "
-            "read arrays");
+      if (k.kind != fir::fnacc::ElementwiseKernelKind::MatMul2D ||
+          k.readArrays.size() != 2 || !k.writeArray) {
+        launchOp.emitError("FNACC specialized runtime expected matmul A/B/C");
         signalPassFailure();
         return;
       }
 
       Value read0Ptr = getRuntimeElementPointer(builder, loc, launchOp,
                                                 k.readArrays[0], k.elementType);
-
-      Value read1Ptr = read0Ptr;
-      if (k.readArrays.size() >= 2)
-        read1Ptr = getRuntimeElementPointer(builder, loc, launchOp,
-                                            k.readArrays[1], k.elementType);
-
-      Value read2Ptr = read0Ptr;
-      if (k.readArrays.size() >= 3)
-        read2Ptr = getRuntimeElementPointer(builder, loc, launchOp,
-                                            k.readArrays[2], k.elementType);
-
+      Value read1Ptr = getRuntimeElementPointer(builder, loc, launchOp,
+                                                k.readArrays[1], k.elementType);
       Value writePtr = getRuntimeElementPointer(builder, loc, launchOp,
                                                 k.writeArray, k.elementType);
 
-      if (!read0Ptr || !read1Ptr || !read2Ptr || !writePtr) {
+      if (!read0Ptr || !read1Ptr || !writePtr) {
         signalPassFailure();
         return;
       }
 
-      if (k.kind == fir::fnacc::ElementwiseKernelKind::MatMul2D) {
-
-        StringRef runtimeName = k.elementType == fir::fnacc::ElementType::F64
-                                    ? "__fnacc_launch_matmul_f64_v1"
-                                    : "__fnacc_launch_matmul_f32_v1";
-
-        llvm::SmallVector<Type> argTypes;
-        argTypes.push_back(kernelIdValue.getType());
-        argTypes.push_back(blockXValue.getType());
-        argTypes.push_back(blockYValue.getType());
-        argTypes.push_back(blockZValue.getType());
-        argTypes.push_back(read0Ptr.getType());
-        argTypes.push_back(read1Ptr.getType());
-        argTypes.push_back(writePtr.getType());
-        argTypes.push_back(extentXValue.getType());
-        argTypes.push_back(extentYValue.getType());
-        argTypes.push_back(extentZValue.getType());
-
-        func::FuncOp callee =
-            getOrCreateRuntimeDecl(module, builder, loc, runtimeName, argTypes);
-
-        llvm::SmallVector<Value> operands;
-        operands.push_back(kernelIdValue);
-        operands.push_back(blockXValue);
-        operands.push_back(blockYValue);
-        operands.push_back(blockZValue);
-        operands.push_back(read0Ptr);
-        operands.push_back(read1Ptr);
-        operands.push_back(writePtr);
-        operands.push_back(extentXValue);
-        operands.push_back(extentYValue);
-        operands.push_back(extentZValue);
-
-        func::CallOp::create(builder, loc, callee.getSymName(), TypeRange{},
-                             operands);
-
-        launchOp.erase();
-
-        ++fallbackKernelId;
-        continue;
-      }
-
-      unsigned scalarCount = k.scalarRefs.size();
-
-      if (k.readArrays.size() > 3) {
-        launchOp.emitError(
-            "FNACC generic runtime supports at most three read arrays");
-        signalPassFailure();
-        return;
-      }
-
-      if (scalarCount > 3) {
-        launchOp.emitError(
-            "FNACC generic runtime supports at most three scalar values");
-        signalPassFailure();
-        return;
-      }
-
-      Value numReadArraysValue =
-          arith::ConstantIntOp::create(builder, loc, k.readArrays.size(), 32);
-
-      Value numScalarsValue =
-          arith::ConstantIntOp::create(builder, loc, scalarCount, 32);
-
-      Value zeroElement = createZeroElement(builder, loc, elementTy);
-
-      Value scalar0Value = zeroElement;
-      Value scalar1Value = zeroElement;
-      Value scalar2Value = zeroElement;
-
-      if (scalarCount >= 1)
-        scalar0Value = fir::LoadOp::create(builder, loc, k.scalarRefs[0]);
-
-      if (scalarCount >= 2)
-        scalar1Value = fir::LoadOp::create(builder, loc, k.scalarRefs[1]);
-
-      if (scalarCount >= 3)
-        scalar2Value = fir::LoadOp::create(builder, loc, k.scalarRefs[2]);
-
+      StringRef runtimeName = k.elementType == fir::fnacc::ElementType::F64
+                                  ? "__fnacc_launch_matmul_f64_v1"
+                                  : "__fnacc_launch_matmul_f32_v1";
       llvm::SmallVector<Type> argTypes;
       argTypes.push_back(kernelIdValue.getType());
-      argTypes.push_back(rankValue.getType());
       argTypes.push_back(blockXValue.getType());
       argTypes.push_back(blockYValue.getType());
       argTypes.push_back(blockZValue.getType());
-      argTypes.push_back(numReadArraysValue.getType());
-      argTypes.push_back(numScalarsValue.getType());
-      argTypes.push_back(elementRefTy);
-      argTypes.push_back(elementRefTy);
-      argTypes.push_back(elementRefTy);
-      argTypes.push_back(elementRefTy);
-      argTypes.push_back(elementTy);
-      argTypes.push_back(elementTy);
-      argTypes.push_back(elementTy);
+      argTypes.push_back(read0Ptr.getType());
+      argTypes.push_back(read1Ptr.getType());
+      argTypes.push_back(writePtr.getType());
       argTypes.push_back(extentXValue.getType());
       argTypes.push_back(extentYValue.getType());
       argTypes.push_back(extentZValue.getType());
@@ -1477,19 +1399,12 @@ struct FNACCLowerToRuntimePass
 
       llvm::SmallVector<Value> operands;
       operands.push_back(kernelIdValue);
-      operands.push_back(rankValue);
       operands.push_back(blockXValue);
       operands.push_back(blockYValue);
       operands.push_back(blockZValue);
-      operands.push_back(numReadArraysValue);
-      operands.push_back(numScalarsValue);
       operands.push_back(read0Ptr);
       operands.push_back(read1Ptr);
-      operands.push_back(read2Ptr);
       operands.push_back(writePtr);
-      operands.push_back(scalar0Value);
-      operands.push_back(scalar1Value);
-      operands.push_back(scalar2Value);
       operands.push_back(extentXValue);
       operands.push_back(extentYValue);
       operands.push_back(extentZValue);

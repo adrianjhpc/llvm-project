@@ -16,7 +16,7 @@ subroutine vector_add_f64(n, a, b, c)
   end do
 end subroutine
 
-! HOST: call @__fnacc_launch_f64_v1
+! HOST: call @__fnacc_begin_launch_v2
 
 ! TTIR-LABEL: tt.func @fnacc_kernel_0
 ! TTIR-SAME: %a: !tt.ptr<f64>
@@ -37,4 +37,3 @@ end subroutine
 ! TTIR-SAME: tensor<128x!tt.ptr<f64>>
 
 ! JSON: "type": "ptr<f64>"
-

@@ -47,8 +47,9 @@ module {
   }
 }
 
-// HOST: func.func private @__fnacc_launch_f32_v1
-// HOST: call @__fnacc_launch_f32_v1
+// HOST: func.func private @__fnacc_begin_launch_v2
+// HOST: call @__fnacc_begin_launch_v2
+// HOST: call @__fnacc_commit_launch_v2
 // HOST-NOT: fnacc.launch
 
 // TTIR: tt.func @fnacc_kernel_0
@@ -58,4 +59,3 @@ module {
 // JSON: "name": "fnacc_kernel_0"
 // JSON: "rank": 1
 // JSON: "tile": [128, 1, 1]
-

@@ -1,5 +1,6 @@
 #include <cuda.h>
 
+#include <algorithm>
 #include <cerrno>
 #include <cstdint>
 #include <cstdio>
@@ -54,7 +55,7 @@ static void fnaccCudaCheck(
   } while (false)
 
 static constexpr const char *FNACC_RUNTIME_BUILD_ID =
-    "FNACC_RUNTIME_BUILD_ID_context_stream_reductions_v6";
+    "FNACC_RUNTIME_BUILD_ID_variadic_elementwise_v7";
 
 static std::size_t fnaccCheckedMul(
     std::size_t a, std::size_t b, const char *what) {
@@ -563,6 +564,116 @@ struct FNACCHiddenTritonArgs {
   CUdeviceptr hidden1 = 0;
 };
 
+enum class FNACCKernelParameterRole {
+  Read,
+  Write,
+  ReadWrite,
+  Partials,
+  Scalar,
+  ExtentX,
+  ExtentY,
+  ExtentZ,
+  LoopLowerX,
+  LoopLowerY,
+  LoopLowerZ,
+  ArrayLowerBound,
+  ArrayStride,
+  Unknown
+};
+
+struct FNACCKernelParameterDesc {
+  int32_t slot = -1;
+  FNACCKernelParameterRole role = FNACCKernelParameterRole::Unknown;
+  std::string type;
+  int32_t arrayIndex = -1;
+  int32_t scalarIndex = -1;
+  int32_t dimension = -1;
+};
+
+static FNACCKernelParameterRole fnaccParseParameterRole(
+    const std::string &role) {
+  if (role == "read")
+    return FNACCKernelParameterRole::Read;
+  if (role == "write")
+    return FNACCKernelParameterRole::Write;
+  if (role == "read_write")
+    return FNACCKernelParameterRole::ReadWrite;
+  if (role == "partials")
+    return FNACCKernelParameterRole::Partials;
+  if (role == "scalar")
+    return FNACCKernelParameterRole::Scalar;
+  if (role == "extent_x")
+    return FNACCKernelParameterRole::ExtentX;
+  if (role == "extent_y")
+    return FNACCKernelParameterRole::ExtentY;
+  if (role == "extent_k" || role == "extent_z")
+    return FNACCKernelParameterRole::ExtentZ;
+  if (role == "loop_lower_x")
+    return FNACCKernelParameterRole::LoopLowerX;
+  if (role == "loop_lower_y")
+    return FNACCKernelParameterRole::LoopLowerY;
+  if (role == "loop_lower_z")
+    return FNACCKernelParameterRole::LoopLowerZ;
+  if (role == "array_lower_bound")
+    return FNACCKernelParameterRole::ArrayLowerBound;
+  if (role == "array_stride")
+    return FNACCKernelParameterRole::ArrayStride;
+  return FNACCKernelParameterRole::Unknown;
+}
+
+static std::vector<FNACCKernelParameterDesc> jsonParseParameterEntries(
+    const std::string &kernelObjectText) {
+  std::vector<FNACCKernelParameterDesc> parameters;
+  std::string paramsArray;
+  if (!jsonFindArrayText(kernelObjectText, "params", paramsArray))
+    return parameters;
+
+  std::size_t pos = 0;
+  int32_t nextImplicitScalarIndex = 0;
+  while (true) {
+    std::size_t slotKey = paramsArray.find("\"slot\"", pos);
+    if (slotKey == std::string::npos)
+      break;
+    std::size_t objectStart = paramsArray.rfind('{', slotKey);
+    if (objectStart == std::string::npos)
+      break;
+    std::size_t objectEnd = findJsonObjectEnd(paramsArray, objectStart);
+    if (objectEnd == std::string::npos)
+      break;
+
+    std::string objectText =
+        paramsArray.substr(objectStart, objectEnd - objectStart);
+    FNACCKernelParameterDesc parameter;
+    std::string role;
+    if (!jsonFindInt(objectText, "slot", parameter.slot) ||
+        !jsonFindString(objectText, "role", role) ||
+        !jsonFindString(objectText, "type", parameter.type)) {
+      pos = objectEnd;
+      continue;
+    }
+    parameter.role = fnaccParseParameterRole(role);
+    jsonFindInt(objectText, "array_index", parameter.arrayIndex);
+    jsonFindInt(objectText, "scalar_index", parameter.scalarIndex);
+    jsonFindInt(objectText, "dimension", parameter.dimension);
+    // Stencil metadata emitted before the Stage 1 migration ordered scalars
+    // but did not spell out scalar_index. Preserve compatibility with those
+    // launch-ABI-v2 objects while making new metadata explicit.
+    if (parameter.role == FNACCKernelParameterRole::Scalar) {
+      if (parameter.scalarIndex < 0)
+        parameter.scalarIndex = nextImplicitScalarIndex;
+      nextImplicitScalarIndex =
+          std::max(nextImplicitScalarIndex, parameter.scalarIndex + 1);
+    }
+    parameters.push_back(std::move(parameter));
+    pos = objectEnd;
+  }
+
+  std::sort(parameters.begin(), parameters.end(),
+      [](const FNACCKernelParameterDesc &lhs,
+          const FNACCKernelParameterDesc &rhs) { return lhs.slot < rhs.slot; });
+  return parameters;
+}
+
 struct FNACCKernelDesc {
   int32_t id = -1;
   std::string name;
@@ -602,9 +713,154 @@ struct FNACCKernelDesc {
   // PACK metadata from JSON.
   std::vector<FNACCPackEntry> pack;
 
+  // Ordered, source-visible device parameters used by launch ABI v2.
+  std::vector<FNACCKernelParameterDesc> parameters;
+
   int32_t ptxIndex = 0;
   std::string ptxFile;
 };
+
+static std::size_t fnaccScalarParameterBytes(const std::string &type) {
+  if (type == "i8")
+    return sizeof(int8_t);
+  if (type == "i16")
+    return sizeof(int16_t);
+  if (type == "i32" || type == "f32")
+    return sizeof(int32_t);
+  if (type == "i64" || type == "f64")
+    return sizeof(int64_t);
+  return 0;
+}
+
+static bool fnaccIsPointerParameterType(const std::string &type) {
+  return type.size() > 5 && type.compare(0, 4, "ptr<") == 0 &&
+      type.back() == '>';
+}
+
+static void fnaccValidateVariadicKernelMetadata(const FNACCKernelDesc &desc) {
+  if (desc.rank < 1 || desc.rank > 2 || desc.arrayCount <= 0 ||
+      desc.scalarCount < 0 || desc.outputCount <= 0 ||
+      desc.parameters.empty()) {
+    std::fprintf(stderr,
+        "FNACC error: invalid v2 ABI metadata for kernel id %d\n", desc.id);
+    std::abort();
+  }
+
+  std::vector<bool> arraysReferenced(
+      static_cast<std::size_t>(desc.arrayCount), false);
+  std::vector<bool> scalarsReferenced(
+      static_cast<std::size_t>(desc.scalarCount), false);
+  int32_t extentCounts[3] = {0, 0, 0};
+
+  for (std::size_t index = 0; index < desc.parameters.size(); ++index) {
+    const FNACCKernelParameterDesc &parameter = desc.parameters[index];
+    if (parameter.slot != static_cast<int32_t>(index)) {
+      std::fprintf(stderr,
+          "FNACC error: non-contiguous v2 parameter slots for kernel id %d\n",
+          desc.id);
+      std::abort();
+    }
+
+    auto validateArray = [&](bool isPointerParameter = true) {
+      if (parameter.arrayIndex < 0 || parameter.arrayIndex >= desc.arrayCount) {
+        std::fprintf(stderr,
+            "FNACC error: invalid v2 array index for kernel id %d slot %d\n",
+            desc.id, parameter.slot);
+        std::abort();
+      }
+      if (isPointerParameter)
+        arraysReferenced[static_cast<std::size_t>(parameter.arrayIndex)] = true;
+    };
+
+    switch (parameter.role) {
+    case FNACCKernelParameterRole::Read:
+    case FNACCKernelParameterRole::Write:
+    case FNACCKernelParameterRole::ReadWrite:
+      validateArray();
+      if (!fnaccIsPointerParameterType(parameter.type)) {
+        std::fprintf(stderr,
+            "FNACC error: v2 array parameter is not a pointer for kernel id "
+            "%d slot %d\n",
+            desc.id, parameter.slot);
+        std::abort();
+      }
+      break;
+    case FNACCKernelParameterRole::Scalar:
+      if (parameter.scalarIndex < 0 ||
+          parameter.scalarIndex >= desc.scalarCount ||
+          fnaccScalarParameterBytes(parameter.type) == 0) {
+        std::fprintf(stderr,
+            "FNACC error: invalid v2 scalar metadata for kernel id %d slot "
+            "%d\n",
+            desc.id, parameter.slot);
+        std::abort();
+      }
+      scalarsReferenced[static_cast<std::size_t>(parameter.scalarIndex)] = true;
+      break;
+    case FNACCKernelParameterRole::ExtentX:
+    case FNACCKernelParameterRole::ExtentY:
+    case FNACCKernelParameterRole::ExtentZ: {
+      unsigned dim = parameter.role == FNACCKernelParameterRole::ExtentX ? 0
+          : parameter.role == FNACCKernelParameterRole::ExtentY          ? 1
+                                                                         : 2;
+      if (dim >= static_cast<unsigned>(desc.rank) || parameter.type != "i32") {
+        std::fprintf(stderr,
+            "FNACC error: invalid v2 extent metadata for kernel id %d slot "
+            "%d\n",
+            desc.id, parameter.slot);
+        std::abort();
+      }
+      ++extentCounts[dim];
+      break;
+    }
+    case FNACCKernelParameterRole::LoopLowerX:
+    case FNACCKernelParameterRole::LoopLowerY:
+    case FNACCKernelParameterRole::LoopLowerZ: {
+      unsigned dim = parameter.role == FNACCKernelParameterRole::LoopLowerX ? 0
+          : parameter.role == FNACCKernelParameterRole::LoopLowerY          ? 1
+                                                                            : 2;
+      if (dim >= static_cast<unsigned>(desc.rank) || parameter.type != "i32") {
+        std::fprintf(stderr,
+            "FNACC error: invalid v2 loop-lower metadata for kernel id %d "
+            "slot %d\n",
+            desc.id, parameter.slot);
+        std::abort();
+      }
+      break;
+    }
+    case FNACCKernelParameterRole::ArrayLowerBound:
+    case FNACCKernelParameterRole::ArrayStride:
+      validateArray(false);
+      if (parameter.dimension < 0 || parameter.dimension >= desc.rank ||
+          parameter.type != "i32") {
+        std::fprintf(stderr,
+            "FNACC error: invalid v2 array-layout metadata for kernel id %d "
+            "slot %d\n",
+            desc.id, parameter.slot);
+        std::abort();
+      }
+      break;
+    case FNACCKernelParameterRole::Partials:
+    case FNACCKernelParameterRole::Unknown:
+      std::fprintf(stderr,
+          "FNACC error: unsupported v2 parameter role for kernel id %d slot "
+          "%d\n",
+          desc.id, parameter.slot);
+      std::abort();
+    }
+  }
+
+  if (extentCounts[0] != 1 || (desc.rank >= 2 && extentCounts[1] != 1) ||
+      std::find(arraysReferenced.begin(), arraysReferenced.end(), false) !=
+          arraysReferenced.end() ||
+      std::find(scalarsReferenced.begin(), scalarsReferenced.end(), false) !=
+          scalarsReferenced.end()) {
+    std::fprintf(stderr,
+        "FNACC error: incomplete v2 parameter metadata for kernel id %d\n",
+        desc.id);
+    std::abort();
+  }
+}
 
 struct FNACCDeviceAllocation {
   CUdeviceptr ptr = 0;
@@ -1016,6 +1272,7 @@ fnaccParseKernelDescsFromJson(const std::string &json) {
     jsonFindInt(objectText, "output_count", desc.outputCount);
 
     desc.pack = jsonParsePackEntries(objectText);
+    desc.parameters = jsonParseParameterEntries(objectText);
     jsonFindInt(objectText, "reduction_stage_id", desc.reductionStageId);
 
     std::string reductionOp;
@@ -1063,14 +1320,14 @@ fnaccParseKernelDescsFromJson(const std::string &json) {
           desc.id, desc.tritonHiddenPtrArgs);
       std::abort();
     }
-    if (desc.kind == "stencil2d" &&
-        (desc.launchAbiVersion != 2 || desc.arrayCount <= 0 ||
-            desc.scalarCount < 0 || desc.outputCount <= 0)) {
+    if (desc.kind == "stencil2d" && desc.launchAbiVersion != 2) {
       std::fprintf(stderr,
           "FNACC error: invalid stencil2d ABI metadata for kernel id %d\n",
           desc.id);
       std::abort();
     }
+    if (desc.launchAbiVersion == 2)
+      fnaccValidateVariadicKernelMetadata(desc);
 
     for (const auto &entry : result) {
       if (entry.second.name == desc.name) {
@@ -1136,6 +1393,91 @@ static void fnaccCleanup() {
   fnaccRegistry.kernels.clear();
 
   fnaccRegistry.initialized = false;
+}
+
+static unsigned fnaccReductionIntegerDynamicSharedBytes(
+    const FNACCKernelDesc *desc, int32_t blockX, size_t integerSize) {
+
+  std::size_t bytes = fnaccCheckedMul(static_cast<std::size_t>(blockX),
+      integerSize, "reduction dynamic shared bytes");
+
+  // Align to 256 bytes.
+  bytes = fnaccCheckedAdd(bytes, 255, "reduction shared alignment") &
+      ~static_cast<std::size_t>(255);
+
+  // Triton may require padding/alignment beyond the simple tile estimate.
+  // Keep the conservative prototype minimum for now.
+  if (bytes < 16384)
+    bytes = 16384;
+
+  if (bytes > static_cast<std::size_t>(std::numeric_limits<unsigned>::max())) {
+    std::fprintf(stderr,
+        "FNACC error: reduction dynamic shared memory requirement too large: "
+        "%zu bytes\n",
+        bytes);
+    std::abort();
+  }
+
+  unsigned requiredBytes = static_cast<unsigned>(bytes);
+
+  return requiredBytes;
+}
+
+static unsigned fnaccReductionDynamicSharedBytes(
+    const FNACCKernelDesc *desc, int32_t blockX) {
+
+  std::size_t bytes = fnaccCheckedMul(static_cast<std::size_t>(blockX),
+      sizeof(float), "reduction dynamic shared bytes");
+
+  // Align to 256 bytes.
+  bytes = fnaccCheckedAdd(bytes, 255, "reduction shared alignment") &
+      ~static_cast<std::size_t>(255);
+
+  // Triton may require padding/alignment beyond the simple tile estimate.
+  // Keep the conservative prototype minimum for now.
+  if (bytes < 16384)
+    bytes = 16384;
+
+  if (bytes > static_cast<std::size_t>(std::numeric_limits<unsigned>::max())) {
+    std::fprintf(stderr,
+        "FNACC error: reduction dynamic shared memory requirement too large: "
+        "%zu bytes\n",
+        bytes);
+    std::abort();
+  }
+
+  unsigned requiredBytes = static_cast<unsigned>(bytes);
+
+  return requiredBytes;
+}
+
+static unsigned fnaccReductionF64DynamicSharedBytes(
+    const FNACCKernelDesc *desc, int32_t blockX) {
+
+  std::size_t bytes = fnaccCheckedMul(static_cast<std::size_t>(blockX),
+      sizeof(double), "reduction f64 dynamic shared bytes");
+
+  // Align to 256 bytes.
+  bytes = fnaccCheckedAdd(bytes, 255, "reduction f64 shared alignment") &
+      ~static_cast<std::size_t>(255);
+
+  // Triton may require padding/alignment beyond the simple tile estimate.
+  // Keep the conservative prototype minimum for now.
+  if (bytes < 16384)
+    bytes = 16384;
+
+  if (bytes > static_cast<std::size_t>(std::numeric_limits<unsigned>::max())) {
+    std::fprintf(stderr,
+        "FNACC error: reduction f64 dynamic shared memory requirement too "
+        "large: "
+        "%zu bytes\n",
+        bytes);
+    std::abort();
+  }
+
+  unsigned requiredBytes = static_cast<unsigned>(bytes);
+
+  return requiredBytes;
 }
 
 static unsigned fnaccMatmulDynamicSharedBytes(const FNACCKernelDesc *desc,
@@ -1573,6 +1915,37 @@ static int32_t fnaccEffectivePackTargetForSlot(
   if (fnaccHostPointerIsPresentOnDevice(hostPtr))
     return FNACC_PACK_TARGET_DEVICE;
 
+  return FNACC_PACK_TARGET_HOST;
+}
+
+static int32_t fnaccEffectivePackTargetForArray(
+    const FNACCKernelDesc *desc, int32_t arrayIndex, void *hostPtr) {
+  std::optional<int32_t> explicitTarget;
+  if (desc) {
+    for (const FNACCKernelParameterDesc &parameter : desc->parameters) {
+      if (parameter.arrayIndex != arrayIndex ||
+          (parameter.role != FNACCKernelParameterRole::Read &&
+              parameter.role != FNACCKernelParameterRole::Write &&
+              parameter.role != FNACCKernelParameterRole::ReadWrite))
+        continue;
+      std::optional<int32_t> candidate =
+          fnaccExplicitPackTargetForSlot(desc, parameter.slot);
+      if (!candidate)
+        continue;
+      if (explicitTarget && *explicitTarget != *candidate) {
+        std::fprintf(stderr,
+            "FNACC error: conflicting PACK targets for v2 array %d in "
+            "kernel id %d\n",
+            arrayIndex, desc->id);
+        std::abort();
+      }
+      explicitTarget = candidate;
+    }
+  }
+  if (explicitTarget)
+    return *explicitTarget;
+  if (fnaccHostPointerIsPresentOnDevice(hostPtr))
+    return FNACC_PACK_TARGET_DEVICE;
   return FNACC_PACK_TARGET_HOST;
 }
 
@@ -2599,7 +2972,7 @@ extern "C" void __fnacc_launch_nd_f32(int32_t kernelId, int32_t rank,
 }
 
 // -------------------------------------------------------------------------- //
-// Public runtime ABI v2: variadic descriptor-aware stencil launches
+// Public runtime ABI v2: variadic metadata-driven elementwise launches
 // -------------------------------------------------------------------------- //
 
 struct FNACCPendingArrayV2 {
@@ -2651,13 +3024,14 @@ extern "C" void __fnacc_begin_launch_v2(int32_t kernelId, int32_t rank,
   }
 
   const FNACCKernelDesc *desc = fnaccLookupKernelDesc(kernelId);
-  if (!desc || desc->kind != "stencil2d" || desc->launchAbiVersion != 2) {
+  if (!desc || desc->launchAbiVersion != 2) {
     std::fprintf(stderr,
-        "FNACC error: kernel id %d is not a stencil2d v2 kernel\n", kernelId);
+        "FNACC error: kernel id %d does not use launch ABI v2\n", kernelId);
     std::abort();
   }
-  if (rank != 2 || arrayCount != desc->arrayCount ||
-      scalarCount != desc->scalarCount || arrayCount <= 0 || scalarCount < 0) {
+  if (rank != desc->rank || rank < 1 || rank > 2 ||
+      arrayCount != desc->arrayCount || scalarCount != desc->scalarCount ||
+      arrayCount <= 0 || scalarCount < 0) {
     std::fprintf(stderr,
         "FNACC error: v2 launch ABI count/rank mismatch for kernel id %d\n",
         kernelId);
@@ -2777,7 +3151,7 @@ extern "C" void __fnacc_commit_launch_v2() {
       std::abort();
     }
 
-  if (pending.extent[0] <= 0 || pending.extent[1] <= 0) {
+  if (pending.extent[0] <= 0 || (pending.rank >= 2 && pending.extent[1] <= 0)) {
     fnaccClearPendingLaunchV2();
     return;
   }
@@ -2794,7 +3168,7 @@ extern "C" void __fnacc_commit_launch_v2() {
   devicePointers.reserve(pending.arrays.size());
   for (std::size_t slot = 0; slot < pending.arrays.size(); ++slot) {
     FNACCPendingArrayV2 &array = pending.arrays[slot];
-    int32_t target = fnaccEffectivePackTargetForSlot(
+    int32_t target = fnaccEffectivePackTargetForArray(
         desc, static_cast<int32_t>(slot), array.host);
     FNACCDeviceArg device = (array.flags & 1)
         ? fnaccPrepareReadBuffer(
@@ -2805,47 +3179,98 @@ extern "C" void __fnacc_commit_launch_v2() {
     deviceArgs.push_back(device);
   }
 
-  std::vector<int32_t> layoutValues;
-  layoutValues.reserve(pending.arrays.size() * 4);
-  for (const FNACCPendingArrayV2 &array : pending.arrays) {
-    layoutValues.push_back(
-        fnaccCheckedI32Layout(array.lower[0], "array lower bound X"));
-    layoutValues.push_back(
-        fnaccCheckedI32Layout(array.lower[1], "array lower bound Y"));
-    layoutValues.push_back(
-        fnaccCheckedI32Layout(array.stride[0], "array stride X"));
-    layoutValues.push_back(
-        fnaccCheckedI32Layout(array.stride[1], "array stride Y"));
-  }
-
+  std::vector<int32_t> parameterValues(desc->parameters.size(), 0);
   std::vector<void *> arguments;
-  arguments.reserve(devicePointers.size() + pending.scalars.size() + 6 +
-      layoutValues.size() + 2);
-  for (CUdeviceptr &pointer : devicePointers)
-    arguments.push_back(&pointer);
-  for (FNACCPendingScalarV2 &scalar : pending.scalars)
-    arguments.push_back(&scalar.storage);
-  arguments.push_back(&pending.extent[0]);
-  arguments.push_back(&pending.extent[1]);
-  arguments.push_back(&pending.loopLower[0]);
-  arguments.push_back(&pending.loopLower[1]);
-  for (int32_t &value : layoutValues)
-    arguments.push_back(&value);
+  arguments.reserve(desc->parameters.size() + 2);
+  for (const FNACCKernelParameterDesc &parameter : desc->parameters) {
+    switch (parameter.role) {
+    case FNACCKernelParameterRole::Read:
+    case FNACCKernelParameterRole::Write:
+    case FNACCKernelParameterRole::ReadWrite: {
+      FNACCPendingArrayV2 &array = pending.arrays[parameter.arrayIndex];
+      int32_t requiredFlags = parameter.role == FNACCKernelParameterRole::Read
+          ? 1
+          : parameter.role == FNACCKernelParameterRole::Write ? 2
+                                                              : 3;
+      if ((array.flags & requiredFlags) != requiredFlags) {
+        std::fprintf(stderr,
+            "FNACC error: v2 array binding flags disagree with kernel id %d "
+            "slot %d\n",
+            pending.kernelId, parameter.slot);
+        std::abort();
+      }
+      arguments.push_back(&devicePointers[parameter.arrayIndex]);
+      break;
+    }
+    case FNACCKernelParameterRole::Scalar: {
+      FNACCPendingScalarV2 &scalar = pending.scalars[parameter.scalarIndex];
+      if (scalar.bytes != fnaccScalarParameterBytes(parameter.type)) {
+        std::fprintf(stderr,
+            "FNACC error: v2 scalar binding type mismatch for kernel id %d "
+            "slot %d\n",
+            pending.kernelId, parameter.slot);
+        std::abort();
+      }
+      arguments.push_back(&scalar.storage);
+      break;
+    }
+    case FNACCKernelParameterRole::ExtentX:
+      arguments.push_back(&pending.extent[0]);
+      break;
+    case FNACCKernelParameterRole::ExtentY:
+      arguments.push_back(&pending.extent[1]);
+      break;
+    case FNACCKernelParameterRole::ExtentZ:
+      arguments.push_back(&pending.extent[2]);
+      break;
+    case FNACCKernelParameterRole::LoopLowerX:
+      arguments.push_back(&pending.loopLower[0]);
+      break;
+    case FNACCKernelParameterRole::LoopLowerY:
+      arguments.push_back(&pending.loopLower[1]);
+      break;
+    case FNACCKernelParameterRole::LoopLowerZ:
+      arguments.push_back(&pending.loopLower[2]);
+      break;
+    case FNACCKernelParameterRole::ArrayLowerBound:
+    case FNACCKernelParameterRole::ArrayStride: {
+      const FNACCPendingArrayV2 &array = pending.arrays[parameter.arrayIndex];
+      int64_t value =
+          parameter.role == FNACCKernelParameterRole::ArrayLowerBound
+          ? array.lower[parameter.dimension]
+          : array.stride[parameter.dimension];
+      parameterValues[parameter.slot] = fnaccCheckedI32Layout(value,
+          parameter.role == FNACCKernelParameterRole::ArrayLowerBound
+              ? "array lower bound"
+              : "array stride");
+      arguments.push_back(&parameterValues[parameter.slot]);
+      break;
+    }
+    case FNACCKernelParameterRole::Partials:
+    case FNACCKernelParameterRole::Unknown:
+      std::fprintf(stderr,
+          "FNACC error: unsupported parameter in v2 commit for kernel id %d "
+          "slot %d\n",
+          pending.kernelId, parameter.slot);
+      std::abort();
+    }
+  }
   FNACCHiddenTritonArgs hidden;
   arguments.push_back(&hidden.hidden0);
   arguments.push_back(&hidden.hidden1);
 
   unsigned gridX =
       fnaccCdiv(pending.extent[0], pending.block[0], "v2 grid dimension X");
-  unsigned gridY =
-      fnaccCdiv(pending.extent[1], pending.block[1], "v2 grid dimension Y");
+  unsigned gridY = pending.rank >= 2
+      ? fnaccCdiv(pending.extent[1], pending.block[1], "v2 grid dimension Y")
+      : 1;
   if (fnaccDebugEnabled()) {
     std::fprintf(stderr,
-        "FNACC: launch stencil2d v2 kernel id=%d arrays=%zu scalars=%zu "
+        "FNACC: launch %s v2 kernel id=%d arrays=%zu scalars=%zu "
         "grid=(%u,%u,1) extent=(%d,%d) lower=(%d,%d)\n",
-        pending.kernelId, pending.arrays.size(), pending.scalars.size(), gridX,
-        gridY, pending.extent[0], pending.extent[1], pending.loopLower[0],
-        pending.loopLower[1]);
+        desc->kind.c_str(), pending.kernelId, pending.arrays.size(),
+        pending.scalars.size(), gridX, gridY, pending.extent[0],
+        pending.extent[1], pending.loopLower[0], pending.loopLower[1]);
   }
 
   FNACC_CUDA_CHECK(cuLaunchKernel(function, gridX, gridY, 1, cudaBlockX, 1, 1,
@@ -4228,8 +4653,15 @@ static bool fnaccFinalizeReductionOnDevice(const FNACCKernelDesc *primaryDesc,
           stageCudaBlockX);
     }
 
+    unsigned dynamicSharedBytes =
+        fnaccReductionDynamicSharedBytes(stageDesc, stageBlock);
+
+    fnaccConfigureDynamicSharedMemory(
+        stageFn, stageKernelId, dynamicSharedBytes);
+
     FNACC_CUDA_CHECK(cuLaunchKernel(stageFn, outputCount, 1, 1, stageCudaBlockX,
-        1, 1, 0, fnaccActiveContextState().stream, args, nullptr));
+        1, 1, dynamicSharedBytes, fnaccActiveContextState().stream, args,
+        nullptr));
     ++workspace.stageLaunches;
 
     CUdeviceptr oldCurrent = current;
@@ -4322,8 +4754,12 @@ extern "C" void __fnacc_launch_reduce_f32_v2(int32_t kernelId, int32_t blockX,
 
   fnaccValidateCudaBlockSize(fn, kernelId, cudaBlockX);
 
-  FNACC_CUDA_CHECK(cuLaunchKernel(fn, gridX, 1, 1, cudaBlockX, 1, 1, 0,
-      fnaccActiveContextState().stream, args, nullptr));
+  unsigned dynamicSharedBytes = fnaccReductionDynamicSharedBytes(desc, blockX);
+
+  fnaccConfigureDynamicSharedMemory(fn, kernelId, dynamicSharedBytes);
+
+  FNACC_CUDA_CHECK(cuLaunchKernel(fn, gridX, 1, 1, cudaBlockX, 1, 1,
+      dynamicSharedBytes, fnaccActiveContextState().stream, args, nullptr));
   ++workspace.primaryLaunches;
 
   float reducedValue = fnaccReductionIdentity<float>(desc->reductionOp);
@@ -4425,8 +4861,13 @@ extern "C" void __fnacc_launch_reduce_f64_v2(int32_t kernelId, int32_t blockX,
 
   fnaccValidateCudaBlockSize(fn, kernelId, cudaBlockX);
 
-  FNACC_CUDA_CHECK(cuLaunchKernel(fn, gridX, 1, 1, cudaBlockX, 1, 1, 0,
-      fnaccActiveContextState().stream, args, nullptr));
+  unsigned dynamicSharedBytes =
+      fnaccReductionF64DynamicSharedBytes(desc, blockX);
+
+  fnaccConfigureDynamicSharedMemory(fn, kernelId, dynamicSharedBytes);
+
+  FNACC_CUDA_CHECK(cuLaunchKernel(fn, gridX, 1, 1, cudaBlockX, 1, 1,
+      dynamicSharedBytes, fnaccActiveContextState().stream, args, nullptr));
   ++workspace.primaryLaunches;
 
   double reducedValue = fnaccReductionIdentity<double>(desc->reductionOp);
@@ -4520,8 +4961,14 @@ static void fnaccLaunchReduceIntegerV2(const char *abiName,
   args[argCount++] = &hidden.hidden1;
 
   fnaccValidateCudaBlockSize(fn, kernelId, cudaBlockX);
-  FNACC_CUDA_CHECK(cuLaunchKernel(fn, gridX, 1, 1, cudaBlockX, 1, 1, 0,
-      fnaccActiveContextState().stream, args, nullptr));
+
+  unsigned dynamicSharedBytes =
+      fnaccReductionIntegerDynamicSharedBytes(desc, blockX, sizeof(Integer));
+
+  fnaccConfigureDynamicSharedMemory(fn, kernelId, dynamicSharedBytes);
+
+  FNACC_CUDA_CHECK(cuLaunchKernel(fn, gridX, 1, 1, cudaBlockX, 1, 1,
+      dynamicSharedBytes, fnaccActiveContextState().stream, args, nullptr));
   ++workspace.primaryLaunches;
 
   Integer reducedValue = fnaccReductionIdentity<Integer>(desc->reductionOp);

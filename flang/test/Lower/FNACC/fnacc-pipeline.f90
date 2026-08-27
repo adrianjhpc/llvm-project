@@ -19,13 +19,17 @@ subroutine fnacc_pipeline_test(n, a, b, c)
   !$fnacc release all
 end subroutine
 
-! HOST-DAG: func.func private @__fnacc_launch_f32_v1
+! HOST-DAG: func.func private @__fnacc_begin_launch_v2
+! HOST-DAG: func.func private @__fnacc_bind_array_v2
+! HOST-DAG: func.func private @__fnacc_commit_launch_v2
 ! HOST-DAG: func.func private @__fnacc_update_host
 ! HOST-DAG: func.func private @__fnacc_release_all
 
 
 ! HOST-LABEL: func.func @_QPfnacc_pipeline_test
-! HOST: call @__fnacc_launch_f32_v1
+! HOST: call @__fnacc_begin_launch_v2
+! HOST-COUNT-3: call @__fnacc_bind_array_v2
+! HOST: call @__fnacc_commit_launch_v2
 ! HOST: call @__fnacc_update_host
 ! HOST: call @__fnacc_release_all
 
@@ -47,6 +51,10 @@ end subroutine
 ! JSON: "id": 0
 ! JSON: "name": "fnacc_kernel_0"
 ! JSON: "kind": "binary"
+! JSON: "launch_abi_version": 2
+! JSON: "array_count": 3
+! JSON: "scalar_count": 0
+! JSON: "output_count": 1
 ! JSON: "rank": 1
 ! JSON: "tile": [128, 1, 1]
 ! JSON: "pack": [
@@ -56,4 +64,3 @@ end subroutine
 ! JSON: "kernel_arg_slot": 2
 ! JSON: "target": 1
 ! JSON: "target_name": "device"
-
