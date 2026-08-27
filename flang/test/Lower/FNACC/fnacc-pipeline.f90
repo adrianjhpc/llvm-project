@@ -51,12 +51,12 @@ end subroutine
 ! JSON: "id": 0
 ! JSON: "name": "fnacc_kernel_0"
 ! JSON: "kind": "binary"
+! JSON: "rank": 1
+! JSON: "tile": [128, 1, 1]
 ! JSON: "launch_abi_version": 2
 ! JSON: "array_count": 3
 ! JSON: "scalar_count": 0
 ! JSON: "output_count": 1
-! JSON: "rank": 1
-! JSON: "tile": [128, 1, 1]
 ! JSON: "pack": [
 ! JSON: "kernel_arg_slot": 0
 ! JSON: "target": 1

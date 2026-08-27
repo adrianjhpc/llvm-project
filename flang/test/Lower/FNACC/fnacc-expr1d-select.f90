@@ -29,7 +29,12 @@ subroutine fnacc_expr1d_select_arrays(n, a, b, c)
   end do
 end subroutine
 
-! HOST-COUNT-2: call @__fnacc_launch_f32_v1
+! HOST-DAG: func.func private @__fnacc_begin_launch_v2
+! HOST-DAG: func.func private @__fnacc_bind_array_v2
+! HOST-DAG: func.func private @__fnacc_commit_launch_v2
+! HOST-COUNT-2: call @__fnacc_begin_launch_v2
+! HOST: call @__fnacc_bind_array_v2
+! HOST: call @__fnacc_commit_launch_v2
 ! HOST-NOT: fnacc.launch
 
 ! TTIR-LABEL: tt.func @fnacc_kernel_0(

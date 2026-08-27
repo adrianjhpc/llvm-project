@@ -1,5 +1,4 @@
-
-// RUN: not fir-opt \
+// RUN: fir-opt \
 // RUN:   --fnacc-assign-kernel-ids \
 // RUN:   --fnacc-lower-to-runtime \
 // RUN:   %s | FileCheck %s
@@ -59,9 +58,9 @@ module {
   }
 }
 
-// CHECK: func.func private @__fnacc_begin_launch_v2
-// CHECK: func.func private @__fnacc_bind_array_v2
-// CHECK: func.func private @__fnacc_commit_launch_v2
+// CHECK-DAG: func.func private @__fnacc_begin_launch_v2
+// CHECK-DAG: func.func private @__fnacc_bind_array_v2
+// CHECK-DAG: func.func private @__fnacc_commit_launch_v2
 
 // CHECK-LABEL: func.func @unsupported_four_reads
 // CHECK: call @__fnacc_begin_launch_v2

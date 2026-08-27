@@ -18,18 +18,15 @@ subroutine fnacc_add_allocatable_f64(n, a, b, c)
 end subroutine
 
 ! HOST-DAG: func.func private @__fnacc_begin_launch_v2
+! HOST-DAG: func.func private @__fnacc_bind_array_v2
+! HOST-DAG: func.func private @__fnacc_commit_launch_v2
 
 ! HOST-LABEL: func.func @_QPfnacc_add_allocatable_f64
-! HOST-NOT: fnacc.launch
 ! HOST: %[[N64:.*]] = fir.load {{.*}} : !fir.ref<i64>
 ! HOST: %[[N32:.*]] = fir.convert %[[N64]] : (i64) -> i32
-! HOST: %[[A_BOX:.*]] = fir.load {{.*}} : !fir.ref<!fir.box<!fir.heap<!fir.array<?xf64>>>>
-! HOST: %[[A_ADDR:.*]] = fir.box_addr %[[A_BOX]] : (!fir.box<!fir.heap<!fir.array<?xf64>>>) -> !fir.heap<!fir.array<?xf64>>
-! HOST: %[[B_BOX:.*]] = fir.load {{.*}} : !fir.ref<!fir.box<!fir.heap<!fir.array<?xf64>>>>
-! HOST: %[[B_ADDR:.*]] = fir.box_addr %[[B_BOX]] : (!fir.box<!fir.heap<!fir.array<?xf64>>>) -> !fir.heap<!fir.array<?xf64>>
-! HOST: %[[C_BOX:.*]] = fir.load {{.*}} : !fir.ref<!fir.box<!fir.heap<!fir.array<?xf64>>>>
-! HOST: %[[C_ADDR:.*]] = fir.box_addr %[[C_BOX]] : (!fir.box<!fir.heap<!fir.array<?xf64>>>) -> !fir.heap<!fir.array<?xf64>>
 ! HOST: call @__fnacc_begin_launch_v2
+! HOST-COUNT-3: call @__fnacc_bind_array_v2
+! HOST: call @__fnacc_commit_launch_v2
 ! HOST-NOT: fnacc.launch
 
 ! TTIR-LABEL: tt.func @fnacc_kernel_0

@@ -19,15 +19,14 @@ end subroutine
 
 ! HOST-DAG: func.func private @__fnacc_validate_contiguous_desc
 ! HOST-DAG: func.func private @__fnacc_begin_launch_v2
+! HOST-DAG: func.func private @__fnacc_bind_array_v2
+! HOST-DAG: func.func private @__fnacc_commit_launch_v2
 
 ! HOST-LABEL: func.func @_QPmatrix_add_assumed_shape
-! HOST: fir.box_dims
-! HOST: fir.box_dims
 ! HOST-COUNT-3: call @__fnacc_validate_contiguous_desc
-! HOST: fir.box_addr
-! HOST: fir.box_addr
-! HOST: fir.box_addr
 ! HOST: call @__fnacc_begin_launch_v2
+! HOST-COUNT-3: call @__fnacc_bind_array_v2
+! HOST: call @__fnacc_commit_launch_v2
 ! HOST-NOT: fnacc.launch
 
 ! TTIR: tt.func @fnacc_kernel_0

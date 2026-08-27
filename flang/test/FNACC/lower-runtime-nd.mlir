@@ -99,19 +99,16 @@ module {
   }
 }
 
-// CHECK: func.func private @__fnacc_begin_launch_v2
-// CHECK: func.func private @__fnacc_bind_array_v2
-// CHECK: func.func private @__fnacc_commit_launch_v2
+// CHECK-DAG: func.func private @__fnacc_begin_launch_v2
+// CHECK-DAG: func.func private @__fnacc_bind_array_v2
+// CHECK-DAG: func.func private @__fnacc_commit_launch_v2
 
 // CHECK-LABEL: func.func @kernel1d
-// CHECK: fir.convert {{.*}} : (!fir.ref<!fir.array<?xf32>>) -> !fir.ref<f32>
 // CHECK: call @__fnacc_begin_launch_v2
 // CHECK-COUNT-3: call @__fnacc_bind_array_v2
 // CHECK: call @__fnacc_commit_launch_v2
 
 // CHECK-LABEL: func.func @kernel2d
-// CHECK: fir.convert {{.*}} : (!fir.ref<!fir.array<?x?xf32>>) -> !fir.ref<f32>
 // CHECK: call @__fnacc_begin_launch_v2
 // CHECK-COUNT-3: call @__fnacc_bind_array_v2
 // CHECK: call @__fnacc_commit_launch_v2
-

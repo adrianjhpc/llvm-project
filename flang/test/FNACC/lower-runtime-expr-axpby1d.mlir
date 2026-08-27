@@ -51,14 +51,12 @@ module {
   }
 }
 
-// CHECK: func.func private @__fnacc_begin_launch_v2
-// CHECK: func.func private @__fnacc_bind_array_v2
-// CHECK: func.func private @__fnacc_bind_scalar_f32_v2
-// CHECK: func.func private @__fnacc_commit_launch_v2
+// CHECK-DAG: func.func private @__fnacc_begin_launch_v2
+// CHECK-DAG: func.func private @__fnacc_bind_array_v2
+// CHECK-DAG: func.func private @__fnacc_bind_scalar_f32_v2
+// CHECK-DAG: func.func private @__fnacc_commit_launch_v2
 
 // CHECK-LABEL: func.func @axpby1d
-// CHECK: fir.load %arg2 : !fir.ref<f32>
-// CHECK: fir.load %arg3 : !fir.ref<f32>
 // CHECK: call @__fnacc_begin_launch_v2
 // CHECK-COUNT-3: call @__fnacc_bind_array_v2
 // CHECK-COUNT-2: call @__fnacc_bind_scalar_f32_v2

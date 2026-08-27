@@ -51,10 +51,12 @@ subroutine fnacc_expr_integer_i16(n, a, b, c)
   end do
 end subroutine
 
-! HOST: call @__fnacc_launch_i32_v1
-! HOST: call @__fnacc_launch_i64_v1
-! HOST: call @__fnacc_launch_i8_v1
-! HOST: call @__fnacc_launch_i16_v1
+! HOST-DAG: func.func private @__fnacc_begin_launch_v2
+! HOST-DAG: func.func private @__fnacc_bind_array_v2
+! HOST-DAG: func.func private @__fnacc_commit_launch_v2
+! HOST-COUNT-4: call @__fnacc_begin_launch_v2
+! HOST: call @__fnacc_bind_array_v2
+! HOST: call @__fnacc_commit_launch_v2
 ! HOST-NOT: fnacc.launch
 
 ! TTIR-LABEL: tt.func @fnacc_kernel_0(

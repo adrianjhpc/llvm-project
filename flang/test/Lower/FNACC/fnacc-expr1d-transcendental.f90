@@ -51,7 +51,12 @@ subroutine fnacc_expr1d_tanh(n, a, b)
   end do
 end subroutine
 
-! HOST-COUNT-4: call @__fnacc_launch_f32_v1
+! HOST-DAG: func.func private @__fnacc_begin_launch_v2
+! HOST-DAG: func.func private @__fnacc_bind_array_v2
+! HOST-DAG: func.func private @__fnacc_commit_launch_v2
+! HOST-COUNT-4: call @__fnacc_begin_launch_v2
+! HOST: call @__fnacc_bind_array_v2
+! HOST: call @__fnacc_commit_launch_v2
 ! HOST-NOT: fnacc.launch
 
 ! TTIR-LABEL: tt.func @fnacc_kernel_0(
