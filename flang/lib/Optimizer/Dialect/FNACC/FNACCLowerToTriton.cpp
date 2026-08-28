@@ -385,16 +385,16 @@ static std::string emitExprVector(const fir::fnacc::ElementwiseKernel &k,
       os << "  " << stem << "_zero = arith.constant 0 : i32\n";
       os << "  " << stem << "_zero_s = tt.splat " << stem
          << "_zero : i32 -> tensor<" << block << "xi32>\n";
-      os << "  " << stem << "_reversed = arith.subi " << stem
-         << "_zero_s, " << value << " : tensor<" << block << "xi32>\n";
+      os << "  " << stem << "_reversed = arith.subi " << stem << "_zero_s, "
+         << value << " : tensor<" << block << "xi32>\n";
       value = stem + "_reversed";
     }
 
     if (expr.affineBaseIndex >= 0) {
-      os << "  " << stem << "_base_s = tt.splat %index"
-         << expr.affineBaseIndex << " : i32 -> tensor<" << block << "xi32>\n";
-      StringRef operation = expr.affineBaseCoefficient == -1 ? "arith.subi"
-                                                              : "arith.addi";
+      os << "  " << stem << "_base_s = tt.splat %index" << expr.affineBaseIndex
+         << " : i32 -> tensor<" << block << "xi32>\n";
+      StringRef operation =
+          expr.affineBaseCoefficient == -1 ? "arith.subi" : "arith.addi";
       os << "  " << stem << "_based = " << operation << " " << value << ", "
          << stem << "_base_s : tensor<" << block << "xi32>\n";
       value = stem + "_based";
@@ -405,8 +405,8 @@ static std::string emitExprVector(const fir::fnacc::ElementwiseKernel &k,
          << " : i32\n";
       os << "  " << stem << "_delta_s = tt.splat " << stem
          << "_delta : i32 -> tensor<" << block << "xi32>\n";
-      os << "  " << stem << "_adjusted = arith.addi " << value << ", "
-         << stem << "_delta_s : tensor<" << block << "xi32>\n";
+      os << "  " << stem << "_adjusted = arith.addi " << value << ", " << stem
+         << "_delta_s : tensor<" << block << "xi32>\n";
       value = stem + "_adjusted";
     }
 
@@ -693,8 +693,8 @@ static void emitTritonMultiExpr1D(const fir::fnacc::ElementwiseKernel &k,
   for (unsigned i = 0; i < k.scalarRefs.size(); ++i)
     parameter("scalar" + std::to_string(i), elemTy);
   for (unsigned i = 0; i < k.indexRefs.size(); ++i)
-    parameter("index" + std::to_string(i), "i32");  
-  parameter("extent_x", "i32"); 
+    parameter("index" + std::to_string(i), "i32");
+  parameter("extent_x", "i32");
   parameter("loop_lower_x", "i32");
   for (unsigned array = 0; array < k.arrayArguments.size(); ++array) {
     parameter("array" + std::to_string(array) + "_lower0", "i32");
@@ -713,8 +713,8 @@ static void emitTritonMultiExpr1D(const fir::fnacc::ElementwiseKernel &k,
      << "xi32>\n";
   os << "  %mask = arith.cmpi slt, %offs, %extent_s : tensor<" << block
      << "xi32>\n";
-  os << "  %loop_lower_x_s = tt.splat %loop_lower_x : i32 -> tensor<"
-     << block << "xi32>\n";
+  os << "  %loop_lower_x_s = tt.splat %loop_lower_x : i32 -> tensor<" << block
+     << "xi32>\n";
   os << "  %source_x = arith.addi %offs, %loop_lower_x_s : tensor<" << block
      << "xi32>\n";
 
@@ -728,20 +728,19 @@ static void emitTritonMultiExpr1D(const fir::fnacc::ElementwiseKernel &k,
       os << "  %" << stem << "_zero = arith.constant 0 : i32\n";
       os << "  %" << stem << "_zero_s = tt.splat %" << stem
          << "_zero : i32 -> tensor<" << block << "xi32>\n";
-      os << "  %" << stem << "_reversed = arith.subi %" << stem
-         << "_zero_s, " << source << " : tensor<" << block << "xi32>\n";
+      os << "  %" << stem << "_reversed = arith.subi %" << stem << "_zero_s, "
+         << source << " : tensor<" << block << "xi32>\n";
       source = "%" + stem.str() + "_reversed";
     }
     if (baseIndex >= 0) {
       os << "  %" << stem << "_base_s = tt.splat %index" << baseIndex
          << " : i32 -> tensor<" << block << "xi32>\n";
-      os << "  %" << stem << "_based = arith.addi " << source << ", %"
-         << stem << "_base_s : tensor<" << block << "xi32>\n";
+      os << "  %" << stem << "_based = arith.addi " << source << ", %" << stem
+         << "_base_s : tensor<" << block << "xi32>\n";
       source = "%" + stem.str() + "_based";
     }
     if (offset != 0) {
-      os << "  %" << stem << "_delta = arith.constant " << offset
-         << " : i32\n";
+      os << "  %" << stem << "_delta = arith.constant " << offset << " : i32\n";
       os << "  %" << stem << "_delta_s = tt.splat %" << stem
          << "_delta : i32 -> tensor<" << block << "xi32>\n";
       os << "  %" << stem << "_adjusted = arith.addi " << source << ", %"
@@ -788,8 +787,8 @@ static void emitTritonMultiExpr1D(const fir::fnacc::ElementwiseKernel &k,
     emitLinearOffset(output.arrayArgumentIndex, output.coefficients[0],
                      output.baseIndices[0], output.offsets[0], stem);
     os << "  %" << stem << "_base = tt.splat %array"
-       << output.arrayArgumentIndex
-       << " : " << ptrTy << " -> " << ptrVecTy << "\n";
+       << output.arrayArgumentIndex << " : " << ptrTy << " -> " << ptrVecTy
+       << "\n";
     os << "  %" << stem << "_ptr = tt.addptr %" << stem << "_base, %" << stem
        << "_offset : " << ptrVecTy << ", tensor<" << block << "xi32>\n";
     os << "  tt.store %" << stem << "_ptr, " << result
@@ -1301,8 +1300,7 @@ static void emitTritonStencil2D(const fir::fnacc::ElementwiseKernel &k,
     using Kind = fir::fnacc::ElementwiseIndexExprKind;
     switch (expression->kind) {
     case Kind::LoopIndex:
-      assert(expression->loopDimension < 2 &&
-             "invalid stencil loop dimension");
+      assert(expression->loopDimension < 2 && "invalid stencil loop dimension");
       return expression->loopDimension == 0 ? "%source_x" : "%source_y";
     case Kind::Capture:
       assert(expression->captureIndex >= 0 &&
@@ -1327,16 +1325,15 @@ static void emitTritonStencil2D(const fir::fnacc::ElementwiseKernel &k,
       break;
     }
 
-    std::string lhs = emitIndexExpression(expression->operands[0],
-                                          stem.str() + "_lhs");
-    std::string rhs = emitIndexExpression(expression->operands[1],
-                                          stem.str() + "_rhs");
-    StringRef operation = expression->kind == Kind::Add      ? "arith.addi"
-                          : expression->kind == Kind::Subtract
-                              ? "arith.subi"
-                              : "arith.muli";
-    os << "  %" << stem << "_value = " << operation << " " << lhs << ", "
-       << rhs << " : tensor<" << block << "xi32>\n";
+    std::string lhs =
+        emitIndexExpression(expression->operands[0], stem.str() + "_lhs");
+    std::string rhs =
+        emitIndexExpression(expression->operands[1], stem.str() + "_rhs");
+    StringRef operation = expression->kind == Kind::Add        ? "arith.addi"
+                          : expression->kind == Kind::Subtract ? "arith.subi"
+                                                               : "arith.muli";
+    os << "  %" << stem << "_value = " << operation << " " << lhs << ", " << rhs
+       << " : tensor<" << block << "xi32>\n";
     return "%" + stem.str() + "_value";
   };
 
@@ -1355,22 +1352,21 @@ static void emitTritonStencil2D(const fir::fnacc::ElementwiseKernel &k,
       os << "  %" << stem << "_zero = arith.constant 0 : i32\n";
       os << "  %" << stem << "_zero_s = tt.splat %" << stem
          << "_zero : i32 -> tensor<" << block << "xi32>\n";
-      os << "  %" << stem << "_reversed = arith.subi %" << stem
-         << "_zero_s, " << source << " : tensor<" << block << "xi32>\n";
+      os << "  %" << stem << "_reversed = arith.subi %" << stem << "_zero_s, "
+         << source << " : tensor<" << block << "xi32>\n";
       source = "%" + stem.str() + "_reversed";
     }
 
     if (baseIndex >= 0) {
       os << "  %" << stem << "_base_s = tt.splat %index" << baseIndex
          << " : i32 -> tensor<" << block << "xi32>\n";
-      os << "  %" << stem << "_based = arith.addi " << source << ", %"
-         << stem << "_base_s : tensor<" << block << "xi32>\n";
+      os << "  %" << stem << "_based = arith.addi " << source << ", %" << stem
+         << "_base_s : tensor<" << block << "xi32>\n";
       source = "%" + stem.str() + "_based";
     }
 
     if (offset != 0) {
-      os << "  %" << stem << "_delta = arith.constant " << offset
-         << " : i32\n";
+      os << "  %" << stem << "_delta = arith.constant " << offset << " : i32\n";
       os << "  %" << stem << "_delta_s = tt.splat %" << stem
          << "_delta : i32 -> tensor<" << block << "xi32>\n";
       os << "  %" << stem << "_adjusted = arith.addi " << source << ", %"
@@ -1379,70 +1375,69 @@ static void emitTritonStencil2D(const fir::fnacc::ElementwiseKernel &k,
     }
     return source;
   };
-  
-  auto emitLinearOffset = [&](unsigned array, ArrayRef<int64_t> offsets,
-			      ArrayRef<unsigned> dimensions,
-                              ArrayRef<int64_t> coefficients,
-                              ArrayRef<int32_t> baseIndices,
-                              ArrayRef<std::shared_ptr<
-                                  fir::fnacc::ElementwiseIndexExpr>>
-                                  indexExpressions,
-                              StringRef stem) {
-    assert(offsets.size() == dimensions.size() &&
-           offsets.size() == coefficients.size() &&
-           offsets.size() == baseIndices.size() &&
-           (indexExpressions.empty() ||
-            offsets.size() == indexExpressions.size()) &&
-           !offsets.empty());
-    auto emitSubscript = [&](unsigned dimension) {
-      if (!indexExpressions.empty() && indexExpressions[dimension])
-        return emitIndexExpression(
-            indexExpressions[dimension],
-            stem.str() + "_dim" + std::to_string(dimension));
-      return emitAdjustedSource(
-          dimensions[dimension], coefficients[dimension],
-          baseIndices[dimension], offsets[dimension],
-          stem.str() + "_dim" + std::to_string(dimension));
-    };
 
-    if (offsets.size() == 1) {
-      assert(dimensions[0] < 2 && "invalid projected stencil dimension");
-      std::string source = emitSubscript(0);
-      os << "  %" << stem << "_lower0_s = tt.splat %array" << array
-         << "_lower0 : i32 -> tensor<" << block << "xi32>\n";
-      os << "  %" << stem << "_index = arith.subi " << source << ", %" << stem
-         << "_lower0_s : tensor<" << block << "xi32>\n";
-      os << "  %" << stem << "_stride0_s = tt.splat %array" << array
-         << "_stride0 : i32 -> tensor<" << block << "xi32>\n";
-      os << "  %" << stem << "_offset = arith.muli %" << stem << "_index, %"
-         << stem << "_stride0_s : tensor<" << block << "xi32>\n";
-      return;
-    }
+  auto emitLinearOffset =
+      [&](unsigned array, ArrayRef<int64_t> offsets,
+          ArrayRef<unsigned> dimensions, ArrayRef<int64_t> coefficients,
+          ArrayRef<int32_t> baseIndices,
+          ArrayRef<std::shared_ptr<fir::fnacc::ElementwiseIndexExpr>>
+              indexExpressions,
+          StringRef stem) {
+        assert(offsets.size() == dimensions.size() &&
+               offsets.size() == coefficients.size() &&
+               offsets.size() == baseIndices.size() &&
+               (indexExpressions.empty() ||
+                offsets.size() == indexExpressions.size()) &&
+               !offsets.empty());
+        auto emitSubscript = [&](unsigned dimension) {
+          if (!indexExpressions.empty() && indexExpressions[dimension])
+            return emitIndexExpression(indexExpressions[dimension],
+                                       stem.str() + "_dim" +
+                                           std::to_string(dimension));
+          return emitAdjustedSource(
+              dimensions[dimension], coefficients[dimension],
+              baseIndices[dimension], offsets[dimension],
+              stem.str() + "_dim" + std::to_string(dimension));
+        };
 
-    assert(offsets.size() == 2 && "unsupported stencil array rank");
-    std::string x = "%" + stem.str() + "_x";
-    std::string y = "%" + stem.str() + "_y";
-    std::string xAdjusted = emitSubscript(0);
-    std::string yAdjusted = emitSubscript(1);
-    os << "  %" << stem << "_lower0_s = tt.splat %array" << array
-       << "_lower0 : i32 -> tensor<" << block << "xi32>\n";
-    os << "  %" << stem << "_lower1_s = tt.splat %array" << array
-       << "_lower1 : i32 -> tensor<" << block << "xi32>\n";
-    os << "  " << x << " = arith.subi " << xAdjusted << ", %" << stem
-       << "_lower0_s : tensor<" << block << "xi32>\n";
-    os << "  " << y << " = arith.subi " << yAdjusted << ", %" << stem
-       << "_lower1_s : tensor<" << block << "xi32>\n";
-    os << "  %" << stem << "_stride0_s = tt.splat %array" << array
-       << "_stride0 : i32 -> tensor<" << block << "xi32>\n";
-    os << "  %" << stem << "_stride1_s = tt.splat %array" << array
-       << "_stride1 : i32 -> tensor<" << block << "xi32>\n";
-    os << "  %" << stem << "_xpart = arith.muli " << x << ", %" << stem
-       << "_stride0_s : tensor<" << block << "xi32>\n";
-    os << "  %" << stem << "_ypart = arith.muli " << y << ", %" << stem
-       << "_stride1_s : tensor<" << block << "xi32>\n";
-    os << "  %" << stem << "_offset = arith.addi %" << stem << "_xpart, %"
-       << stem << "_ypart : tensor<" << block << "xi32>\n";
-  };
+        if (offsets.size() == 1) {
+          assert(dimensions[0] < 2 && "invalid projected stencil dimension");
+          std::string source = emitSubscript(0);
+          os << "  %" << stem << "_lower0_s = tt.splat %array" << array
+             << "_lower0 : i32 -> tensor<" << block << "xi32>\n";
+          os << "  %" << stem << "_index = arith.subi " << source << ", %"
+             << stem << "_lower0_s : tensor<" << block << "xi32>\n";
+          os << "  %" << stem << "_stride0_s = tt.splat %array" << array
+             << "_stride0 : i32 -> tensor<" << block << "xi32>\n";
+          os << "  %" << stem << "_offset = arith.muli %" << stem << "_index, %"
+             << stem << "_stride0_s : tensor<" << block << "xi32>\n";
+          return;
+        }
+
+        assert(offsets.size() == 2 && "unsupported stencil array rank");
+        std::string x = "%" + stem.str() + "_x";
+        std::string y = "%" + stem.str() + "_y";
+        std::string xAdjusted = emitSubscript(0);
+        std::string yAdjusted = emitSubscript(1);
+        os << "  %" << stem << "_lower0_s = tt.splat %array" << array
+           << "_lower0 : i32 -> tensor<" << block << "xi32>\n";
+        os << "  %" << stem << "_lower1_s = tt.splat %array" << array
+           << "_lower1 : i32 -> tensor<" << block << "xi32>\n";
+        os << "  " << x << " = arith.subi " << xAdjusted << ", %" << stem
+           << "_lower0_s : tensor<" << block << "xi32>\n";
+        os << "  " << y << " = arith.subi " << yAdjusted << ", %" << stem
+           << "_lower1_s : tensor<" << block << "xi32>\n";
+        os << "  %" << stem << "_stride0_s = tt.splat %array" << array
+           << "_stride0 : i32 -> tensor<" << block << "xi32>\n";
+        os << "  %" << stem << "_stride1_s = tt.splat %array" << array
+           << "_stride1 : i32 -> tensor<" << block << "xi32>\n";
+        os << "  %" << stem << "_xpart = arith.muli " << x << ", %" << stem
+           << "_stride0_s : tensor<" << block << "xi32>\n";
+        os << "  %" << stem << "_ypart = arith.muli " << y << ", %" << stem
+           << "_stride1_s : tensor<" << block << "xi32>\n";
+        os << "  %" << stem << "_offset = arith.addi %" << stem << "_xpart, %"
+           << stem << "_ypart : tensor<" << block << "xi32>\n";
+      };
 
   ExprTritonEmitterState state;
   state.block = block;
@@ -1453,8 +1448,8 @@ static void emitTritonStencil2D(const fir::fnacc::ElementwiseKernel &k,
   for (auto [index, access] : llvm::enumerate(k.arrayAccesses)) {
     std::string stem = "access" + std::to_string(index);
     emitLinearOffset(access.arrayArgumentIndex, access.offsets,
-                     access.dimensions, access.coefficients,
-		     access.baseIndices, access.indexExpressions, stem);
+                     access.dimensions, access.coefficients, access.baseIndices,
+                     access.indexExpressions, stem);
     os << "  %" << stem << "_base = tt.splat %array"
        << access.arrayArgumentIndex << " : " << ptrTy << " -> " << ptrVecTy
        << "\n";
@@ -1469,8 +1464,8 @@ static void emitTritonStencil2D(const fir::fnacc::ElementwiseKernel &k,
     std::string result = emitExprVector(k, *output.expression, state, os);
     std::string stem = "output" + std::to_string(index);
     emitLinearOffset(output.arrayArgumentIndex, output.offsets,
-                     output.dimensions, output.coefficients,
-                     output.baseIndices, output.indexExpressions, stem);		     
+                     output.dimensions, output.coefficients, output.baseIndices,
+                     output.indexExpressions, stem);
     os << "  %" << stem << "_base = tt.splat %array"
        << output.arrayArgumentIndex << " : " << ptrTy << " -> " << ptrVecTy
        << "\n";
@@ -2251,8 +2246,8 @@ static void emitJsonDescriptor(const fir::fnacc::FNACCKernelPlan &plan,
   if (plan.usesVariadicABI) {
     os << "      \"launch_abi_version\": 2,\n";
     os << "      \"array_count\": " << k.arrayArguments.size() << ",\n";
-    os << "      \"scalar_count\": "
-       << k.scalarRefs.size() + k.indexRefs.size() << ",\n";
+    os << "      \"scalar_count\": " << k.scalarRefs.size() + k.indexRefs.size()
+       << ",\n";
     os << "      \"output_count\": "
        << (k.outputs.empty() ? 1 : k.outputs.size()) << ",\n";
   }
