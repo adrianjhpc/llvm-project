@@ -1236,8 +1236,10 @@ struct FNACCLowerToRuntimePass
           arith::ConstantIntOp::create(builder, loc, blockShape.z, 32);
 
       bool isStencil2D = k.kind == fir::fnacc::ElementwiseKernelKind::Stencil2D;
+      bool isAffine1D =
+          k.kind == fir::fnacc::ElementwiseKernelKind::MultiExpr1D;
       Value extentXValue =
-          isStencil2D
+          isStencil2D || isAffine1D
               ? materializeTripExtent(builder, loc, launchOp, k.extentX,
                                       k.loopLowerX)
               : materializeExtentValue(builder, loc, launchOp, k.extentX);
@@ -1267,7 +1269,7 @@ struct FNACCLowerToRuntimePass
       }
 
       Value loopLowerXValue =
-          isStencil2D
+          isStencil2D || isAffine1D
               ? materializeExtentValue(builder, loc, launchOp, k.loopLowerX)
               : constantI32(builder, loc, 1);
       Value loopLowerYValue =
@@ -1295,7 +1297,8 @@ struct FNACCLowerToRuntimePass
             loopLowerYValue,
             loopLowerZValue,
             constantI32(builder, loc, k.arrayArguments.size()),
-            constantI32(builder, loc, k.scalarRefs.size())};
+            constantI32(builder, loc,
+                        k.scalarRefs.size() + k.indexRefs.size())};
         createRuntimeCall(module, builder, loc, "__fnacc_begin_launch_v2",
                           beginOperands);
 
@@ -1360,6 +1363,17 @@ struct FNACCLowerToRuntimePass
           createRuntimeCall(
               module, builder, loc, scalarBindName,
               ValueRange{constantI32(builder, loc, index), scalarValue});
+        }
+
+        for (auto [index, indexRef] : llvm::enumerate(k.indexRefs)) {
+          Value indexValue = fir::LoadOp::create(builder, loc, indexRef);
+          indexValue = convertToI32(builder, loc, indexValue);
+          createRuntimeCall(
+              module, builder, loc, "__fnacc_bind_scalar_i32_v2",
+              ValueRange{constantI32(
+                             builder, loc,
+                             static_cast<int32_t>(k.scalarRefs.size() + index)),
+                         indexValue});
         }
 
         createRuntimeCall(module, builder, loc, "__fnacc_commit_launch_v2",

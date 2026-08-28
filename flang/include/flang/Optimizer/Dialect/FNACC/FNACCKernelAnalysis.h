@@ -83,6 +83,7 @@ enum class ReductionOperator : int32_t {
 enum class ElementwiseExprKind {
   ArrayLoad,
   ScalarLoad,
+  AffineIndex,
   ConstantReal,
   ConstantInteger,
 
@@ -146,6 +147,10 @@ struct ElementwiseExpr {
   // Index in ElementwiseKernel::arrayAccesses. This distinguishes two loads
   // from the same array at different stencil offsets.
   int32_t arrayAccessIndex = -1;
+  int64_t affineCoefficient = 1;
+  int32_t affineBaseIndex = -1;
+  int64_t affineBaseCoefficient = 0;
+  int64_t affineOffset = 0;
   double realValue = 0.0;
   int64_t integerValue = 0;
 
@@ -161,6 +166,28 @@ struct ScalarCapture {
   mlir::Value value;
 };
 
+enum class ElementwiseIndexExprKind {
+  LoopIndex,
+  Capture,
+  Constant,
+  Add,
+  Subtract,
+  Multiply
+};
+
+/// Integer subscript expression for rank-projected pack/unpack accesses.
+/// Multiplication is accepted only when at most one operand varies across the
+/// logical iteration space; this permits runtime leading dimensions without
+/// admitting products of two loop coordinates.
+struct ElementwiseIndexExpr {
+  ElementwiseIndexExprKind kind;
+  unsigned loopDimension = 0;
+  mlir::Value capture;
+  int32_t captureIndex = -1;
+  int64_t constantValue = 0;
+  llvm::SmallVector<std::shared_ptr<ElementwiseIndexExpr>, 2> operands;
+};
+
 struct ElementwiseArrayAccess {
   mlir::Value array;
   mlir::Value loadedValue;
@@ -169,7 +196,14 @@ struct ElementwiseArrayAccess {
   /// subscript. A rank-1 coordinate array in a rank-2 stencil therefore uses
   /// either {0} (the inner/X loop) or {1} (the outer/Y loop).
   llvm::SmallVector<unsigned, 3> dimensions;
+  /// Coefficient of the selected logical loop coordinate. The affine stencil
+  /// subset currently accepts +1 and -1.
+  llvm::SmallVector<int64_t, 3> coefficients;
+  /// Optional index into ElementwiseKernel::indexRefs for a uniform integer
+  /// base added to this array dimension. -1 means that no base is present.
+  llvm::SmallVector<int32_t, 3> baseIndices;
   llvm::SmallVector<int64_t, 3> offsets;
+  llvm::SmallVector<std::shared_ptr<ElementwiseIndexExpr>, 3> indexExpressions;
 };
 
 struct ElementwiseOutput {
@@ -177,7 +211,10 @@ struct ElementwiseOutput {
   mlir::Value storedValue;
   unsigned arrayArgumentIndex = 0;
   llvm::SmallVector<unsigned, 3> dimensions;
+  llvm::SmallVector<int64_t, 3> coefficients;
+  llvm::SmallVector<int32_t, 3> baseIndices;
   llvm::SmallVector<int64_t, 3> offsets;
+  llvm::SmallVector<std::shared_ptr<ElementwiseIndexExpr>, 3> indexExpressions;
   std::unique_ptr<ElementwiseExpr> expression;
 };
 
@@ -256,7 +293,7 @@ struct ElementwiseKernel {
   mlir::Value writeArray;
 
   /// Unique array bindings for the variadic ABI. Stencil accesses retain their
-  /// constant affine offsets, and each stencil output owns an expression root.
+  /// affine coordinate transforms, and each output owns an expression root.
   llvm::SmallVector<ElementwiseArrayArgument> arrayArguments;
   llvm::SmallVector<ElementwiseArrayAccess> arrayAccesses;
   llvm::SmallVector<ElementwiseOutput> outputs;
@@ -264,6 +301,11 @@ struct ElementwiseKernel {
 
   /// Host-visible, read-only scalar references passed to the kernel by value.
   llvm::SmallVector<mlir::Value> scalarRefs;
+
+  /// Host-visible integer references used only to construct affine array
+  /// subscripts. They are converted to i32 and appended to the v2 scalar
+  /// bindings after scalarRefs.
+  llvm::SmallVector<mlir::Value> indexRefs;
 
   /// Scalar references proven iteration-private and promoted into the
   /// expression tree. They are recorded for diagnostics and validation only;

@@ -520,36 +520,235 @@ static std::optional<int64_t> getIndexConstant(Value value) {
   return constant.getSExtValue();
 }
 
-/// Match `induction + constant` after FIR converts. Fortran subscripts such as
-/// j, j+1 and k-2 all reach this helper. Products or cross-dimensional index
-/// expressions are intentionally rejected.
-static std::optional<int64_t> matchAffineIndex(Value value,
-                                               Value inductionMemref) {
+static std::optional<Value> getReadOnlyScalarCaptureRef(Value value);
+
+struct AffineIndexMatch {
+  int64_t coefficient = 0;
+  Value baseRef;
+  int64_t baseCoefficient = 0;
+  int64_t offset = 0;
+};
+
+static std::optional<AffineIndexMatch>
+combineAffineIndexMatches(const AffineIndexMatch &lhs,
+                          const AffineIndexMatch &rhs, int64_t rhsSign) {
+  if (lhs.baseRef && rhs.baseRef)
+    return std::nullopt;
+
+  AffineIndexMatch result;
+  result.coefficient = lhs.coefficient + rhsSign * rhs.coefficient;
+  result.baseRef = lhs.baseRef ? lhs.baseRef : rhs.baseRef;
+  result.baseCoefficient =
+      lhs.baseRef ? lhs.baseCoefficient : rhsSign * rhs.baseCoefficient;
+  result.offset = lhs.offset + rhsSign * rhs.offset;
+  return result;
+}
+
+static std::optional<AffineIndexMatch>
+matchAffineIndexExpression(Value value, Value inductionMemref) {
   value = stripFirConvert(value);
 
-  if (auto load = value.getDefiningOp<fir::LoadOp>())
-    return load.getMemref() == inductionMemref ? std::optional<int64_t>(0)
-                                               : std::nullopt;
-
-  if (auto add = value.getDefiningOp<arith::AddIOp>()) {
-    if (auto constant = getIndexConstant(add.getRhs())) {
-      if (auto base = matchAffineIndex(add.getLhs(), inductionMemref))
-        return *base + *constant;
-    }
-    if (auto constant = getIndexConstant(add.getLhs())) {
-      if (auto base = matchAffineIndex(add.getRhs(), inductionMemref))
-        return *base + *constant;
-    }
+  if (auto constant = getIndexConstant(value)) {
+    AffineIndexMatch result;
+    result.offset = *constant;
+    return result;
   }
 
-  if (auto sub = value.getDefiningOp<arith::SubIOp>()) {
-    if (auto constant = getIndexConstant(sub.getRhs())) {
-      if (auto base = matchAffineIndex(sub.getLhs(), inductionMemref))
-        return *base - *constant;
+  if (auto load = value.getDefiningOp<fir::LoadOp>()) {
+    if (load.getMemref() == inductionMemref) {
+      AffineIndexMatch result;
+      result.coefficient = 1;
+      return result;
     }
+
+    std::optional<Value> capture = getReadOnlyScalarCaptureRef(value);
+    if (!capture)
+      return std::nullopt;
+    auto refTy = dyn_cast<fir::ReferenceType>(capture->getType());
+    if (!refTy)
+      return std::nullopt;
+    Type elementType = refTy.getEleTy();
+    if (!elementType.isInteger(8) && !elementType.isInteger(16) &&
+        !elementType.isInteger(32) && !elementType.isInteger(64))
+      return std::nullopt;
+
+    AffineIndexMatch result;
+    result.baseRef = *capture;
+    result.baseCoefficient = 1;
+    return result;
+  }
+
+  if (auto add = value.getDefiningOp<arith::AddIOp>()) {
+    auto lhs = matchAffineIndexExpression(add.getLhs(), inductionMemref);
+    auto rhs = matchAffineIndexExpression(add.getRhs(), inductionMemref);
+    if (lhs && rhs)
+      return combineAffineIndexMatches(*lhs, *rhs, 1);
+  }
+
+  if (auto subtract = value.getDefiningOp<arith::SubIOp>()) {
+    auto lhs =
+        matchAffineIndexExpression(subtract.getLhs(), inductionMemref);
+    auto rhs =
+        matchAffineIndexExpression(subtract.getRhs(), inductionMemref);
+    if (lhs && rhs)
+      return combineAffineIndexMatches(*lhs, *rhs, -1);
   }
 
   return std::nullopt;
+}
+
+/// Match `coefficient * induction + base + constant` after FIR converts.
+/// Coefficients are limited to +1 and -1, and at most one host-visible integer
+/// base is accepted. This covers ordinary stencil offsets as well as reversed
+/// halo coordinates such as `x_min-j` and `left_xmax+1-j`.
+static std::optional<AffineIndexMatch>
+matchAffineIndex(Value value, Value inductionMemref) {
+  std::optional<AffineIndexMatch> result =
+      matchAffineIndexExpression(value, inductionMemref);
+  if (!result || (result->coefficient != 1 && result->coefficient != -1) ||
+      (result->baseRef && result->baseCoefficient != 1))
+    return std::nullopt;
+  return result;
+}
+
+static Value stripIndexExpressionWrappers(Value value) {
+  while (true) {
+    value = stripFirConvert(value);
+    Operation *operation = value.getDefiningOp();
+    if (!operation || operation->getNumOperands() != 1 ||
+        operation->getName().getStringRef() != "fir.no_reassoc")
+      return value;
+    value = operation->getOperand(0);
+  }
+}
+
+static std::shared_ptr<ElementwiseIndexExpr>
+makeIndexExpr(ElementwiseIndexExprKind kind) {
+  auto expression = std::make_shared<ElementwiseIndexExpr>();
+  expression->kind = kind;
+  return expression;
+}
+
+static unsigned
+getIndexExpressionLoopMask(const std::shared_ptr<ElementwiseIndexExpr> &expr) {
+  if (!expr)
+    return 0;
+  if (expr->kind == ElementwiseIndexExprKind::LoopIndex)
+    return 1u << expr->loopDimension;
+  unsigned mask = 0;
+  for (const auto &operand : expr->operands)
+    mask |= getIndexExpressionLoopMask(operand);
+  return mask;
+}
+
+static bool sameIndexExpression(
+    const std::shared_ptr<ElementwiseIndexExpr> &lhs,
+    const std::shared_ptr<ElementwiseIndexExpr> &rhs) {
+  if (!lhs || !rhs)
+    return lhs == rhs;
+  if (lhs->kind != rhs->kind || lhs->loopDimension != rhs->loopDimension ||
+      lhs->capture != rhs->capture || lhs->constantValue != rhs->constantValue ||
+      lhs->operands.size() != rhs->operands.size())
+    return false;
+  for (auto [lhsOperand, rhsOperand] :
+       llvm::zip_equal(lhs->operands, rhs->operands))
+    if (!sameIndexExpression(lhsOperand, rhsOperand))
+      return false;
+  return true;
+}
+
+static bool sameIndexExpressions(
+    ArrayRef<std::shared_ptr<ElementwiseIndexExpr>> lhs,
+    ArrayRef<std::shared_ptr<ElementwiseIndexExpr>> rhs) {
+  if (lhs.size() != rhs.size())
+    return false;
+  for (auto [lhsExpression, rhsExpression] : llvm::zip_equal(lhs, rhs))
+    if (!sameIndexExpression(lhsExpression, rhsExpression))
+      return false;
+  return true;
+}
+
+static std::shared_ptr<ElementwiseIndexExpr> matchGeneralIndexExpression(
+    Value value, ArrayRef<Value> inductionMemrefs, Operation *before,
+    llvm::SmallVectorImpl<Operation *> &consumedOps) {
+  value = stripIndexExpressionWrappers(value);
+
+  if (auto constant = getIndexConstant(value)) {
+    auto expression = makeIndexExpr(ElementwiseIndexExprKind::Constant);
+    expression->constantValue = *constant;
+    return expression;
+  }
+
+  if (auto load = value.getDefiningOp<fir::LoadOp>()) {
+    for (auto [dimension, memref] : llvm::enumerate(inductionMemrefs)) {
+      if (!sameValueAfterFirConvert(load.getMemref(), memref))
+        continue;
+      auto expression = makeIndexExpr(ElementwiseIndexExprKind::LoopIndex);
+      expression->loopDimension = dimension;
+      return expression;
+    }
+
+    if (auto capture = getReadOnlyScalarCaptureRef(value)) {
+      auto referenceType = dyn_cast<fir::ReferenceType>(capture->getType());
+      Type type = referenceType ? referenceType.getEleTy() : Type{};
+      if (type && (type.isInteger(8) || type.isInteger(16) ||
+                   type.isInteger(32) || type.isInteger(64))) {
+        auto expression = makeIndexExpr(ElementwiseIndexExprKind::Capture);
+        expression->capture = *capture;
+        return expression;
+      }
+    }
+
+    // Resolve a straight-line iteration-private index temporary, as emitted
+    // for `index = ...; buffer(index) = ...` in CloverLeaf pack kernels.
+    if (before && before->getBlock() == load->getBlock()) {
+      for (auto iterator = before->getIterator();
+           iterator != before->getBlock()->begin();) {
+        --iterator;
+        auto store = dyn_cast<fir::StoreOp>(&*iterator);
+        if (!store ||
+            !sameValueAfterFirConvert(store.getMemref(), load.getMemref()))
+          continue;
+        if (!llvm::is_contained(consumedOps, load.getOperation()))
+          consumedOps.push_back(load.getOperation());
+        if (!llvm::is_contained(consumedOps, store.getOperation()))
+          consumedOps.push_back(store.getOperation());
+        return matchGeneralIndexExpression(store.getValue(), inductionMemrefs,
+                                           store.getOperation(), consumedOps);
+      }
+    }
+    return {};
+  }
+
+  Operation *operation = value.getDefiningOp();
+  if (!operation || operation->getNumOperands() != 2)
+    return {};
+
+  ElementwiseIndexExprKind kind;
+  if (isa<arith::AddIOp>(operation))
+    kind = ElementwiseIndexExprKind::Add;
+  else if (isa<arith::SubIOp>(operation))
+    kind = ElementwiseIndexExprKind::Subtract;
+  else if (isa<arith::MulIOp>(operation))
+    kind = ElementwiseIndexExprKind::Multiply;
+  else
+    return {};
+
+  auto lhs = matchGeneralIndexExpression(operation->getOperand(0),
+                                         inductionMemrefs, before, consumedOps);
+  auto rhs = matchGeneralIndexExpression(operation->getOperand(1),
+                                         inductionMemrefs, before, consumedOps);
+  if (!lhs || !rhs)
+    return {};
+  if (kind == ElementwiseIndexExprKind::Multiply &&
+      getIndexExpressionLoopMask(lhs) != 0 &&
+      getIndexExpressionLoopMask(rhs) != 0)
+    return {};
+
+  auto expression = makeIndexExpr(kind);
+  expression->operands.push_back(std::move(lhs));
+  expression->operands.push_back(std::move(rhs));
+  return expression;
 }
 
 static fir::fnacc::ElementType getSupportedElementType(Type type) {
@@ -792,7 +991,11 @@ struct ArrayAccessInfo {
   llvm::SmallVector<Value> readArrays;
   llvm::SmallVector<Value> readValues;
   llvm::SmallVector<llvm::SmallVector<unsigned, 3>> readDimensions;
+  llvm::SmallVector<llvm::SmallVector<int64_t, 3>> readCoefficients;
+  llvm::SmallVector<llvm::SmallVector<Value, 3>> readBaseRefs;
   llvm::SmallVector<llvm::SmallVector<int64_t, 3>> readOffsets;
+  llvm::SmallVector<llvm::SmallVector<std::shared_ptr<ElementwiseIndexExpr>, 3>>
+      readIndexExpressions;
 
   // A later store to one output may read the value written by an earlier
   // store to the same logical element. Such straight-line assignments are
@@ -806,7 +1009,12 @@ struct ArrayAccessInfo {
   llvm::SmallVector<Value> storedValues;
   llvm::SmallVector<Operation *> writeStores;
   llvm::SmallVector<llvm::SmallVector<unsigned, 3>> writeDimensions;
+  llvm::SmallVector<llvm::SmallVector<int64_t, 3>> writeCoefficients;
+  llvm::SmallVector<llvm::SmallVector<Value, 3>> writeBaseRefs;
   llvm::SmallVector<llvm::SmallVector<int64_t, 3>> writeOffsets;
+  llvm::SmallVector<llvm::SmallVector<std::shared_ptr<ElementwiseIndexExpr>, 3>>
+      writeIndexExpressions;
+  llvm::SmallVector<Operation *, 4> indexExpressionOps;
   struct WriteCondition {
     Operation *ifOperation = nullptr;
     Value condition;
@@ -814,12 +1022,30 @@ struct ArrayAccessInfo {
   };
   llvm::SmallVector<llvm::SmallVector<WriteCondition, 2>> writeConditions;
 
-  bool hasNonZeroOffset() const {
+  bool hasNonIdentitySubscript() const {
     auto hasOffset = [](ArrayRef<int64_t> offsets) {
       return llvm::any_of(offsets, [](int64_t value) { return value != 0; });
     };
+    auto hasNonUnitCoefficient = [](ArrayRef<int64_t> coefficients) {
+      return llvm::any_of(coefficients,
+                          [](int64_t value) { return value != 1; });
+    };
+    auto hasBase = [](ArrayRef<Value> bases) {
+      return llvm::any_of(bases, [](Value value) { return bool(value); });
+    };
+    auto hasGeneralExpression = [](const auto &expressions) {
+      return llvm::any_of(expressions, [](const auto &expression) {
+        return static_cast<bool>(expression);
+      });
+    };
     return llvm::any_of(readOffsets, hasOffset) ||
-           llvm::any_of(writeOffsets, hasOffset);
+           llvm::any_of(writeOffsets, hasOffset) ||
+           llvm::any_of(readCoefficients, hasNonUnitCoefficient) ||
+           llvm::any_of(writeCoefficients, hasNonUnitCoefficient) ||
+           llvm::any_of(readBaseRefs, hasBase) ||
+           llvm::any_of(writeBaseRefs, hasBase) ||
+           llvm::any_of(readIndexExpressions, hasGeneralExpression) ||
+           llvm::any_of(writeIndexExpressions, hasGeneralExpression);
   }
 };
 
@@ -1220,6 +1446,28 @@ recognizeElementwiseExpr(Value value, const ArrayAccessInfo &accesses,
     return expression;
   }
 
+  // An induction-derived value may participate in the stored expression as
+  // well as in an array address. Preserve the source Fortran coordinate so a
+  // non-unit loop origin does not become the zero-based device offset. The
+  // captured integer base is kept separate from element-typed scalar captures.
+  if (kernel.innerIndMemref) {
+    std::optional<AffineIndexMatch> affine =
+        matchAffineIndexExpression(value, kernel.innerIndMemref);
+    if (affine &&
+        (affine->coefficient == 1 || affine->coefficient == -1) &&
+        (!affine->baseRef || affine->baseCoefficient == 1 ||
+         affine->baseCoefficient == -1)) {
+      auto expression = makeExpr(ElementwiseExprKind::AffineIndex);
+      expression->affineCoefficient = affine->coefficient;
+      expression->affineBaseCoefficient = affine->baseCoefficient;
+      expression->affineOffset = affine->offset;
+      if (affine->baseRef)
+        expression->affineBaseIndex = static_cast<int32_t>(
+            getOrAddValueIndex(kernel.indexRefs, affine->baseRef));
+      return expression;
+    }
+  }
+
   // Classify scalar storage before deciding whether it belongs in the ABI.
   if (auto scalar = classifyScalarElementReference(value)) {
     switch (scalar->kind) {
@@ -1553,6 +1801,44 @@ recognizeElementwiseExpr(Value value, const ArrayAccessInfo &accesses,
 static unsigned getOrAddArrayArgument(ElementwiseKernel &kernel, Value array,
                                       bool read, bool write);
 
+static llvm::SmallVector<int32_t, 3>
+getAffineBaseIndices(ElementwiseKernel &kernel, ArrayRef<Value> baseRefs) {
+  llvm::SmallVector<int32_t, 3> indices;
+  indices.reserve(baseRefs.size());
+  for (Value baseRef : baseRefs) {
+    if (!baseRef) {
+      indices.push_back(-1);
+      continue;
+    }
+    indices.push_back(
+        static_cast<int32_t>(getOrAddValueIndex(kernel.indexRefs, baseRef)));
+  }
+  return indices;
+}
+
+static void bindIndexExpressionCaptures(
+    ElementwiseKernel &kernel,
+    const std::shared_ptr<ElementwiseIndexExpr> &expression) {
+  if (!expression)
+    return;
+
+  if (expression->kind == ElementwiseIndexExprKind::Capture) {
+    expression->captureIndex =
+        static_cast<int32_t>(getOrAddValueIndex(kernel.indexRefs,
+                                                expression->capture));
+  }
+
+  for (const auto &operand : expression->operands)
+    bindIndexExpressionCaptures(kernel, operand);
+}
+
+static void bindIndexExpressionCaptures(
+    ElementwiseKernel &kernel,
+    ArrayRef<std::shared_ptr<ElementwiseIndexExpr>> expressions) {
+  for (const auto &expression : expressions)
+    bindIndexExpressionCaptures(kernel, expression);
+}
+
 static bool appendRecognizedOutputs(ElementwiseKernel &kernel,
                                     const ArrayAccessInfo &info,
                                     std::string &reason) {
@@ -1568,19 +1854,29 @@ static bool appendRecognizedOutputs(ElementwiseKernel &kernel,
           !sameArrayBase(info.writeArrays[first],
                          info.writeArrays[candidate]) ||
           info.writeDimensions[first] != info.writeDimensions[candidate] ||
-          info.writeOffsets[first] != info.writeOffsets[candidate])
+          info.writeCoefficients[first] !=
+              info.writeCoefficients[candidate] ||
+          info.writeBaseRefs[first] != info.writeBaseRefs[candidate] ||
+          info.writeOffsets[first] != info.writeOffsets[candidate] ||
+          !sameIndexExpressions(info.writeIndexExpressions[first],
+                                info.writeIndexExpressions[candidate]))
         continue;
       handled[candidate] = true;
       group.push_back(candidate);
     }
-
     ElementwiseOutput output;
     output.array = info.writeArrays[first];
     output.storedValue = info.storedValues[first];
     output.arrayArgumentIndex =
         getOrAddArrayArgument(kernel, output.array, false, true);
     output.dimensions = info.writeDimensions[first];
+    output.coefficients = info.writeCoefficients[first];
+    output.baseIndices =
+        getAffineBaseIndices(kernel, info.writeBaseRefs[first]);
     output.offsets = info.writeOffsets[first];
+    output.indexExpressions = info.writeIndexExpressions[first];
+    bindIndexExpressionCaptures(kernel, output.indexExpressions);
+    
     bool allUnconditional = llvm::all_of(group, [&](unsigned index) {
       return info.writeConditions[index].empty();
     });
@@ -1603,7 +1899,11 @@ static bool appendRecognizedOutputs(ElementwiseKernel &kernel,
              ++readIndex) {
           if (!sameArrayBase(info.readArrays[readIndex], output.array) ||
               info.readDimensions[readIndex] != output.dimensions ||
-              info.readOffsets[readIndex] != output.offsets)
+              info.readCoefficients[readIndex] != output.coefficients ||
+              info.readBaseRefs[readIndex] != info.writeBaseRefs[first] ||
+              info.readOffsets[readIndex] != output.offsets ||
+              !sameIndexExpressions(info.readIndexExpressions[readIndex],
+                                    output.indexExpressions))
             continue;
 
           Operation *load = info.readValues[readIndex].getDefiningOp();
@@ -1735,7 +2035,11 @@ static bool detectMultiExpr1D(ElementwiseKernel &kernel,
   kernel.arrayAccesses.clear();
   kernel.outputs.clear();
   kernel.scalarRefs.clear();
+  kernel.indexRefs.clear();
   kernel.privateScalarRefs.clear();
+
+  for (Operation *op : info.indexExpressionOps)
+    markConsumed(kernel, op);
 
   for (unsigned index = 0; index < info.readValues.size(); ++index) {
     Value array = info.readArrays[index];
@@ -1748,7 +2052,12 @@ static bool detectMultiExpr1D(ElementwiseKernel &kernel,
     access.loadedValue = info.readValues[index];
     access.arrayArgumentIndex = arrayArgumentIndex;
     access.dimensions = info.readDimensions[index];
+    access.coefficients = info.readCoefficients[index];
+    access.baseIndices =
+        getAffineBaseIndices(kernel, info.readBaseRefs[index]);
     access.offsets = info.readOffsets[index];
+    access.indexExpressions = info.readIndexExpressions[index];
+    bindIndexExpressionCaptures(kernel, access.indexExpressions);
     kernel.arrayAccesses.push_back(std::move(access));
   }
 
@@ -1779,7 +2088,11 @@ static bool detectStencil2D(ElementwiseKernel &kernel,
   kernel.arrayAccesses.clear();
   kernel.outputs.clear();
   kernel.scalarRefs.clear();
+  kernel.indexRefs.clear();
   kernel.privateScalarRefs.clear();
+
+  for (Operation *op : info.indexExpressionOps)
+    markConsumed(kernel, op);
 
   for (unsigned index = 0; index < info.readValues.size(); ++index) {
     Value array = info.readArrays[index];
@@ -1792,7 +2105,12 @@ static bool detectStencil2D(ElementwiseKernel &kernel,
     access.loadedValue = info.readValues[index];
     access.arrayArgumentIndex = arrayArgumentIndex;
     access.dimensions = info.readDimensions[index];
+    access.coefficients = info.readCoefficients[index];
+    access.baseIndices =
+        getAffineBaseIndices(kernel, info.readBaseRefs[index]);
     access.offsets = info.readOffsets[index];
+    access.indexExpressions = info.readIndexExpressions[index];
+    bindIndexExpressionCaptures(kernel, access.indexExpressions);
     kernel.arrayAccesses.push_back(std::move(access));
   }
 
@@ -1818,7 +2136,7 @@ static bool collectArrayAccessesFromBody(
     Block *body, unsigned expectedRank, ArrayRef<Value> expectedIndexMemrefs,
     ArrayAccessInfo &info, std::string &reason, unsigned minReads = 1,
     unsigned maxReads = 3, bool allowMultipleWrites = false,
-    bool allowAffineOffsets = false) {
+    bool allowAffineSubscripts = false) {
   if (!body) {
     reason = "loop has no body";
     return false;
@@ -1839,21 +2157,25 @@ static bool collectArrayAccessesFromBody(
         }
 
         llvm::SmallVector<unsigned, 3> dimensions;
+        llvm::SmallVector<int64_t, 3> coefficients;
+        llvm::SmallVector<Value, 3> baseRefs;	
         llvm::SmallVector<int64_t, 3> offsets;
+        llvm::SmallVector<std::shared_ptr<ElementwiseIndexExpr>, 3>
+            indexExpressions;	
         for (unsigned arrayDim = 0; arrayDim < indices.size(); ++arrayDim) {
           std::optional<unsigned> matchedDimension;
-          std::optional<int64_t> matchedOffset;
+          std::optional<AffineIndexMatch> matchedIndex;
 
           // A full-rank access retains the ordinary positional mapping. A
           // lower-rank read may project any one logical loop dimension.
           if (indices.size() == expectedRank) {
             matchedDimension = arrayDim;
-            matchedOffset = matchAffineIndex(indices[arrayDim],
+            matchedIndex = matchAffineIndex(indices[arrayDim],
                                              expectedIndexMemrefs[arrayDim]);
           } else {
             for (unsigned kernelDim = 0; kernelDim < expectedRank;
                  ++kernelDim) {
-              if (auto offset = matchAffineIndex(
+              if (auto index = matchAffineIndex(
                       indices[arrayDim], expectedIndexMemrefs[kernelDim])) {
                 if (matchedDimension) {
                   reason = "array subscript ambiguously matches two loop "
@@ -1861,19 +2183,48 @@ static bool collectArrayAccessesFromBody(
                   return false;
                 }
                 matchedDimension = kernelDim;
-                matchedOffset = *offset;
+                matchedIndex = *index;
               }
             }
           }
 
-          if (!matchedDimension || !matchedOffset ||
-              (!allowAffineOffsets && *matchedOffset != 0)) {
-            reason =
-                "array index is not an affine induction-variable subscript";
+          bool acceptedSimple =
+              matchedDimension && matchedIndex &&
+              (allowAffineSubscripts ||
+               (matchedIndex->coefficient == 1 && !matchedIndex->baseRef &&
+                matchedIndex->offset == 0));
+          if (acceptedSimple) {
+            dimensions.push_back(*matchedDimension);
+            coefficients.push_back(matchedIndex->coefficient);
+            baseRefs.push_back(matchedIndex->baseRef);
+            offsets.push_back(matchedIndex->offset);
+            indexExpressions.push_back({});
+            continue;
+          }
+
+          auto expression =
+              allowAffineSubscripts && expectedRank == 2
+                  ? matchGeneralIndexExpression(indices[arrayDim],
+                                                expectedIndexMemrefs,
+                                                arrayCoor.getOperation(),
+                                                info.indexExpressionOps)
+                  : nullptr;
+          if (!expression) {
+            reason = "array index is not an affine induction-variable "
+                     "subscript or supported pack expression";
             return false;
           }
-          dimensions.push_back(*matchedDimension);
-          offsets.push_back(*matchedOffset);
+
+          unsigned loopMask = getIndexExpressionLoopMask(expression);
+          unsigned dimension = 0;
+          if (loopMask != 0)
+            while ((loopMask & (1u << dimension)) == 0)
+              ++dimension;
+          dimensions.push_back(dimension);
+          coefficients.push_back(1);
+          baseRefs.push_back({});
+          offsets.push_back(0);
+          indexExpressions.push_back(std::move(expression));
         }
 
         Value base = arrayCoor.getMemref();
@@ -1882,14 +2233,24 @@ static bool collectArrayAccessesFromBody(
             info.readArrays.push_back(base);
             info.readValues.push_back(load.getResult());
             info.readDimensions.push_back(dimensions);
+            info.readCoefficients.push_back(coefficients);
+            info.readBaseRefs.push_back(baseRefs);
             info.readOffsets.push_back(offsets);
+            info.readIndexExpressions.push_back(indexExpressions);
           } else if (auto store = dyn_cast<fir::StoreOp>(user)) {
-            // A projected output would be written by more than one logical
-            // iteration. Mixed-rank stencil support is intentionally limited
-            // to reads; outputs must span the complete iteration space.
             if (indices.size() != expectedRank) {
-              reason = "lower-rank array writes are not iteration-unique";
-              return false;
+              unsigned loopMask = 0;
+              for (auto [dimension, expression] :
+                   llvm::zip_equal(dimensions, indexExpressions)) {
+                loopMask |= expression ? getIndexExpressionLoopMask(expression)
+                                       : 1u << dimension;
+              }
+              unsigned requiredMask = (1u << expectedRank) - 1u;
+              if (!allowAffineSubscripts || loopMask != requiredMask) {
+                reason = "lower-rank array write subscript does not depend on "
+                         "every logical loop dimension";
+                return false;
+              }
             }
             if (info.writeArray && !allowMultipleWrites) {
               reason = "kernel has more than one write array";
@@ -1904,7 +2265,10 @@ static bool collectArrayAccessesFromBody(
             info.storedValues.push_back(store.getValue());
             info.writeStores.push_back(store.getOperation());
             info.writeDimensions.push_back(dimensions);
+            info.writeCoefficients.push_back(coefficients);
+            info.writeBaseRefs.push_back(baseRefs);
             info.writeOffsets.push_back(offsets);
+            info.writeIndexExpressions.push_back(indexExpressions);
             info.writeConditions.push_back(conditions);
           } else {
             reason = "array_coor result has unsupported user";
@@ -2071,8 +2435,8 @@ static bool collectArrayAccesses1D(ElementwiseKernel &k, fir::DoLoopOp loop,
   llvm::SmallVector<Value> indexMemrefs;
   indexMemrefs.push_back(indMemref);
 
-  if (!collectArrayAccessesFromBody(body, 1, indexMemrefs, info, reason, 1, 0,
-                                    true))
+  if (!collectArrayAccessesFromBody(body, 1, indexMemrefs, info, reason, 0, 0,
+                                    true, true))
     return false;
 
   if (!info.writeArray) {
@@ -2080,12 +2444,11 @@ static bool collectArrayAccesses1D(ElementwiseKernel &k, fir::DoLoopOp loop,
     return false;
   }
 
-  if (info.readArrays.empty()) {
-    reason = "kernel expected at least one read array";
-    return false;
-  }
-
-  if (info.storedValues.size() > 1)
+  bool canonicalPointwise = isConstantIntegerValue(loop.getLowerBound(), 1) &&
+                            !info.hasNonIdentitySubscript() &&
+                            !info.readArrays.empty() &&
+                            info.storedValues.size() == 1;
+  if (!canonicalPointwise)
     return detectMultiExpr1D(k, info, reason);
 
   // Existing direct form:
@@ -2143,13 +2506,13 @@ static bool collectArrayAccesses2D(ElementwiseKernel &k,
   indexMemrefs.push_back(outerIndMemref);
 
   if (!collectArrayAccessesFromBody(innerLoop.getBody(), 2, indexMemrefs, info,
-                                    reason, 1, 0, true, true))
+                                    reason, 0, 0, true, true))
     return false;
 
   bool canonicalPointwise =
       isConstantIntegerValue(innerLoop.getLowerBound(), 1) &&
       isConstantIntegerValue(k.outerLoop.getLowerBound(), 1) &&
-      !info.hasNonZeroOffset() && info.storedValues.size() == 1;
+      !info.hasNonIdentitySubscript() && info.storedValues.size() == 1;
 
   if (!canonicalPointwise)
     return detectStencil2D(k, info, reason);
@@ -3201,9 +3564,6 @@ static ElementwiseRecognitionResult recognize1D(fir::fnacc::LaunchOp launchOp) {
   std::string loopReason;
   if (!verifyLoopLowerBoundAndStep(loop, "1-D", loopReason))
     return fail(loop.getOperation(), loopReason);
-  if (!isConstantIntegerValue(loop.getLowerBound(), 1))
-    return fail(loop.getOperation(), "1-D loop lower bound must be constant 1");
-
   ElementwiseExtentSource extentX = getLoopExtentSource(loop);
 
   if (extentX.kind == ElementwiseExtentSourceKind::Unknown)
@@ -3426,6 +3786,9 @@ getKernelParameterSlotsForValue(const ElementwiseKernel &kernel, Value value) {
     for (unsigned i = 0; i < kernel.scalarRefs.size(); ++i)
       if (sameValueAfterFirConvert(kernel.scalarRefs[i], value))
         slots.push_back(scalarBaseSlot + i);
+    for (unsigned i = 0; i < kernel.indexRefs.size(); ++i)
+      if (sameValueAfterFirConvert(kernel.indexRefs[i], value))
+        slots.push_back(scalarBaseSlot + kernel.scalarRefs.size() + i);
     return slots;
   }
 
@@ -3523,6 +3886,13 @@ static FNACCKernelABI buildKernelABI(fir::fnacc::LaunchOp launchOp,
                          FNACCKernelParameterPassing::Value, kernel.elementType,
                          "scalar" + std::to_string(i), -1, -1, i);
 
+    for (unsigned i = 0; i < kernel.indexRefs.size(); ++i) {
+      unsigned scalarIndex = kernel.scalarRefs.size() + i;
+      appendABIParameter(abi, FNACCKernelParameterRole::Scalar,
+                         FNACCKernelParameterPassing::Value, ElementType::I32,
+                         "index" + std::to_string(i), -1, -1, scalarIndex);
+    }
+
     appendABIParameter(abi, FNACCKernelParameterRole::ExtentX,
                        FNACCKernelParameterPassing::Value, ElementType::I32,
                        "extent_x");
@@ -3535,7 +3905,22 @@ static FNACCKernelABI buildKernelABI(fir::fnacc::LaunchOp launchOp,
                          FNACCKernelParameterPassing::Value, ElementType::I32,
                          "extent_k");
 
-    if (kernel.kind == ElementwiseKernelKind::Stencil2D) {
+    if (kernel.kind == ElementwiseKernelKind::MultiExpr1D) {
+      appendABIParameter(abi, FNACCKernelParameterRole::LoopLowerX,
+                         FNACCKernelParameterPassing::Value, ElementType::I32,
+                         "loop_lower_x");
+
+      for (unsigned array = 0; array < kernel.arrayArguments.size(); ++array) {
+        appendABIParameter(
+            abi, FNACCKernelParameterRole::ArrayLowerBound,
+            FNACCKernelParameterPassing::Value, ElementType::I32,
+            "array" + std::to_string(array) + "_lower0", array, 0);
+        appendABIParameter(
+            abi, FNACCKernelParameterRole::ArrayStride,
+            FNACCKernelParameterPassing::Value, ElementType::I32,
+            "array" + std::to_string(array) + "_stride0", array, 0);
+      }
+    } else if (kernel.kind == ElementwiseKernelKind::Stencil2D) {
       appendABIParameter(abi, FNACCKernelParameterRole::LoopLowerX,
                          FNACCKernelParameterPassing::Value, ElementType::I32,
                          "loop_lower_x");

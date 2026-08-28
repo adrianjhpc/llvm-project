@@ -24,8 +24,5 @@ subroutine bad_step(n, a, b, c)
 end subroutine
 
 ! CHECK: error: FNACC cannot plan launch:
-! CHECK-SAME: loop lower bound must be constant 1
-
-! CHECK: error: FNACC cannot plan launch:
-! CHECK-SAME: loop step must be constant 1
+! CHECK-SAME: 1-D loop step must be constant 1
 

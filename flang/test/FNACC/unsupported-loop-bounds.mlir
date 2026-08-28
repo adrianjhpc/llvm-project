@@ -42,8 +42,4 @@ module {
 }
 
 // CHECK: error: FNACC runtime cannot lower launch:
-// CHECK-SAME: 1-D loop lower bound must be constant 1
-
-// CHECK: error: FNACC runtime cannot lower launch:
-// CHECK-SAME: 1-D loop step must be constant 1
-
+// CHECK: 1-D loop step must be constant 1
