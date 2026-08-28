@@ -55,7 +55,7 @@ static void fnaccCudaCheck(
   } while (false)
 
 static constexpr const char *FNACC_RUNTIME_BUILD_ID =
-    "FNACC_RUNTIME_BUILD_ID_variadic_elementwise_v7";
+    "FNACC_RUNTIME_BUILD_ID_variadic_all_kernels_v9";
 
 static std::size_t fnaccCheckedMul(
     std::size_t a, std::size_t b, const char *what) {
@@ -751,6 +751,11 @@ static void fnaccValidateVariadicKernelMetadata(const FNACCKernelDesc &desc) {
   std::vector<bool> scalarsReferenced(
       static_cast<std::size_t>(desc.scalarCount), false);
   int32_t extentCounts[3] = {0, 0, 0};
+  int32_t partialsCount = 0;
+  bool isReduction = desc.kind == "reduction_sum1d" ||
+      desc.kind == "reduction_dot1d" || desc.kind == "reduction_product1d" ||
+      desc.kind == "reduction_min1d" || desc.kind == "reduction_max1d";
+  bool isMatmul = desc.kind == "matmul2d";
 
   for (std::size_t index = 0; index < desc.parameters.size(); ++index) {
     const FNACCKernelParameterDesc &parameter = desc.parameters[index];
@@ -803,7 +808,9 @@ static void fnaccValidateVariadicKernelMetadata(const FNACCKernelDesc &desc) {
       unsigned dim = parameter.role == FNACCKernelParameterRole::ExtentX ? 0
           : parameter.role == FNACCKernelParameterRole::ExtentY          ? 1
                                                                          : 2;
-      if (dim >= static_cast<unsigned>(desc.rank) || parameter.type != "i32") {
+      bool validDimension =
+          dim < static_cast<unsigned>(desc.rank) || (isMatmul && dim == 2);
+      if (!validDimension || parameter.type != "i32") {
         std::fprintf(stderr,
             "FNACC error: invalid v2 extent metadata for kernel id %d slot "
             "%d\n",
@@ -841,6 +848,15 @@ static void fnaccValidateVariadicKernelMetadata(const FNACCKernelDesc &desc) {
       }
       break;
     case FNACCKernelParameterRole::Partials:
+      if (!isReduction || !fnaccIsPointerParameterType(parameter.type)) {
+        std::fprintf(stderr,
+            "FNACC error: invalid v2 partials parameter for kernel id %d "
+            "slot %d\n",
+            desc.id, parameter.slot);
+        std::abort();
+      }
+      ++partialsCount;
+      break;
     case FNACCKernelParameterRole::Unknown:
       std::fprintf(stderr,
           "FNACC error: unsupported v2 parameter role for kernel id %d slot "
@@ -851,6 +867,8 @@ static void fnaccValidateVariadicKernelMetadata(const FNACCKernelDesc &desc) {
   }
 
   if (extentCounts[0] != 1 || (desc.rank >= 2 && extentCounts[1] != 1) ||
+      (isMatmul ? extentCounts[2] != 1 : extentCounts[2] != 0) ||
+      (isReduction ? partialsCount != 1 : partialsCount != 0) ||
       std::find(arraysReferenced.begin(), arraysReferenced.end(), false) !=
           arraysReferenced.end() ||
       std::find(scalarsReferenced.begin(), scalarsReferenced.end(), false) !=
@@ -2990,6 +3008,13 @@ struct FNACCPendingScalarV2 {
   bool bound = false;
 };
 
+struct FNACCPendingReductionResultV2 {
+  void *host = nullptr;
+  alignas(8) uint64_t initialStorage = 0;
+  std::size_t bytes = 0;
+  bool bound = false;
+};
+
 struct FNACCPendingLaunchV2 {
   bool active = false;
   CUcontext context = nullptr;
@@ -3000,6 +3025,7 @@ struct FNACCPendingLaunchV2 {
   int32_t loopLower[3] = {1, 1, 1};
   std::vector<FNACCPendingArrayV2> arrays;
   std::vector<FNACCPendingScalarV2> scalars;
+  FNACCPendingReductionResultV2 reductionResult;
 };
 
 static thread_local FNACCPendingLaunchV2 fnaccPendingLaunchV2;
@@ -3118,6 +3144,301 @@ FNACC_DEFINE_SCALAR_BINDER(f64, double)
 
 #undef FNACC_DEFINE_SCALAR_BINDER
 
+template <typename T>
+static void fnaccBindReductionResultV2(T *host, T initialValue) {
+  FNACC_RUNTIME_GUARD();
+  if (!fnaccPendingLaunchV2.active || !host ||
+      fnaccPendingLaunchV2.reductionResult.bound) {
+    std::fprintf(stderr, "FNACC error: invalid v2 reduction result binding\n");
+    std::abort();
+  }
+  FNACCPendingReductionResultV2 &result = fnaccPendingLaunchV2.reductionResult;
+  static_assert(sizeof(T) <= sizeof(result.initialStorage));
+  result.host = host;
+  std::memcpy(&result.initialStorage, &initialValue, sizeof(T));
+  result.bytes = sizeof(T);
+  result.bound = true;
+}
+
+#define FNACC_DEFINE_REDUCTION_RESULT_BINDER(SUFFIX, TYPE) \
+  extern "C" void __fnacc_bind_reduction_result_##SUFFIX##_v2( \
+      TYPE *host, TYPE initialValue) { \
+    fnaccBindReductionResultV2<TYPE>(host, initialValue); \
+  }
+
+FNACC_DEFINE_REDUCTION_RESULT_BINDER(i8, int8_t)
+FNACC_DEFINE_REDUCTION_RESULT_BINDER(i16, int16_t)
+FNACC_DEFINE_REDUCTION_RESULT_BINDER(i32, int32_t)
+FNACC_DEFINE_REDUCTION_RESULT_BINDER(i64, int64_t)
+FNACC_DEFINE_REDUCTION_RESULT_BINDER(f32, float)
+FNACC_DEFINE_REDUCTION_RESULT_BINDER(f64, double)
+
+#undef FNACC_DEFINE_REDUCTION_RESULT_BINDER
+
+extern "C" void __fnacc_launch_reduce_f32_v2(
+    int32_t, int32_t, int32_t, float *, float *, float *, float, int32_t);
+extern "C" void __fnacc_launch_reduce_f64_v2(
+    int32_t, int32_t, int32_t, double *, double *, double *, double, int32_t);
+extern "C" void __fnacc_launch_reduce_i8_v2(
+    int32_t, int32_t, int32_t, int8_t *, int8_t *, int8_t *, int8_t, int32_t);
+extern "C" void __fnacc_launch_reduce_i16_v2(int32_t, int32_t, int32_t,
+    int16_t *, int16_t *, int16_t *, int16_t, int32_t);
+extern "C" void __fnacc_launch_reduce_i32_v2(int32_t, int32_t, int32_t,
+    int32_t *, int32_t *, int32_t *, int32_t, int32_t);
+extern "C" void __fnacc_launch_reduce_i64_v2(int32_t, int32_t, int32_t,
+    int64_t *, int64_t *, int64_t *, int64_t, int32_t);
+extern "C" void __fnacc_launch_matmul_f32_v1(int32_t, int32_t, int32_t, int32_t,
+    float *, float *, float *, int32_t, int32_t, int32_t);
+extern "C" void __fnacc_launch_matmul_f64_v1(int32_t, int32_t, int32_t, int32_t,
+    double *, double *, double *, int32_t, int32_t, int32_t);
+
+static CUdeviceptr fnaccReserveReductionBuffer(FNACCDeviceAllocation &,
+    std::size_t, FNACCReductionBufferStats &, const char *);
+template <typename Real>
+static Real fnaccReductionIdentity(FNACCKernelDesc::ReductionOperator);
+template <typename Real>
+static Real fnaccApplyReduction(FNACCKernelDesc::ReductionOperator, Real, Real);
+template <typename Real>
+static bool fnaccFinalizeReductionOnDevice(const FNACCKernelDesc *,
+    FNACCReductionWorkspace &, CUdeviceptr, unsigned, Real *);
+
+static bool fnaccIsReductionKernelKind(const std::string &kind) {
+  return kind == "reduction_sum1d" || kind == "reduction_dot1d" ||
+      kind == "reduction_product1d" || kind == "reduction_min1d" ||
+      kind == "reduction_max1d";
+}
+
+template <typename T>
+static T fnaccPendingReductionInitial(
+    const FNACCPendingReductionResultV2 &result) {
+  T initialValue;
+  std::memcpy(&initialValue, &result.initialStorage, sizeof(T));
+  return initialValue;
+}
+
+template <typename T>
+static void fnaccCommitReductionTypedV2(
+    const FNACCKernelDesc *desc, FNACCPendingLaunchV2 &pending) {
+  T initialValue = fnaccPendingReductionInitial<T>(pending.reductionResult);
+  T *result = static_cast<T *>(pending.reductionResult.host);
+  if (pending.extent[0] <= 0) {
+    *result = initialValue;
+    fnaccClearPendingLaunchV2();
+    return;
+  }
+
+  CUfunction function = getKernelFunction(pending.kernelId);
+  unsigned gridX = fnaccCdiv(
+      pending.extent[0], pending.block[0], "v2 reduction grid dimension X");
+  unsigned cudaBlockX = fnaccCudaThreadsPerCTA(pending.kernelId);
+  fnaccValidateCudaBlockSize(function, pending.kernelId, cudaBlockX);
+  fnaccValidateSupportedHiddenPtrArgCount(pending.kernelId);
+
+  std::vector<FNACCDeviceArg> deviceArgs;
+  std::vector<CUdeviceptr> devicePointers;
+  deviceArgs.reserve(pending.arrays.size());
+  devicePointers.reserve(pending.arrays.size());
+  for (std::size_t slot = 0; slot < pending.arrays.size(); ++slot) {
+    FNACCPendingArrayV2 &array = pending.arrays[slot];
+    if ((array.flags & 1) == 0) {
+      std::fprintf(stderr,
+          "FNACC error: v2 reduction input is not readable for kernel id "
+          "%d\n",
+          pending.kernelId);
+      std::abort();
+    }
+    int32_t target = fnaccEffectivePackTargetForArray(
+        desc, static_cast<int32_t>(slot), array.host);
+    FNACCDeviceArg device = fnaccPrepareReadBuffer(
+        array.host, array.bytes, target, static_cast<int32_t>(slot));
+    devicePointers.push_back(device.ptr);
+    deviceArgs.push_back(device);
+  }
+
+  FNACCReductionWorkspace &workspace = fnaccGetReductionWorkspace();
+  std::size_t partialBytes = static_cast<std::size_t>(gridX) * sizeof(T);
+  CUdeviceptr dPartials = fnaccReserveReductionBuffer(
+      workspace.partials, partialBytes, workspace.partialStats, "partials");
+
+  std::vector<void *> arguments;
+  arguments.reserve(desc->parameters.size() + 2);
+  for (const FNACCKernelParameterDesc &parameter : desc->parameters) {
+    switch (parameter.role) {
+    case FNACCKernelParameterRole::Read:
+      if ((pending.arrays[parameter.arrayIndex].flags & 1) == 0) {
+        std::fprintf(stderr,
+            "FNACC error: reduction array flags disagree with kernel id %d "
+            "slot %d\n",
+            pending.kernelId, parameter.slot);
+        std::abort();
+      }
+      arguments.push_back(&devicePointers[parameter.arrayIndex]);
+      break;
+    case FNACCKernelParameterRole::Partials:
+      arguments.push_back(&dPartials);
+      break;
+    case FNACCKernelParameterRole::Scalar: {
+      FNACCPendingScalarV2 &scalar = pending.scalars[parameter.scalarIndex];
+      if (scalar.bytes != fnaccScalarParameterBytes(parameter.type)) {
+        std::fprintf(stderr,
+            "FNACC error: reduction scalar type mismatch for kernel id %d "
+            "slot %d\n",
+            pending.kernelId, parameter.slot);
+        std::abort();
+      }
+      arguments.push_back(&scalar.storage);
+      break;
+    }
+    case FNACCKernelParameterRole::ExtentX:
+      arguments.push_back(&pending.extent[0]);
+      break;
+    default:
+      std::fprintf(stderr,
+          "FNACC error: unsupported reduction v2 parameter for kernel id %d "
+          "slot %d\n",
+          pending.kernelId, parameter.slot);
+      std::abort();
+    }
+  }
+  FNACCHiddenTritonArgs hidden;
+  arguments.push_back(&hidden.hidden0);
+  arguments.push_back(&hidden.hidden1);
+
+  unsigned dynamicSharedBytes;
+  if constexpr (std::is_same_v<T, double>) {
+    dynamicSharedBytes =
+        fnaccReductionF64DynamicSharedBytes(desc, pending.block[0]);
+  } else if constexpr (std::is_integral_v<T>) {
+    dynamicSharedBytes = fnaccReductionIntegerDynamicSharedBytes(
+        desc, pending.block[0], sizeof(T));
+  } else {
+    dynamicSharedBytes =
+        fnaccReductionDynamicSharedBytes(desc, pending.block[0]);
+  }
+  fnaccConfigureDynamicSharedMemory(
+      function, pending.kernelId, dynamicSharedBytes);
+
+  if (fnaccDebugEnabled()) {
+    std::fprintf(stderr,
+        "FNACC: launch reduction v2 kernel id=%d arrays=%zu scalars=%zu "
+        "grid=(%u,1,1) extent=%d\n",
+        pending.kernelId, pending.arrays.size(), pending.scalars.size(), gridX,
+        pending.extent[0]);
+  }
+  FNACC_CUDA_CHECK(cuLaunchKernel(function, gridX, 1, 1, cudaBlockX, 1, 1,
+      dynamicSharedBytes, fnaccActiveContextState().stream, arguments.data(),
+      nullptr));
+  ++workspace.primaryLaunches;
+
+  T reducedValue = fnaccReductionIdentity<T>(desc->reductionOp);
+  if (!fnaccFinalizeReductionOnDevice<T>(
+          desc, workspace, dPartials, gridX, &reducedValue)) {
+    fnaccWaitForRuntimeStream();
+    std::vector<T> partials(gridX);
+    FNACC_CUDA_CHECK(cuMemcpyDtoH(partials.data(), dPartials, partialBytes));
+    for (T value : partials)
+      reducedValue =
+          fnaccApplyReduction(desc->reductionOp, reducedValue, value);
+  }
+  *result = fnaccApplyReduction(desc->reductionOp, initialValue, reducedValue);
+
+  for (const FNACCDeviceArg &device : deviceArgs)
+    fnaccReleaseDeviceArg(device);
+  fnaccClearPendingLaunchV2();
+}
+
+static bool fnaccTryCommitReductionLaunchV2(
+    const FNACCKernelDesc *desc, FNACCPendingLaunchV2 &pending) {
+  if (!fnaccIsReductionKernelKind(desc->kind))
+    return false;
+  if (pending.arrays.empty() || !pending.reductionResult.bound) {
+    std::fprintf(stderr,
+        "FNACC error: incomplete v2 reduction bindings for kernel id %d\n",
+        pending.kernelId);
+    std::abort();
+  }
+
+  std::string pointerType;
+  for (const FNACCKernelParameterDesc &parameter : desc->parameters)
+    if (parameter.role == FNACCKernelParameterRole::Read) {
+      pointerType = parameter.type;
+      break;
+    }
+  std::size_t resultBytes = pending.reductionResult.bytes;
+
+#define FNACC_DISPATCH_REDUCTION(TYPE_NAME, TYPE) \
+  if (pointerType == "ptr<" TYPE_NAME ">" && resultBytes == sizeof(TYPE)) { \
+    fnaccCommitReductionTypedV2<TYPE>(desc, pending); \
+    return true; \
+  }
+
+  FNACC_DISPATCH_REDUCTION("i8", int8_t)
+  FNACC_DISPATCH_REDUCTION("i16", int16_t)
+  FNACC_DISPATCH_REDUCTION("i32", int32_t)
+  FNACC_DISPATCH_REDUCTION("i64", int64_t)
+  FNACC_DISPATCH_REDUCTION("f32", float)
+  FNACC_DISPATCH_REDUCTION("f64", double)
+
+#undef FNACC_DISPATCH_REDUCTION
+
+  std::fprintf(stderr,
+      "FNACC error: v2 reduction result type mismatch for kernel id %d\n",
+      pending.kernelId);
+  std::abort();
+}
+
+static bool fnaccTryCommitMatmulLaunchV2(
+    const FNACCKernelDesc *desc, const FNACCPendingLaunchV2 &pending) {
+  if (desc->kind != "matmul2d")
+    return false;
+  if (pending.arrays.size() != 3 || (pending.arrays[0].flags & 1) == 0 ||
+      (pending.arrays[1].flags & 1) == 0 ||
+      (pending.arrays[2].flags & 2) == 0) {
+    std::fprintf(stderr,
+        "FNACC error: matmul v2 requires readable A/B and writable C for "
+        "kernel id %d\n",
+        pending.kernelId);
+    std::abort();
+  }
+
+  std::string pointerType;
+  for (const FNACCKernelParameterDesc &parameter : desc->parameters)
+    if (parameter.role == FNACCKernelParameterRole::Read) {
+      pointerType = parameter.type;
+      break;
+    }
+
+  int32_t kernelId = pending.kernelId;
+  int32_t blockX = pending.block[0];
+  int32_t blockY = pending.block[1];
+  int32_t blockK = pending.block[2];
+  void *a = pending.arrays[0].host;
+  void *b = pending.arrays[1].host;
+  void *c = pending.arrays[2].host;
+  int32_t n = pending.extent[0];
+  int32_t m = pending.extent[1];
+  int32_t k = pending.extent[2];
+  fnaccClearPendingLaunchV2();
+
+  if (pointerType == "ptr<f32>") {
+    __fnacc_launch_matmul_f32_v1(kernelId, blockX, blockY, blockK,
+        static_cast<float *>(a), static_cast<float *>(b),
+        static_cast<float *>(c), n, m, k);
+    return true;
+  }
+  if (pointerType == "ptr<f64>") {
+    __fnacc_launch_matmul_f64_v1(kernelId, blockX, blockY, blockK,
+        static_cast<double *>(a), static_cast<double *>(b),
+        static_cast<double *>(c), n, m, k);
+    return true;
+  }
+
+  std::fprintf(stderr,
+      "FNACC error: unsupported matmul v2 element type for kernel id %d\n",
+      kernelId);
+  std::abort();
+}
+
 static int32_t fnaccCheckedI32Layout(int64_t value, const char *what) {
   if (value < std::numeric_limits<int32_t>::min() ||
       value > std::numeric_limits<int32_t>::max()) {
@@ -3151,12 +3472,25 @@ extern "C" void __fnacc_commit_launch_v2() {
       std::abort();
     }
 
+  const FNACCKernelDesc *desc = fnaccLookupKernelDesc(pending.kernelId);
+  bool isReduction = fnaccIsReductionKernelKind(desc->kind);
+  if (pending.reductionResult.bound != isReduction) {
+    std::fprintf(stderr,
+        "FNACC error: v2 reduction result binding disagrees with kernel id "
+        "%d\n",
+        pending.kernelId);
+    std::abort();
+  }
+  if (fnaccTryCommitReductionLaunchV2(desc, pending))
+    return;
+  if (fnaccTryCommitMatmulLaunchV2(desc, pending))
+    return;
+
   if (pending.extent[0] <= 0 || (pending.rank >= 2 && pending.extent[1] <= 0)) {
     fnaccClearPendingLaunchV2();
     return;
   }
 
-  const FNACCKernelDesc *desc = fnaccLookupKernelDesc(pending.kernelId);
   CUfunction function = getKernelFunction(pending.kernelId);
   unsigned cudaBlockX = fnaccCudaThreadsPerCTA(pending.kernelId);
   fnaccValidateCudaBlockSize(function, pending.kernelId, cudaBlockX);

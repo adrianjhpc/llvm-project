@@ -20,17 +20,22 @@ subroutine fnacc_dot_reduce_allocatable_f64(n, a, b, sum)
   end do
 end subroutine
 
-! HOST-DAG: func.func private @__fnacc_launch_reduce_f64_v2
+! HOST-DAG: func.func private @__fnacc_begin_launch_v2
+! HOST-DAG: func.func private @__fnacc_bind_array_v2
+! HOST-DAG: func.func private @__fnacc_bind_reduction_result_f64_v2
+! HOST-DAG: func.func private @__fnacc_commit_launch_v2
 
 ! HOST-LABEL: func.func @_QPfnacc_dot_reduce_allocatable_f64
 ! HOST-NOT: fnacc.launch
-! HOST: %[[N64:.*]] = fir.load {{.*}} : !fir.ref<i64>
-! HOST: %[[N32:.*]] = fir.convert %[[N64]] : (i64) -> i32
+! HOST: call @__fnacc_begin_launch_v2
 ! HOST: %[[A_BOX:.*]] = fir.load {{.*}} : !fir.ref<!fir.box<!fir.heap<!fir.array<?xf64>>>>
 ! HOST: %[[A_ADDR:.*]] = fir.box_addr %[[A_BOX]] : (!fir.box<!fir.heap<!fir.array<?xf64>>>) -> !fir.heap<!fir.array<?xf64>>
+! HOST: call @__fnacc_bind_array_v2
 ! HOST: %[[B_BOX:.*]] = fir.load {{.*}} : !fir.ref<!fir.box<!fir.heap<!fir.array<?xf64>>>>
 ! HOST: %[[B_ADDR:.*]] = fir.box_addr %[[B_BOX]] : (!fir.box<!fir.heap<!fir.array<?xf64>>>) -> !fir.heap<!fir.array<?xf64>>
-! HOST: call @__fnacc_launch_reduce_f64_v2
+! HOST: call @__fnacc_bind_array_v2
+! HOST: call @__fnacc_bind_reduction_result_f64_v2
+! HOST: call @__fnacc_commit_launch_v2
 ! HOST-NOT: fnacc.launch
 
 ! TTIR-LABEL: tt.func @fnacc_kernel_0
@@ -53,6 +58,9 @@ end subroutine
 
 ! JSON: "fnacc_schema_version": 1
 ! JSON-DAG: "kind": "reduction_dot1d"
+! JSON-DAG: "launch_abi_version": 2
+! JSON-DAG: "array_count": 2
+! JSON-DAG: "output_count": 1
 ! JSON-DAG: "reduction_stage_id": 1
 ! JSON-DAG: "type": "ptr<f64>"
 ! JSON-DAG: "role": "partials"

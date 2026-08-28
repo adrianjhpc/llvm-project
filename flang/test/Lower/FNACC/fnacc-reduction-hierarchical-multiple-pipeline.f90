@@ -29,7 +29,12 @@ subroutine fnacc_dot_reduce_second(n, a, b, sum)
   end do
 end subroutine
 
-! HOST-COUNT-2: call @__fnacc_launch_reduce_
+! HOST: call @__fnacc_begin_launch_v2
+! HOST: call @__fnacc_bind_reduction_result_f32_v2
+! HOST: call @__fnacc_commit_launch_v2
+! HOST: call @__fnacc_begin_launch_v2
+! HOST: call @__fnacc_bind_reduction_result_f64_v2
+! HOST: call @__fnacc_commit_launch_v2
 ! HOST-NOT: fnacc.launch
 
 ! TTIR-LABEL: tt.func @fnacc_kernel_0(
@@ -45,12 +50,14 @@ end subroutine
 
 ! JSON: "id": 0
 ! JSON: "name": "fnacc_kernel_0"
+! JSON: "launch_abi_version": 2
 ! JSON: "reduction_stage_id": 2
 ! JSON: "id": 2
 ! JSON: "name": "fnacc_kernel_0_reduce_stage"
 ! JSON: "kind": "reduction_stage1d"
 ! JSON: "id": 1
 ! JSON: "name": "fnacc_kernel_1"
+! JSON: "launch_abi_version": 2
 ! JSON: "reduction_stage_id": 3
 ! JSON: "id": 3
 ! JSON: "name": "fnacc_kernel_1_reduce_stage"

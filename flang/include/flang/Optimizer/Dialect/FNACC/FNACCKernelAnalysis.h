@@ -67,8 +67,10 @@ enum class ElementwiseKernelKind {
 };
 
 /// Return true when the kernel uses the staged, dynamically-sized launch ABI.
-/// Reductions and matmul retain their specialized runtime entry points.
 bool usesVariadicLaunchABI(ElementwiseKernelKind kind);
+
+/// Return true for a primary (non-synthetic) reduction kernel kind.
+bool isReductionKernelKind(ElementwiseKernelKind kind);
 
 /// Stable values written to fnacc.reduction_ops and kernel JSON.
 enum class ReductionOperator : int32_t {
@@ -93,6 +95,7 @@ enum class ElementwiseExprKind {
   SinF,
   CosF,
   TanhF,
+  SquareF,
   AbsI,
 
   // Binary arithmetic.
@@ -124,6 +127,10 @@ enum class ElementwiseExprKind {
   CmpSGE,
   CmpIEQ,
   CmpINE,
+
+  // Predicate composition.
+  And,
+  Or,
 
   // Conditional value selection.
   Select
@@ -158,6 +165,10 @@ struct ElementwiseArrayAccess {
   mlir::Value array;
   mlir::Value loadedValue;
   unsigned arrayArgumentIndex = 0;
+  /// For each array dimension, the logical kernel dimension that supplies its
+  /// subscript. A rank-1 coordinate array in a rank-2 stencil therefore uses
+  /// either {0} (the inner/X loop) or {1} (the outer/Y loop).
+  llvm::SmallVector<unsigned, 3> dimensions;
   llvm::SmallVector<int64_t, 3> offsets;
 };
 
@@ -165,6 +176,7 @@ struct ElementwiseOutput {
   mlir::Value array;
   mlir::Value storedValue;
   unsigned arrayArgumentIndex = 0;
+  llvm::SmallVector<unsigned, 3> dimensions;
   llvm::SmallVector<int64_t, 3> offsets;
   std::unique_ptr<ElementwiseExpr> expression;
 };
@@ -173,6 +185,9 @@ struct ElementwiseArrayArgument {
   mlir::Value array;
   bool read = false;
   bool write = false;
+  /// Physical rank of this array binding. This is independent of the kernel
+  /// iteration rank for mixed-rank stencils.
+  unsigned rank = 0;
 };
 
 /// Classification of scalar storage referenced by a parallel loop.

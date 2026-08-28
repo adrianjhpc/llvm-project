@@ -59,20 +59,21 @@ static Type getMLIRElementType(OpBuilder &builder,
   }
 }
 
-static StringRef getReductionRuntimeName(fir::fnacc::ElementType type) {
+static StringRef
+getReductionResultBindRuntimeName(fir::fnacc::ElementType type) {
   switch (type) {
   case fir::fnacc::ElementType::I8:
-    return "__fnacc_launch_reduce_i8_v2";
+    return "__fnacc_bind_reduction_result_i8_v2";
   case fir::fnacc::ElementType::I16:
-    return "__fnacc_launch_reduce_i16_v2";
+    return "__fnacc_bind_reduction_result_i16_v2";
   case fir::fnacc::ElementType::I32:
-    return "__fnacc_launch_reduce_i32_v2";
+    return "__fnacc_bind_reduction_result_i32_v2";
   case fir::fnacc::ElementType::I64:
-    return "__fnacc_launch_reduce_i64_v2";
+    return "__fnacc_bind_reduction_result_i64_v2";
   case fir::fnacc::ElementType::F32:
-    return "__fnacc_launch_reduce_f32_v2";
+    return "__fnacc_bind_reduction_result_f32_v2";
   case fir::fnacc::ElementType::F64:
-    return "__fnacc_launch_reduce_f64_v2";
+    return "__fnacc_bind_reduction_result_f64_v2";
   case fir::fnacc::ElementType::Unknown:
     llvm_unreachable("unknown FNACC reduction element type");
   }
@@ -1213,81 +1214,6 @@ struct FNACCLowerToRuntimePass
         return;
       }
 
-      if (k.kind == fir::fnacc::ElementwiseKernelKind::ReductionSum1D ||
-          k.kind == fir::fnacc::ElementwiseKernelKind::ReductionDot1D ||
-          k.kind == fir::fnacc::ElementwiseKernelKind::ReductionProduct1D ||
-          k.kind == fir::fnacc::ElementwiseKernelKind::ReductionMin1D ||
-          k.kind == fir::fnacc::ElementwiseKernelKind::ReductionMax1D) {
-        if (!k.reductionScalarRef) {
-          launchOp.emitError("FNACC reduction has no reduction scalar ref");
-          signalPassFailure();
-          return;
-        }
-
-        if (k.readArrays.empty() || k.readArrays.size() > 2) {
-          launchOp.emitError(
-              "FNACC reduction runtime supports one or two read arrays");
-          signalPassFailure();
-          return;
-        }
-
-        Value initialValue =
-            fir::LoadOp::create(builder, loc, k.reductionScalarRef);
-
-        StringRef reductionRuntimeName = getReductionRuntimeName(k.elementType);
-
-        Value numReadArraysValue = arith::ConstantIntOp::create(
-            builder, loc, static_cast<int32_t>(k.readArrays.size()), 32);
-
-        Value read0Ptr = getRuntimeElementPointer(
-            builder, loc, launchOp, k.readArrays[0], k.elementType);
-
-        Value read1Ptr = read0Ptr;
-        if (k.readArrays.size() >= 2) {
-          read1Ptr = getRuntimeElementPointer(builder, loc, launchOp,
-                                              k.readArrays[1], k.elementType);
-        }
-
-        if (!read0Ptr || !read1Ptr) {
-          signalPassFailure();
-          return;
-        }
-
-        Value resultPtr = getRuntimeScalarElementPointer(
-            builder, loc, k.reductionScalarRef, k.elementType);
-
-        llvm::SmallVector<Type> argTypes;
-        argTypes.push_back(kernelIdValue.getType());
-        argTypes.push_back(blockXValue.getType());
-        argTypes.push_back(numReadArraysValue.getType());
-        argTypes.push_back(read0Ptr.getType());
-        argTypes.push_back(read1Ptr.getType());
-        argTypes.push_back(resultPtr.getType());
-        argTypes.push_back(initialValue.getType());
-        argTypes.push_back(extentXValue.getType());
-
-        func::FuncOp callee = getOrCreateRuntimeDecl(
-            module, builder, loc, reductionRuntimeName, argTypes);
-
-        llvm::SmallVector<Value> operands;
-        operands.push_back(kernelIdValue);
-        operands.push_back(blockXValue);
-        operands.push_back(numReadArraysValue);
-        operands.push_back(read0Ptr);
-        operands.push_back(read1Ptr);
-        operands.push_back(resultPtr);
-        operands.push_back(initialValue);
-        operands.push_back(extentXValue);
-
-        func::CallOp::create(builder, loc, callee.getSymName(), TypeRange{},
-                             operands);
-
-        launchOp.erase();
-
-        ++fallbackKernelId;
-        continue;
-      }
-
       if (usesVariadicABI) {
         llvm::SmallVector<Value> beginOperands{
             kernelIdValue,
@@ -1309,12 +1235,13 @@ struct FNACCLowerToRuntimePass
         for (auto [index, array] : llvm::enumerate(k.arrayArguments)) {
           auto layout = tryCreateLaunchArrayArgs(builder, loc, launchOp,
                                                  array.array, k.elementType);
-          if (!layout ||
-              layout->lowerBounds.size() < static_cast<unsigned>(k.rank) ||
-              layout->elementStrides.size() < static_cast<unsigned>(k.rank)) {
+          unsigned requiredRank =
+              array.rank == 0 ? static_cast<unsigned>(k.rank) : array.rank;
+          if (!layout || layout->lowerBounds.size() < requiredRank ||
+              layout->elementStrides.size() < requiredRank) {
             launchOp.emitError(
-                "FNACC v2 array requires a contiguous rank-matched explicit "
-                "shape or descriptor-backed layout");
+                "FNACC v2 array requires a contiguous explicit shape or "
+                "descriptor-backed layout matching the array operand rank");
             signalPassFailure();
             return;
           }
@@ -1345,6 +1272,21 @@ struct FNACCLowerToRuntimePass
                             bindOperands);
         }
 
+        if (fir::fnacc::isReductionKernelKind(k.kind)) {
+          if (!k.reductionScalarRef) {
+            launchOp.emitError("FNACC reduction has no reduction scalar ref");
+            signalPassFailure();
+            return;
+          }
+          Value resultPtr = getRuntimeScalarElementPointer(
+              builder, loc, k.reductionScalarRef, k.elementType);
+          Value initialValue =
+              fir::LoadOp::create(builder, loc, k.reductionScalarRef);
+          createRuntimeCall(module, builder, loc,
+                            getReductionResultBindRuntimeName(k.elementType),
+                            ValueRange{resultPtr, initialValue});
+        }
+
         StringRef scalarBindName = getScalarBindRuntimeName(k.elementType);
         for (auto [index, scalarRef] : llvm::enumerate(k.scalarRefs)) {
           Value scalarValue = fir::LoadOp::create(builder, loc, scalarRef);
@@ -1360,61 +1302,9 @@ struct FNACCLowerToRuntimePass
         continue;
       }
 
-      if (k.kind != fir::fnacc::ElementwiseKernelKind::MatMul2D ||
-          k.readArrays.size() != 2 || !k.writeArray) {
-        launchOp.emitError("FNACC specialized runtime expected matmul A/B/C");
-        signalPassFailure();
-        return;
-      }
-
-      Value read0Ptr = getRuntimeElementPointer(builder, loc, launchOp,
-                                                k.readArrays[0], k.elementType);
-      Value read1Ptr = getRuntimeElementPointer(builder, loc, launchOp,
-                                                k.readArrays[1], k.elementType);
-      Value writePtr = getRuntimeElementPointer(builder, loc, launchOp,
-                                                k.writeArray, k.elementType);
-
-      if (!read0Ptr || !read1Ptr || !writePtr) {
-        signalPassFailure();
-        return;
-      }
-
-      StringRef runtimeName = k.elementType == fir::fnacc::ElementType::F64
-                                  ? "__fnacc_launch_matmul_f64_v1"
-                                  : "__fnacc_launch_matmul_f32_v1";
-      llvm::SmallVector<Type> argTypes;
-      argTypes.push_back(kernelIdValue.getType());
-      argTypes.push_back(blockXValue.getType());
-      argTypes.push_back(blockYValue.getType());
-      argTypes.push_back(blockZValue.getType());
-      argTypes.push_back(read0Ptr.getType());
-      argTypes.push_back(read1Ptr.getType());
-      argTypes.push_back(writePtr.getType());
-      argTypes.push_back(extentXValue.getType());
-      argTypes.push_back(extentYValue.getType());
-      argTypes.push_back(extentZValue.getType());
-
-      func::FuncOp callee =
-          getOrCreateRuntimeDecl(module, builder, loc, runtimeName, argTypes);
-
-      llvm::SmallVector<Value> operands;
-      operands.push_back(kernelIdValue);
-      operands.push_back(blockXValue);
-      operands.push_back(blockYValue);
-      operands.push_back(blockZValue);
-      operands.push_back(read0Ptr);
-      operands.push_back(read1Ptr);
-      operands.push_back(writePtr);
-      operands.push_back(extentXValue);
-      operands.push_back(extentYValue);
-      operands.push_back(extentZValue);
-
-      func::CallOp::create(builder, loc, callee.getSymName(), TypeRange{},
-                           operands);
-
-      launchOp.erase();
-
-      ++fallbackKernelId;
+      launchOp.emitError(
+          "FNACC internal error: recognized kernel has no v2 launch ABI");
+      signalPassFailure();
     }
     if (failed(lowerFNACCDataOpsToRuntime(module, builder))) {
       signalPassFailure();

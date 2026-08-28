@@ -43,8 +43,29 @@ subroutine fnacc_integer_max_i64(n, a, result)
   end do
 end subroutine
 
-! HOST-COUNT-3: call @__fnacc_launch_reduce_i32_v2
-! HOST: call @__fnacc_launch_reduce_i64_v2
+! HOST-LABEL: func.func @_QPfnacc_integer_sum
+! HOST: call @__fnacc_begin_launch_v2
+! HOST: call @__fnacc_bind_array_v2
+! HOST: call @__fnacc_bind_reduction_result_i32_v2
+! HOST: call @__fnacc_commit_launch_v2
+
+! HOST-LABEL: func.func @_QPfnacc_integer_product
+! HOST: call @__fnacc_begin_launch_v2
+! HOST: call @__fnacc_bind_array_v2
+! HOST: call @__fnacc_bind_reduction_result_i32_v2
+! HOST: call @__fnacc_commit_launch_v2
+
+! HOST-LABEL: func.func @_QPfnacc_integer_min
+! HOST: call @__fnacc_begin_launch_v2
+! HOST: call @__fnacc_bind_array_v2
+! HOST: call @__fnacc_bind_reduction_result_i32_v2
+! HOST: call @__fnacc_commit_launch_v2
+
+! HOST-LABEL: func.func @_QPfnacc_integer_max_i64
+! HOST: call @__fnacc_begin_launch_v2
+! HOST: call @__fnacc_bind_array_v2
+! HOST: call @__fnacc_bind_reduction_result_i64_v2
+! HOST: call @__fnacc_commit_launch_v2
 ! HOST-NOT: fnacc.launch
 
 ! TTIR-LABEL: tt.func @fnacc_kernel_0

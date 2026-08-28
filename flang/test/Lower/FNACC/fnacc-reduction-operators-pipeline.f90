@@ -38,7 +38,10 @@ subroutine fnacc_max_reduce(n, a, result)
   end do
 end subroutine
 
-! HOST-COUNT-3: call @__fnacc_launch_reduce_f32_v2
+! HOST: call @__fnacc_begin_launch_v2
+! HOST: call @__fnacc_bind_array_v2
+! HOST: call @__fnacc_bind_reduction_result_f32_v2
+! HOST-COUNT-3: call @__fnacc_commit_launch_v2
 ! HOST-NOT: fnacc.launch
 
 ! TTIR-LABEL: tt.func @fnacc_kernel_0
@@ -52,10 +55,13 @@ end subroutine
 ! TTIR: arith.maximumf %lhs, %rhs : f32
 
 ! JSON: "fnacc_schema_version": 1
-! JSON-DAG: "kind": "reduction_product1d"
-! JSON-DAG: "reduction_op": "multiply"
-! JSON-DAG: "kind": "reduction_min1d"
-! JSON-DAG: "reduction_op": "min"
-! JSON-DAG: "kind": "reduction_max1d"
-! JSON-DAG: "reduction_op": "max"
-! JSON-DAG: "kind": "reduction_stage1d"
+! JSON: "kind": "reduction_product1d"
+! JSON: "launch_abi_version": 2
+! JSON: "reduction_op": "multiply"
+! JSON: "kind": "reduction_min1d"
+! JSON: "launch_abi_version": 2
+! JSON: "reduction_op": "min"
+! JSON: "kind": "reduction_max1d"
+! JSON: "launch_abi_version": 2
+! JSON: "reduction_op": "max"
+! JSON: "kind": "reduction_stage1d"

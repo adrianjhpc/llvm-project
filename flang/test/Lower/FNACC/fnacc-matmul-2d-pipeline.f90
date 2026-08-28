@@ -22,13 +22,17 @@ subroutine matmul_2d_fnacc_kernel(a, b, c)
   end do
 end subroutine
 
-! HOST-DAG: func.func private @__fnacc_launch_matmul_f32_v1
+! HOST-DAG: func.func private @__fnacc_begin_launch_v2
+! HOST-DAG: func.func private @__fnacc_bind_array_v2
+! HOST-DAG: func.func private @__fnacc_commit_launch_v2
 
 ! HOST-LABEL: func.func @_QPmatmul_2d_fnacc_kernel
 ! HOST-DAG: %[[BX:.*]] = arith.constant 16 : i32
 ! HOST-DAG: %[[BY:.*]] = arith.constant 16 : i32
 ! HOST-DAG: %[[BK:.*]] = arith.constant 32 : i32
-! HOST: call @__fnacc_launch_matmul_f32_v1(%{{.*}}, %[[BX]], %[[BY]], %[[BK]],
+! HOST: call @__fnacc_begin_launch_v2(%{{.*}}, %{{.*}}, %[[BX]], %[[BY]], %[[BK]],
+! HOST-COUNT-3: call @__fnacc_bind_array_v2
+! HOST: call @__fnacc_commit_launch_v2
 ! HOST-NOT: fnacc.launch
 
 ! TTIR-LABEL: tt.func @fnacc_kernel_0
@@ -65,5 +69,8 @@ end subroutine
 ! JSON: "kind": "matmul2d"
 ! JSON: "rank": 2
 ! JSON: "tile": [16, 16, 32]
+! JSON: "launch_abi_version": 2
+! JSON: "array_count": 3
+! JSON: "scalar_count": 0
+! JSON: "output_count": 1
 ! JSON: "role": "extent_k"
-

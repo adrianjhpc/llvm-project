@@ -47,11 +47,15 @@ module {
   }
 }
 
-// CHECK: func.func private @__fnacc_launch_reduce_f32_v2
-// CHECK-SAME: i32, i32, i32, !fir.ref<f32>, !fir.ref<f32>, !fir.ref<f32>, f32, i32
+// CHECK-DAG: func.func private @__fnacc_begin_launch_v2
+// CHECK-DAG: func.func private @__fnacc_bind_array_v2
+// CHECK-DAG: func.func private @__fnacc_bind_reduction_result_f32_v2
+// CHECK-DAG: func.func private @__fnacc_commit_launch_v2
 
 // CHECK-LABEL: func.func @dot_reduce
-// CHECK: call @__fnacc_launch_reduce_f32_v2
-// CHECK-SAME: !fir.ref<f32>, !fir.ref<f32>, !fir.ref<f32>
+// CHECK: call @__fnacc_begin_launch_v2
+// CHECK-COUNT-2: call @__fnacc_bind_array_v2
+// CHECK: call @__fnacc_bind_reduction_result_f32_v2
+// CHECK: call @__fnacc_commit_launch_v2
+// CHECK-NOT: call @__fnacc_launch_reduce_f32_v2
 // CHECK-NOT: fnacc.launch
-

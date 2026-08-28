@@ -15,6 +15,5 @@ subroutine reduce_with_initial(n, a, total)
 end subroutine
 
 ! CHECK: %[[INITIAL:[0-9]+]] = fir.load %[[RESULT:[0-9]+]] : !fir.ref<f32>
-! CHECK: call @__fnacc_launch_reduce_f32_v2
-! CHECK-SAME: %[[RESULT]], %[[INITIAL]],
-
+! CHECK: call @__fnacc_bind_reduction_result_f32_v2(%[[RESULT]], %[[INITIAL]])
+! CHECK: call @__fnacc_commit_launch_v2

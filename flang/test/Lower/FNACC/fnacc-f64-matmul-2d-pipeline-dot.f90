@@ -23,10 +23,14 @@ subroutine matmul_2d_f64_fnacc_dot_strategy(a, b, c)
   end do
 end subroutine
 
-! HOST-DAG: func.func private @__fnacc_launch_matmul_f64_v1
+! HOST-DAG: func.func private @__fnacc_begin_launch_v2
+! HOST-DAG: func.func private @__fnacc_bind_array_v2
+! HOST-DAG: func.func private @__fnacc_commit_launch_v2
 
 ! HOST-LABEL: func.func @_QPmatmul_2d_f64_fnacc_dot_strategy
-! HOST: call @__fnacc_launch_matmul_f64_v1
+! HOST: call @__fnacc_begin_launch_v2
+! HOST-COUNT-3: call @__fnacc_bind_array_v2
+! HOST: call @__fnacc_commit_launch_v2
 ! HOST-NOT: fnacc.launch
 
 ! TTIR-LABEL: tt.func @fnacc_kernel_0
@@ -61,8 +65,10 @@ end subroutine
 ! JSON-DAG: "id": 0
 ! JSON-DAG: "name": "fnacc_kernel_0"
 ! JSON-DAG: "kind": "matmul2d"
+! JSON-DAG: "launch_abi_version": 2
+! JSON-DAG: "array_count": 3
+! JSON-DAG: "output_count": 1
 ! JSON-DAG: "rank": 2
 ! JSON-DAG: "tile": [8, 8, 4]
 ! JSON-DAG: "type": "ptr<f64>"
 ! JSON-DAG: "role": "extent_k"
-

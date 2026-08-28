@@ -421,6 +421,15 @@ static std::string emitExprVector(const fir::fnacc::ElementwiseKernel &k,
     return result;
   }
 
+  case fir::fnacc::ElementwiseExprKind::SquareF: {
+    assert(expr.operands.size() == 1 && "square requires one operand");
+    std::string operand = emitExprVector(k, *expr.operands[0], state, os);
+    std::string result = "%expr" + std::to_string(state.nextTmp++);
+    os << "  " << result << " = arith.mulf " << operand << ", " << operand
+       << " : tensor<" << block << "x" << elemTy << ">\n";
+    return result;
+  }
+
   case fir::fnacc::ElementwiseExprKind::AbsI: {
     assert(expr.operands.size() == 1 &&
            "integer absolute value requires one operand");
@@ -517,6 +526,20 @@ static std::string emitExprVector(const fir::fnacc::ElementwiseKernel &k,
     os << "  " << result << " = arith.cmpi " << comparisonPredicate(expr.kind)
        << ", " << lhs << ", " << rhs << " : tensor<" << block << "x" << elemTy
        << ">\n";
+    return result;
+  }
+
+  case fir::fnacc::ElementwiseExprKind::And:
+  case fir::fnacc::ElementwiseExprKind::Or: {
+    assert(expr.operands.size() == 2 &&
+           "predicate composition requires two operands");
+    std::string lhs = emitExprVector(k, *expr.operands[0], state, os);
+    std::string rhs = emitExprVector(k, *expr.operands[1], state, os);
+    std::string result = "%pred" + std::to_string(state.nextTmp++);
+    os << "  " << result << " = "
+       << (expr.kind == fir::fnacc::ElementwiseExprKind::And ? "arith.andi"
+                                                             : "arith.ori")
+       << " " << lhs << ", " << rhs << " : tensor<" << block << "xi1>\n";
     return result;
   }
 
@@ -740,12 +763,24 @@ static StringRef reductionIdentity(fir::fnacc::ReductionOperator op,
 static void emitTritonReduction1D(const fir::fnacc::ElementwiseKernel &k,
                                   int64_t block, StringRef kernelName,
                                   llvm::raw_ostream &os) {
+  assert(!k.readArrays.empty() && "reduction requires an input array");
   std::string ptrTy = ptrType(k.elementType);
   std::string elemTy = ttElementType(k.elementType).str();
 
-  os << "tt.func @" << kernelName << "(%a: " << ptrTy
-     << ", %partials: " << ptrTy
-     << ", %n: i32) attributes {noinline = false} {\n";
+  os << "tt.func @" << kernelName << "(";
+  if (k.expression) {
+    for (unsigned index = 0; index < k.readArrays.size(); ++index) {
+      if (index != 0)
+        os << ", ";
+      os << "%read" << index << ": " << ptrTy;
+    }
+  } else {
+    os << "%a: " << ptrTy;
+  }
+  os << ", %partials: " << ptrTy;
+  for (unsigned index = 0; index < k.scalarRefs.size(); ++index)
+    os << ", %scalar" << index << ": " << elemTy;
+  os << ", %n: i32) attributes {noinline = false} {\n";
 
   os << "  %pid  = tt.get_program_id x : i32\n";
   os << "  %blk  = arith.constant " << block << " : i32\n";
@@ -757,20 +792,35 @@ static void emitTritonReduction1D(const fir::fnacc::ElementwiseKernel &k,
   os << "  %n_s = tt.splat %n : i32 -> tensor<" << block << "xi32>\n";
   os << "  %mask = arith.cmpi slt, %offs, %n_s : tensor<" << block << "xi32>\n";
 
-  os << "  %ap = tt.splat %a : " << ptrTy << " -> tensor<" << block << "x"
-     << ptrTy << ">\n";
-  os << "  %ao = tt.addptr %ap, %offs : tensor<" << block << "x" << ptrTy
-     << ">, tensor<" << block << "xi32>\n";
-  os << "  %vals = tt.load %ao, %mask : tensor<" << block << "x" << ptrTy
-     << ">\n";
+  std::string values = "%vals";
+  if (k.expression) {
+    for (unsigned index = 0; index < k.readArrays.size(); ++index) {
+      std::string pointer = "%read" + std::to_string(index);
+      std::string loaded = "%read" + std::to_string(index) + "v";
+      emitLoad1D(pointer, loaded, block, k.elementType, os);
+    }
+
+    ExprTritonEmitterState state;
+    state.block = block;
+    state.scalarSplatEmitted.resize(k.scalarRefs.size(), false);
+    state.scalarSplatNames.resize(k.scalarRefs.size());
+    values = emitExprVector(k, *k.expression, state, os);
+  } else {
+    os << "  %ap = tt.splat %a : " << ptrTy << " -> tensor<" << block << "x"
+       << ptrTy << ">\n";
+    os << "  %ao = tt.addptr %ap, %offs : tensor<" << block << "x" << ptrTy
+       << ">, tensor<" << block << "xi32>\n";
+    os << "  %vals = tt.load %ao, %mask : tensor<" << block << "x" << ptrTy
+       << ">\n";
+  }
 
   os << "  %identity = arith.constant "
      << reductionIdentity(k.reductionOperator, k.elementType) << " : " << elemTy
      << "\n";
   os << "  %identity_s = tt.splat %identity : " << elemTy << " -> tensor<"
      << block << "x" << elemTy << ">\n";
-  os << "  %safe = arith.select %mask, %vals, %identity_s : tensor<" << block
-     << "xi1>, tensor<" << block << "x" << elemTy << ">\n";
+  os << "  %safe = arith.select %mask, " << values << ", %identity_s : tensor<"
+     << block << "xi1>, tensor<" << block << "x" << elemTy << ">\n";
 
   os << "  %reduced = \"tt.reduce\"(%safe) ({\n";
   os << "  ^bb0(%lhs: " << elemTy << ", %rhs: " << elemTy << "):\n";
@@ -1123,7 +1173,33 @@ static void emitTritonStencil2D(const fir::fnacc::ElementwiseKernel &k,
      << "xi32>\n";
 
   auto emitLinearOffset = [&](unsigned array, ArrayRef<int64_t> offsets,
-                              StringRef stem) {
+                              ArrayRef<unsigned> dimensions, StringRef stem) {
+    assert(offsets.size() == dimensions.size() && !offsets.empty());
+    if (offsets.size() == 1) {
+      assert(dimensions[0] < 2 && "invalid projected stencil dimension");
+      std::string source = dimensions[0] == 0 ? "%source_x" : "%source_y";
+      if (offsets[0] != 0) {
+        os << "  %" << stem << "_delta = arith.constant " << offsets[0]
+           << " : i32\n";
+        os << "  %" << stem << "_delta_s = tt.splat %" << stem
+           << "_delta : i32 -> tensor<" << block << "xi32>\n";
+        os << "  %" << stem << "_source = arith.addi " << source << ", %"
+           << stem << "_delta_s : tensor<" << block << "xi32>\n";
+        source = "%" + stem.str() + "_source";
+      }
+      os << "  %" << stem << "_lower0_s = tt.splat %array" << array
+         << "_lower0 : i32 -> tensor<" << block << "xi32>\n";
+      os << "  %" << stem << "_index = arith.subi " << source << ", %" << stem
+         << "_lower0_s : tensor<" << block << "xi32>\n";
+      os << "  %" << stem << "_stride0_s = tt.splat %array" << array
+         << "_stride0 : i32 -> tensor<" << block << "xi32>\n";
+      os << "  %" << stem << "_offset = arith.muli %" << stem << "_index, %"
+         << stem << "_stride0_s : tensor<" << block << "xi32>\n";
+      return;
+    }
+
+    assert(offsets.size() == 2 && dimensions[0] == 0 && dimensions[1] == 1 &&
+           "unsupported stencil dimension mapping");
     std::string x = "%" + stem.str() + "_x";
     std::string y = "%" + stem.str() + "_y";
     std::string xAdjusted = "%source_x";
@@ -1174,7 +1250,8 @@ static void emitTritonStencil2D(const fir::fnacc::ElementwiseKernel &k,
 
   for (auto [index, access] : llvm::enumerate(k.arrayAccesses)) {
     std::string stem = "access" + std::to_string(index);
-    emitLinearOffset(access.arrayArgumentIndex, access.offsets, stem);
+    emitLinearOffset(access.arrayArgumentIndex, access.offsets,
+                     access.dimensions, stem);
     os << "  %" << stem << "_base = tt.splat %array"
        << access.arrayArgumentIndex << " : " << ptrTy << " -> " << ptrVecTy
        << "\n";
@@ -1188,7 +1265,8 @@ static void emitTritonStencil2D(const fir::fnacc::ElementwiseKernel &k,
   for (auto [index, output] : llvm::enumerate(k.outputs)) {
     std::string result = emitExprVector(k, *output.expression, state, os);
     std::string stem = "output" + std::to_string(index);
-    emitLinearOffset(output.arrayArgumentIndex, output.offsets, stem);
+    emitLinearOffset(output.arrayArgumentIndex, output.offsets,
+                     output.dimensions, stem);
     os << "  %" << stem << "_base = tt.splat %array"
        << output.arrayArgumentIndex << " : " << ptrTy << " -> " << ptrVecTy
        << "\n";
