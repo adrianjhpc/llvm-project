@@ -794,10 +794,17 @@ struct ArrayAccessInfo {
   llvm::SmallVector<llvm::SmallVector<unsigned, 3>> readDimensions;
   llvm::SmallVector<llvm::SmallVector<int64_t, 3>> readOffsets;
 
+  // A later store to one output may read the value written by an earlier
+  // store to the same logical element. Such straight-line assignments are
+  // fused into one expression root by forwarding the intervening load to the
+  // earlier stored SSA value.
+  llvm::SmallVector<std::pair<Value, Value>, 4> forwardedValues;
+
   Value writeArray;
   Value storedValue;
   llvm::SmallVector<Value> writeArrays;
   llvm::SmallVector<Value> storedValues;
+  llvm::SmallVector<Operation *> writeStores;
   llvm::SmallVector<llvm::SmallVector<unsigned, 3>> writeDimensions;
   llvm::SmallVector<llvm::SmallVector<int64_t, 3>> writeOffsets;
   struct WriteCondition {
@@ -1192,6 +1199,15 @@ recognizeElementwiseExpr(Value value, const ArrayAccessInfo &accesses,
                          ElementwiseKernel &kernel, std::string &reason) {
   value = stripElementwiseWrappers(value);
 
+  // Resolve an iteration-local read-after-write before treating the load as
+  // a device-memory input. Reverse iteration selects the most recent
+  // forwarding definition if a chain contains more than two stores.
+  for (const auto &forwarded : llvm::reverse(accesses.forwardedValues)) {
+    if (!sameValueAfterFirConvert(value, forwarded.first))
+      continue;
+    return recognizeElementwiseExpr(forwarded.second, accesses, kernel, reason);
+  }
+
   // Array element load previously collected from a recognized array_coor.
   int readIndex = findReadValueIndex(accesses.readValues, value);
   if (readIndex >= 0) {
@@ -1565,10 +1581,53 @@ static bool appendRecognizedOutputs(ElementwiseKernel &kernel,
         getOrAddArrayArgument(kernel, output.array, false, true);
     output.dimensions = info.writeDimensions[first];
     output.offsets = info.writeOffsets[first];
+    bool allUnconditional = llvm::all_of(group, [&](unsigned index) {
+      return info.writeConditions[index].empty();
+    });
+    if (allUnconditional) {
+      ArrayAccessInfo forwardedInfo = info;
+      for (unsigned stage = 1; stage < group.size(); ++stage) {
+        unsigned previousIndex = group[stage - 1];
+        unsigned currentIndex = group[stage];
+        Operation *previousStore = info.writeStores[previousIndex];
+        Operation *currentStore = info.writeStores[currentIndex];
+        bool foundForwardedLoad = false;
 
-    if (group.size() == 1 && info.writeConditions[first].empty()) {
-      output.expression =
-          recognizeElementwiseExpr(output.storedValue, info, kernel, reason);
+        if (!previousStore || !currentStore ||
+            previousStore->getBlock() != currentStore->getBlock()) {
+          reason = "unconditional output store chain crosses a block boundary";
+          return false;
+        }
+
+        for (unsigned readIndex = 0; readIndex < info.readValues.size();
+             ++readIndex) {
+          if (!sameArrayBase(info.readArrays[readIndex], output.array) ||
+              info.readDimensions[readIndex] != output.dimensions ||
+              info.readOffsets[readIndex] != output.offsets)
+            continue;
+
+          Operation *load = info.readValues[readIndex].getDefiningOp();
+          if (!load || load->getBlock() != previousStore->getBlock() ||
+              !previousStore->isBeforeInBlock(load) ||
+              !load->isBeforeInBlock(currentStore))
+            continue;
+
+          forwardedInfo.forwardedValues.push_back(
+              {info.readValues[readIndex], info.storedValues[previousIndex]});
+          foundForwardedLoad = true;
+        }
+
+        if (!foundForwardedLoad) {
+          reason = "multiple unconditional output stores are not a "
+                   "same-element read-after-write chain";
+          return false;
+        }
+      }
+
+      unsigned finalIndex = group.back();
+      output.storedValue = info.storedValues[finalIndex];
+      output.expression = recognizeElementwiseExpr(
+          output.storedValue, forwardedInfo, kernel, reason);
     } else if (group.size() == 2 &&
                info.writeConditions[group[0]].size() == 1 &&
                info.writeConditions[group[1]].size() == 1) {
@@ -1843,6 +1902,7 @@ static bool collectArrayAccessesFromBody(
             }
             info.writeArrays.push_back(base);
             info.storedValues.push_back(store.getValue());
+            info.writeStores.push_back(store.getOperation());
             info.writeDimensions.push_back(dimensions);
             info.writeOffsets.push_back(offsets);
             info.writeConditions.push_back(conditions);

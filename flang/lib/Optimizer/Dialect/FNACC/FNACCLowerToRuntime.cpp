@@ -304,6 +304,87 @@ getRuntimeVisibleArrayLike(fir::fnacc::LaunchOp launchOp, Value arrayLike) {
   return descriptorRef;
 }
 
+/// Rebuild a side-effect-free integer expression immediately before the
+/// launch. Flang commonly materializes source bounds such as `x_max + 1`
+/// inside fnacc.launch even though every leaf of the expression is
+/// host-visible. Runtime lowering must not retain those region-owned SSA
+/// values after erasing the launch.
+static Value
+rematerializeIntegerValueOutsideLaunch(OpBuilder &builder, Location loc,
+                                       fir::fnacc::LaunchOp launchOp,
+                                       Value value) {
+  if (!isDefinedInsideLaunch(launchOp, value))
+    return value;
+
+  if (auto convert = value.getDefiningOp<fir::ConvertOp>()) {
+    Value operand = rematerializeIntegerValueOutsideLaunch(
+        builder, loc, launchOp, convert.getValue());
+    if (!operand)
+      return {};
+    return fir::ConvertOp::create(builder, loc, value.getType(), operand);
+  }
+
+  if (auto load = value.getDefiningOp<fir::LoadOp>()) {
+    Value memref = stripLaunchLocalFirConverts(launchOp, load.getMemref());
+    auto refTy = dyn_cast<fir::ReferenceType>(memref.getType());
+    if (!refTy || isDefinedInsideLaunch(launchOp, memref))
+      return {};
+
+    Type elementType = refTy.getEleTy();
+    bool supportedInteger =
+        elementType.isInteger(8) || elementType.isInteger(16) ||
+        elementType.isInteger(32) || elementType.isInteger(64);
+    if (!supportedInteger)
+      return {};
+    return fir::LoadOp::create(builder, loc, memref);
+  }
+
+  if (auto constant = value.getDefiningOp<arith::ConstantOp>()) {
+    auto integer = dyn_cast<IntegerAttr>(constant.getValue());
+    if (!integer)
+      return {};
+
+    if (isa<IndexType>(value.getType()))
+      return arith::ConstantIndexOp::create(builder, loc, integer.getInt());
+
+    auto integerType = dyn_cast<IntegerType>(value.getType());
+    if (!integerType || integerType.getWidth() > 64)
+      return {};
+    return arith::ConstantIntOp::create(builder, loc,
+                                        integer.getValue().getSExtValue(),
+                                        integerType.getWidth());
+  }
+
+  auto rematerializeBinary = [&](Value lhs, Value rhs,
+                                 StringRef operationName) -> Value {
+    Value newLhs =
+        rematerializeIntegerValueOutsideLaunch(builder, loc, launchOp, lhs);
+    Value newRhs =
+        rematerializeIntegerValueOutsideLaunch(builder, loc, launchOp, rhs);
+    if (!newLhs || !newRhs)
+      return {};
+
+    if (operationName == "arith.addi")
+      return arith::AddIOp::create(builder, loc, newLhs, newRhs);
+    if (operationName == "arith.subi")
+      return arith::SubIOp::create(builder, loc, newLhs, newRhs);
+    if (operationName == "arith.muli")
+      return arith::MulIOp::create(builder, loc, newLhs, newRhs);
+    return {};
+  };
+
+  if (auto add = value.getDefiningOp<arith::AddIOp>())
+    return rematerializeBinary(add.getLhs(), add.getRhs(), "arith.addi");
+  if (auto subtract = value.getDefiningOp<arith::SubIOp>())
+    return rematerializeBinary(subtract.getLhs(), subtract.getRhs(),
+                               "arith.subi");
+  if (auto multiply = value.getDefiningOp<arith::MulIOp>())
+    return rematerializeBinary(multiply.getLhs(), multiply.getRhs(),
+                               "arith.muli");
+
+  return {};
+}
+
 static Value
 materializeExtentValue(OpBuilder &builder, Location loc,
                        fir::fnacc::LaunchOp launchOp,
@@ -351,31 +432,17 @@ materializeExtentValue(OpBuilder &builder, Location loc,
     return convertToI32(builder, loc, dims.getLowerBound());
   }
 
-  case Kind::Value:
-    if (isDefinedInsideLaunch(launchOp, source.value)) {
-      Value value = stripLaunchLocalFirConverts(launchOp, source.value);
-      if (auto load = value.getDefiningOp<fir::LoadOp>()) {
-        Value memref = stripLaunchLocalFirConverts(launchOp, load.getMemref());
-        auto refTy = dyn_cast<fir::ReferenceType>(memref.getType());
-        if (refTy) {
-          Type elementType = refTy.getEleTy();
-          bool supportedInteger =
-              elementType.isInteger(8) || elementType.isInteger(16) ||
-              elementType.isInteger(32) || elementType.isInteger(64);
-
-          if (!isDefinedInsideLaunch(launchOp, memref) && supportedInteger) {
-            Value loaded = fir::LoadOp::create(builder, loc, memref);
-            return convertToI32(builder, loc, loaded);
-          }
-        }
-      }
-
+  case Kind::Value: {
+    Value value = rematerializeIntegerValueOutsideLaunch(builder, loc, launchOp,
+                                                         source.value);
+    if (!value) {
       launchOp.emitError(
           "FNACC loop extent value cannot be rematerialized outside "
           "fnacc.launch");
       return {};
     }
-    return convertToI32(builder, loc, source.value);
+    return convertToI32(builder, loc, value);
+  }
 
   case Kind::Unknown:
     llvm_unreachable("unknown FNACC extent source");

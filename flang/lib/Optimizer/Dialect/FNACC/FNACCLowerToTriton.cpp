@@ -621,7 +621,7 @@ static void emitTritonMultiExpr1D(const fir::fnacc::ElementwiseKernel &k,
                                   int64_t block, StringRef kernelName,
                                   llvm::raw_ostream &os) {
   assert(k.kind == fir::fnacc::ElementwiseKernelKind::MultiExpr1D);
-  assert(!k.arrayArguments.empty() && k.outputs.size() > 1);
+  assert(!k.arrayArguments.empty() && !k.outputs.empty());
 
   std::string ptrTy = ptrType(k.elementType);
   std::string ptrVecTy = ptrTensorType(block, k.elementType);
