@@ -80,6 +80,27 @@ getReductionResultBindRuntimeName(fir::fnacc::ElementType type) {
   llvm_unreachable("unhandled FNACC reduction element type");
 }
 
+static StringRef
+getIndexedReductionResultBindRuntimeName(fir::fnacc::ElementType type) {
+  switch (type) {
+  case fir::fnacc::ElementType::I8:
+    return "__fnacc_bind_reduction_result_i8_at_v2";
+  case fir::fnacc::ElementType::I16:
+    return "__fnacc_bind_reduction_result_i16_at_v2";
+  case fir::fnacc::ElementType::I32:
+    return "__fnacc_bind_reduction_result_i32_at_v2";
+  case fir::fnacc::ElementType::I64:
+    return "__fnacc_bind_reduction_result_i64_at_v2";
+  case fir::fnacc::ElementType::F32:
+    return "__fnacc_bind_reduction_result_f32_at_v2";
+  case fir::fnacc::ElementType::F64:
+    return "__fnacc_bind_reduction_result_f64_at_v2";
+  case fir::fnacc::ElementType::Unknown:
+    llvm_unreachable("unknown FNACC reduction element type");
+  }
+  llvm_unreachable("unhandled FNACC reduction element type");
+}
+
 static StringRef getScalarBindRuntimeName(fir::fnacc::ElementType type) {
   switch (type) {
   case fir::fnacc::ElementType::I8:
@@ -1303,8 +1324,8 @@ struct FNACCLowerToRuntimePass
                           beginOperands);
 
         for (auto [index, array] : llvm::enumerate(k.arrayArguments)) {
-          auto layout = tryCreateLaunchArrayArgs(builder, loc, launchOp,
-                                                 array.array, k.elementType);
+          auto layout = tryCreateLaunchArrayArgs(
+              builder, loc, launchOp, array.array, array.elementType);
           unsigned requiredRank =
               array.rank == 0 ? static_cast<unsigned>(k.rank) : array.rank;
           if (!layout || layout->lowerBounds.size() < requiredRank ||
@@ -1343,18 +1364,32 @@ struct FNACCLowerToRuntimePass
         }
 
         if (fir::fnacc::isReductionKernelKind(k.kind)) {
-          if (!k.reductionScalarRef) {
-            launchOp.emitError("FNACC reduction has no reduction scalar ref");
-            signalPassFailure();
-            return;
+          if (!k.reductionOutputs.empty()) {
+            for (auto [index, output] : llvm::enumerate(k.reductionOutputs)) {
+              Value resultPtr = getRuntimeScalarElementPointer(
+                  builder, loc, output.scalarRef, k.elementType);
+              Value initialValue =
+                  fir::LoadOp::create(builder, loc, output.scalarRef);
+              createRuntimeCall(
+                  module, builder, loc,
+                  getIndexedReductionResultBindRuntimeName(k.elementType),
+                  ValueRange{constantI32(builder, loc, index), resultPtr,
+                             initialValue});
+            }
+          } else {
+            if (!k.reductionScalarRef) {
+              launchOp.emitError("FNACC reduction has no reduction scalar ref");
+              signalPassFailure();
+              return;
+            }
+            Value resultPtr = getRuntimeScalarElementPointer(
+                builder, loc, k.reductionScalarRef, k.elementType);
+            Value initialValue =
+                fir::LoadOp::create(builder, loc, k.reductionScalarRef);
+            createRuntimeCall(module, builder, loc,
+                              getReductionResultBindRuntimeName(k.elementType),
+                              ValueRange{resultPtr, initialValue});
           }
-          Value resultPtr = getRuntimeScalarElementPointer(
-              builder, loc, k.reductionScalarRef, k.elementType);
-          Value initialValue =
-              fir::LoadOp::create(builder, loc, k.reductionScalarRef);
-          createRuntimeCall(module, builder, loc,
-                            getReductionResultBindRuntimeName(k.elementType),
-                            ValueRange{resultPtr, initialValue});
         }
 
         StringRef scalarBindName = getScalarBindRuntimeName(k.elementType);

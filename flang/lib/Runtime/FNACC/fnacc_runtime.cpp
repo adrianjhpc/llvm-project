@@ -55,7 +55,7 @@ static void fnaccCudaCheck(
   } while (false)
 
 static constexpr const char *FNACC_RUNTIME_BUILD_ID =
-    "FNACC_RUNTIME_BUILD_ID_variadic_all_kernels_v9";
+    "FNACC_RUNTIME_BUILD_ID_fused_multi_reduction_v10";
 
 static std::size_t fnaccCheckedMul(
     std::size_t a, std::size_t b, const char *what) {
@@ -754,8 +754,18 @@ static void fnaccValidateVariadicKernelMetadata(const FNACCKernelDesc &desc) {
   int32_t partialsCount = 0;
   bool isReduction = desc.kind == "reduction_sum1d" ||
       desc.kind == "reduction_dot1d" || desc.kind == "reduction_product1d" ||
-      desc.kind == "reduction_min1d" || desc.kind == "reduction_max1d";
+      desc.kind == "reduction_min1d" || desc.kind == "reduction_max1d" ||
+      desc.kind == "reduction_multi2d";
+  bool isMultiReduction = desc.kind == "reduction_multi2d";
   bool isMatmul = desc.kind == "matmul2d";
+
+  if (isReduction &&
+      (isMultiReduction ? desc.outputCount < 2 : desc.outputCount != 1)) {
+    std::fprintf(stderr,
+        "FNACC error: invalid v2 reduction output count for kernel id %d\n",
+        desc.id);
+    std::abort();
+  }
 
   for (std::size_t index = 0; index < desc.parameters.size(); ++index) {
     const FNACCKernelParameterDesc &parameter = desc.parameters[index];
@@ -3025,7 +3035,7 @@ struct FNACCPendingLaunchV2 {
   int32_t loopLower[3] = {1, 1, 1};
   std::vector<FNACCPendingArrayV2> arrays;
   std::vector<FNACCPendingScalarV2> scalars;
-  FNACCPendingReductionResultV2 reductionResult;
+  std::vector<FNACCPendingReductionResultV2> reductionResults;
 };
 
 static thread_local FNACCPendingLaunchV2 fnaccPendingLaunchV2;
@@ -3081,6 +3091,7 @@ extern "C" void __fnacc_begin_launch_v2(int32_t kernelId, int32_t rank,
   pending.loopLower[2] = loopLowerZ;
   pending.arrays.resize(static_cast<std::size_t>(arrayCount));
   pending.scalars.resize(static_cast<std::size_t>(scalarCount));
+  pending.reductionResults.resize(static_cast<std::size_t>(desc->outputCount));
 }
 
 extern "C" void __fnacc_bind_array_v2(int32_t slot, void *host, int64_t bytes,
@@ -3145,14 +3156,18 @@ FNACC_DEFINE_SCALAR_BINDER(f64, double)
 #undef FNACC_DEFINE_SCALAR_BINDER
 
 template <typename T>
-static void fnaccBindReductionResultV2(T *host, T initialValue) {
+static void fnaccBindReductionResultAtV2(
+    int32_t slot, T *host, T initialValue) {
   FNACC_RUNTIME_GUARD();
-  if (!fnaccPendingLaunchV2.active || !host ||
-      fnaccPendingLaunchV2.reductionResult.bound) {
+  if (!fnaccPendingLaunchV2.active || slot < 0 ||
+      static_cast<std::size_t>(slot) >=
+          fnaccPendingLaunchV2.reductionResults.size() ||
+      !host || fnaccPendingLaunchV2.reductionResults[slot].bound) {
     std::fprintf(stderr, "FNACC error: invalid v2 reduction result binding\n");
     std::abort();
   }
-  FNACCPendingReductionResultV2 &result = fnaccPendingLaunchV2.reductionResult;
+  FNACCPendingReductionResultV2 &result =
+      fnaccPendingLaunchV2.reductionResults[slot];
   static_assert(sizeof(T) <= sizeof(result.initialStorage));
   result.host = host;
   std::memcpy(&result.initialStorage, &initialValue, sizeof(T));
@@ -3163,7 +3178,11 @@ static void fnaccBindReductionResultV2(T *host, T initialValue) {
 #define FNACC_DEFINE_REDUCTION_RESULT_BINDER(SUFFIX, TYPE) \
   extern "C" void __fnacc_bind_reduction_result_##SUFFIX##_v2( \
       TYPE *host, TYPE initialValue) { \
-    fnaccBindReductionResultV2<TYPE>(host, initialValue); \
+    fnaccBindReductionResultAtV2<TYPE>(0, host, initialValue); \
+  } \
+  extern "C" void __fnacc_bind_reduction_result_##SUFFIX##_at_v2( \
+      int32_t slot, TYPE *host, TYPE initialValue) { \
+    fnaccBindReductionResultAtV2<TYPE>(slot, host, initialValue); \
   }
 
 FNACC_DEFINE_REDUCTION_RESULT_BINDER(i8, int8_t)
@@ -3201,11 +3220,12 @@ static Real fnaccApplyReduction(FNACCKernelDesc::ReductionOperator, Real, Real);
 template <typename Real>
 static bool fnaccFinalizeReductionOnDevice(const FNACCKernelDesc *,
     FNACCReductionWorkspace &, CUdeviceptr, unsigned, Real *);
+static int32_t fnaccCheckedI32Layout(int64_t, const char *);
 
 static bool fnaccIsReductionKernelKind(const std::string &kind) {
   return kind == "reduction_sum1d" || kind == "reduction_dot1d" ||
       kind == "reduction_product1d" || kind == "reduction_min1d" ||
-      kind == "reduction_max1d";
+      kind == "reduction_max1d" || kind == "reduction_multi2d";
 }
 
 template <typename T>
@@ -3219,8 +3239,9 @@ static T fnaccPendingReductionInitial(
 template <typename T>
 static void fnaccCommitReductionTypedV2(
     const FNACCKernelDesc *desc, FNACCPendingLaunchV2 &pending) {
-  T initialValue = fnaccPendingReductionInitial<T>(pending.reductionResult);
-  T *result = static_cast<T *>(pending.reductionResult.host);
+  FNACCPendingReductionResultV2 &pendingResult = pending.reductionResults[0];
+  T initialValue = fnaccPendingReductionInitial<T>(pendingResult);
+  T *result = static_cast<T *>(pendingResult.host);
   if (pending.extent[0] <= 0) {
     *result = initialValue;
     fnaccClearPendingLaunchV2();
@@ -3347,11 +3368,223 @@ static void fnaccCommitReductionTypedV2(
   fnaccClearPendingLaunchV2();
 }
 
+template <typename T>
+static void fnaccCommitMultiReductionTypedV2(
+    const FNACCKernelDesc *desc, FNACCPendingLaunchV2 &pending) {
+  if (pending.reductionResults.size() !=
+          static_cast<std::size_t>(desc->outputCount) ||
+      pending.reductionResults.empty()) {
+    std::fprintf(stderr,
+        "FNACC error: multi-reduction result count mismatch for kernel id "
+        "%d\n",
+        pending.kernelId);
+    std::abort();
+  }
+
+  for (const FNACCPendingReductionResultV2 &result : pending.reductionResults)
+    if (!result.bound || result.bytes != sizeof(T)) {
+      std::fprintf(stderr,
+          "FNACC error: incomplete multi-reduction result bindings for "
+          "kernel id %d\n",
+          pending.kernelId);
+      std::abort();
+    }
+
+  if (pending.extent[0] <= 0 || pending.extent[1] <= 0) {
+    for (FNACCPendingReductionResultV2 &result : pending.reductionResults)
+      *static_cast<T *>(result.host) = fnaccPendingReductionInitial<T>(result);
+    fnaccClearPendingLaunchV2();
+    return;
+  }
+
+  CUfunction function = getKernelFunction(pending.kernelId);
+  unsigned gridX = fnaccCdiv(pending.extent[0], pending.block[0],
+      "v2 multi-reduction grid dimension X");
+  unsigned gridY = fnaccCdiv(pending.extent[1], pending.block[1],
+      "v2 multi-reduction grid dimension Y");
+  std::size_t programCountSize =
+      fnaccCheckedMul(static_cast<std::size_t>(gridX),
+          static_cast<std::size_t>(gridY), "multi-reduction program count");
+  if (programCountSize >
+      static_cast<std::size_t>(std::numeric_limits<unsigned>::max())) {
+    std::fprintf(stderr,
+        "FNACC error: multi-reduction program count exceeds unsigned\n");
+    std::abort();
+  }
+  unsigned programCount = static_cast<unsigned>(programCountSize);
+
+  unsigned cudaBlockX = fnaccCudaThreadsPerCTA(pending.kernelId);
+  fnaccValidateCudaBlockSize(function, pending.kernelId, cudaBlockX);
+  fnaccValidateSupportedHiddenPtrArgCount(pending.kernelId);
+
+  std::vector<FNACCDeviceArg> deviceArgs;
+  std::vector<CUdeviceptr> devicePointers;
+  deviceArgs.reserve(pending.arrays.size());
+  devicePointers.reserve(pending.arrays.size());
+  for (std::size_t slot = 0; slot < pending.arrays.size(); ++slot) {
+    FNACCPendingArrayV2 &array = pending.arrays[slot];
+    if ((array.flags & 1) == 0) {
+      std::fprintf(stderr,
+          "FNACC error: multi-reduction input is not readable for kernel id "
+          "%d\n",
+          pending.kernelId);
+      std::abort();
+    }
+    int32_t target = fnaccEffectivePackTargetForArray(
+        desc, static_cast<int32_t>(slot), array.host);
+    FNACCDeviceArg device = fnaccPrepareReadBuffer(
+        array.host, array.bytes, target, static_cast<int32_t>(slot));
+    devicePointers.push_back(device.ptr);
+    deviceArgs.push_back(device);
+  }
+
+  FNACCReductionWorkspace &workspace = fnaccGetReductionWorkspace();
+  std::size_t partialElements = fnaccCheckedMul(programCountSize,
+      pending.reductionResults.size(), "multi-reduction partial elements");
+  std::size_t partialBytes = fnaccCheckedMul(
+      partialElements, sizeof(T), "multi-reduction partial bytes");
+  CUdeviceptr dPartials = fnaccReserveReductionBuffer(
+      workspace.partials, partialBytes, workspace.partialStats, "partials");
+
+  std::vector<int32_t> parameterValues(desc->parameters.size(), 0);
+  std::vector<void *> arguments;
+  arguments.reserve(desc->parameters.size() + 2);
+  for (const FNACCKernelParameterDesc &parameter : desc->parameters) {
+    switch (parameter.role) {
+    case FNACCKernelParameterRole::Read:
+      if ((pending.arrays[parameter.arrayIndex].flags & 1) == 0) {
+        std::fprintf(stderr,
+            "FNACC error: multi-reduction array flags disagree with kernel "
+            "id %d slot %d\n",
+            pending.kernelId, parameter.slot);
+        std::abort();
+      }
+      arguments.push_back(&devicePointers[parameter.arrayIndex]);
+      break;
+    case FNACCKernelParameterRole::Partials:
+      arguments.push_back(&dPartials);
+      break;
+    case FNACCKernelParameterRole::Scalar: {
+      FNACCPendingScalarV2 &scalar = pending.scalars[parameter.scalarIndex];
+      if (scalar.bytes != fnaccScalarParameterBytes(parameter.type)) {
+        std::fprintf(stderr,
+            "FNACC error: multi-reduction scalar type mismatch for kernel "
+            "id %d slot %d\n",
+            pending.kernelId, parameter.slot);
+        std::abort();
+      }
+      arguments.push_back(&scalar.storage);
+      break;
+    }
+    case FNACCKernelParameterRole::ExtentX:
+      arguments.push_back(&pending.extent[0]);
+      break;
+    case FNACCKernelParameterRole::ExtentY:
+      arguments.push_back(&pending.extent[1]);
+      break;
+    case FNACCKernelParameterRole::LoopLowerX:
+      arguments.push_back(&pending.loopLower[0]);
+      break;
+    case FNACCKernelParameterRole::LoopLowerY:
+      arguments.push_back(&pending.loopLower[1]);
+      break;
+    case FNACCKernelParameterRole::ArrayLowerBound:
+    case FNACCKernelParameterRole::ArrayStride: {
+      const FNACCPendingArrayV2 &array = pending.arrays[parameter.arrayIndex];
+      int64_t value =
+          parameter.role == FNACCKernelParameterRole::ArrayLowerBound
+          ? array.lower[parameter.dimension]
+          : array.stride[parameter.dimension];
+      parameterValues[parameter.slot] = fnaccCheckedI32Layout(value,
+          parameter.role == FNACCKernelParameterRole::ArrayLowerBound
+              ? "array lower bound"
+              : "array stride");
+      arguments.push_back(&parameterValues[parameter.slot]);
+      break;
+    }
+    default:
+      std::fprintf(stderr,
+          "FNACC error: unsupported multi-reduction v2 parameter for kernel "
+          "id %d slot %d\n",
+          pending.kernelId, parameter.slot);
+      std::abort();
+    }
+  }
+  FNACCHiddenTritonArgs hidden;
+  arguments.push_back(&hidden.hidden0);
+  arguments.push_back(&hidden.hidden1);
+
+  std::size_t tileElementsSize =
+      fnaccCheckedMul(static_cast<std::size_t>(pending.block[0]),
+          static_cast<std::size_t>(pending.block[1]),
+          "multi-reduction tile elements");
+  if (tileElementsSize >
+      static_cast<std::size_t>(std::numeric_limits<int32_t>::max())) {
+    std::fprintf(stderr,
+        "FNACC error: multi-reduction tile element count exceeds i32\n");
+    std::abort();
+  }
+  int32_t tileElements = static_cast<int32_t>(tileElementsSize);
+  unsigned dynamicSharedBytes;
+  if constexpr (std::is_same_v<T, double>) {
+    dynamicSharedBytes =
+        fnaccReductionF64DynamicSharedBytes(desc, tileElements);
+  } else if constexpr (std::is_integral_v<T>) {
+    dynamicSharedBytes =
+        fnaccReductionIntegerDynamicSharedBytes(desc, tileElements, sizeof(T));
+  } else {
+    dynamicSharedBytes = fnaccReductionDynamicSharedBytes(desc, tileElements);
+  }
+  fnaccConfigureDynamicSharedMemory(
+      function, pending.kernelId, dynamicSharedBytes);
+
+  if (fnaccDebugEnabled()) {
+    std::fprintf(stderr,
+        "FNACC: launch multi-reduction v2 kernel id=%d arrays=%zu "
+        "scalars=%zu outputs=%zu grid=(%u,%u,1) extent=(%d,%d)\n",
+        pending.kernelId, pending.arrays.size(), pending.scalars.size(),
+        pending.reductionResults.size(), gridX, gridY, pending.extent[0],
+        pending.extent[1]);
+  }
+  FNACC_CUDA_CHECK(cuLaunchKernel(function, gridX, gridY, 1, cudaBlockX, 1, 1,
+      dynamicSharedBytes, fnaccActiveContextState().stream, arguments.data(),
+      nullptr));
+  ++workspace.primaryLaunches;
+
+  std::size_t resultStrideBytes = fnaccCheckedMul(
+      programCountSize, sizeof(T), "multi-reduction result partial stride");
+  for (std::size_t index = 0; index < pending.reductionResults.size();
+      ++index) {
+    FNACCPendingReductionResultV2 &pendingResult =
+        pending.reductionResults[index];
+    T reducedValue = fnaccReductionIdentity<T>(desc->reductionOp);
+    CUdeviceptr segment =
+        dPartials + static_cast<CUdeviceptr>(index * resultStrideBytes);
+    if (!fnaccFinalizeReductionOnDevice<T>(
+            desc, workspace, segment, programCount, &reducedValue)) {
+      fnaccWaitForRuntimeStream();
+      std::vector<T> partials(programCount);
+      FNACC_CUDA_CHECK(
+          cuMemcpyDtoH(partials.data(), segment, resultStrideBytes));
+      for (T value : partials)
+        reducedValue =
+            fnaccApplyReduction(desc->reductionOp, reducedValue, value);
+    }
+    T initialValue = fnaccPendingReductionInitial<T>(pendingResult);
+    *static_cast<T *>(pendingResult.host) =
+        fnaccApplyReduction(desc->reductionOp, initialValue, reducedValue);
+  }
+
+  for (const FNACCDeviceArg &device : deviceArgs)
+    fnaccReleaseDeviceArg(device);
+  fnaccClearPendingLaunchV2();
+}
+
 static bool fnaccTryCommitReductionLaunchV2(
     const FNACCKernelDesc *desc, FNACCPendingLaunchV2 &pending) {
   if (!fnaccIsReductionKernelKind(desc->kind))
     return false;
-  if (pending.arrays.empty() || !pending.reductionResult.bound) {
+  if (pending.arrays.empty()) {
     std::fprintf(stderr,
         "FNACC error: incomplete v2 reduction bindings for kernel id %d\n",
         pending.kernelId);
@@ -3364,11 +3597,30 @@ static bool fnaccTryCommitReductionLaunchV2(
       pointerType = parameter.type;
       break;
     }
-  std::size_t resultBytes = pending.reductionResult.bytes;
+  bool isMultiReduction = desc->kind == "reduction_multi2d";
+  if ((!isMultiReduction && pending.reductionResults.size() != 1) ||
+      pending.reductionResults.empty()) {
+    std::fprintf(stderr,
+        "FNACC error: invalid v2 reduction result count for kernel id %d\n",
+        pending.kernelId);
+    std::abort();
+  }
+  std::size_t resultBytes = pending.reductionResults[0].bytes;
+  for (const FNACCPendingReductionResultV2 &result : pending.reductionResults)
+    if (!result.bound || result.bytes != resultBytes) {
+      std::fprintf(stderr,
+          "FNACC error: incomplete v2 reduction result bindings for kernel "
+          "id %d\n",
+          pending.kernelId);
+      std::abort();
+    }
 
 #define FNACC_DISPATCH_REDUCTION(TYPE_NAME, TYPE) \
   if (pointerType == "ptr<" TYPE_NAME ">" && resultBytes == sizeof(TYPE)) { \
-    fnaccCommitReductionTypedV2<TYPE>(desc, pending); \
+    if (isMultiReduction) \
+      fnaccCommitMultiReductionTypedV2<TYPE>(desc, pending); \
+    else \
+      fnaccCommitReductionTypedV2<TYPE>(desc, pending); \
     return true; \
   }
 
@@ -3474,7 +3726,21 @@ extern "C" void __fnacc_commit_launch_v2() {
 
   const FNACCKernelDesc *desc = fnaccLookupKernelDesc(pending.kernelId);
   bool isReduction = fnaccIsReductionKernelKind(desc->kind);
-  if (pending.reductionResult.bound != isReduction) {
+  bool anyReductionResultBound = std::any_of(pending.reductionResults.begin(),
+      pending.reductionResults.end(),
+      [](const FNACCPendingReductionResultV2 &result) { return result.bound; });
+  bool allReductionResultsBound = !pending.reductionResults.empty() &&
+      std::all_of(pending.reductionResults.begin(),
+          pending.reductionResults.end(),
+          [](const FNACCPendingReductionResultV2 &result) {
+            return result.bound;
+          });
+  bool reductionResultsAgree = isReduction
+      ? (pending.reductionResults.size() ==
+                static_cast<std::size_t>(desc->outputCount) &&
+            allReductionResultsBound)
+      : !anyReductionResultBound;
+  if (!reductionResultsAgree) {
     std::fprintf(stderr,
         "FNACC error: v2 reduction result binding disagrees with kernel id "
         "%d\n",

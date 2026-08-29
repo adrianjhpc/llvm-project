@@ -63,7 +63,8 @@ enum class ElementwiseKernelKind {
   ReductionDot1D,
   ReductionProduct1D,
   ReductionMin1D,
-  ReductionMax1D
+  ReductionMax1D,
+  MultiReduction2D
 };
 
 /// Return true when the kernel uses the staged, dynamically-sized launch ABI.
@@ -83,6 +84,7 @@ enum class ReductionOperator : int32_t {
 enum class ElementwiseExprKind {
   ArrayLoad,
   ScalarLoad,
+  IndexScalarLoad,
   AffineIndex,
   ConstantReal,
   ConstantInteger,
@@ -132,6 +134,7 @@ enum class ElementwiseExprKind {
   // Predicate composition.
   And,
   Or,
+  Not,
 
   // Conditional value selection.
   Select
@@ -139,9 +142,14 @@ enum class ElementwiseExprKind {
 
 enum class ElementwiseExprResultKind { Element, Predicate };
 
+enum class ElementType { Unknown, I8, I16, I32, I64, F32, F64 };
+
 struct ElementwiseExpr {
   ElementwiseExprKind kind;
   ElementwiseExprResultKind resultKind = ElementwiseExprResultKind::Element;
+  /// Element type carried by this expression. For comparisons this records
+  /// the operand type while resultKind records the i1 predicate result.
+  ElementType elementType = ElementType::Unknown;
 
   mlir::Value source;
   // Index in ElementwiseKernel::arrayAccesses. This distinguishes two loads
@@ -156,8 +164,6 @@ struct ElementwiseExpr {
 
   llvm::SmallVector<std::unique_ptr<ElementwiseExpr>> operands;
 };
-
-enum class ElementType { Unknown, I8, I16, I32, I64, F32, F64 };
 
 enum class ScalarCaptureKind { Reference, Value };
 
@@ -192,6 +198,7 @@ struct ElementwiseArrayAccess {
   mlir::Value array;
   mlir::Value loadedValue;
   unsigned arrayArgumentIndex = 0;
+  ElementType elementType = ElementType::Unknown;
   /// For each array dimension, the logical kernel dimension that supplies its
   /// subscript. A rank-1 coordinate array in a rank-2 stencil therefore uses
   /// either {0} (the inner/X loop) or {1} (the outer/Y loop).
@@ -216,15 +223,24 @@ struct ElementwiseOutput {
   llvm::SmallVector<int64_t, 3> offsets;
   llvm::SmallVector<std::shared_ptr<ElementwiseIndexExpr>, 3> indexExpressions;
   std::unique_ptr<ElementwiseExpr> expression;
+  /// Optional per-lane predicate for a one-sided guarded store.
+  std::unique_ptr<ElementwiseExpr> predicate;
 };
 
 struct ElementwiseArrayArgument {
   mlir::Value array;
   bool read = false;
   bool write = false;
+  ElementType elementType = ElementType::Unknown;
   /// Physical rank of this array binding. This is independent of the kernel
   /// iteration rank for mixed-rank stencils.
   unsigned rank = 0;
+};
+
+struct ElementwiseReductionOutput {
+  mlir::Value scalarRef;
+  ReductionOperator reductionOperator = ReductionOperator::Add;
+  std::unique_ptr<ElementwiseExpr> expression;
 };
 
 /// Classification of scalar storage referenced by a parallel loop.
@@ -297,6 +313,8 @@ struct ElementwiseKernel {
   llvm::SmallVector<ElementwiseArrayArgument> arrayArguments;
   llvm::SmallVector<ElementwiseArrayAccess> arrayAccesses;
   llvm::SmallVector<ElementwiseOutput> outputs;
+  /// Scalar result roots for one fused, multi-output reduction traversal.
+  llvm::SmallVector<ElementwiseReductionOutput> reductionOutputs;
   llvm::SmallVector<mlir::Value> writeArrays;
 
   /// Host-visible, read-only scalar references passed to the kernel by value.
