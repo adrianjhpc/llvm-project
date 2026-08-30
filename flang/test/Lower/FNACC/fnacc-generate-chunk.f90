@@ -4,6 +4,7 @@
 ! RUN:   %t.fir -o %t.host.fir
 ! RUN: FileCheck %s --check-prefix=HOST --input-file=%t.host.fir
 ! RUN: FileCheck %s --check-prefix=TTIR --input-file=%t.ttir
+! RUN: FileCheck %s --check-prefix=STORES --input-file=%t.ttir
 ! RUN: FileCheck %s --check-prefix=JSON --input-file=%t.json
 ! RUN: %python -m json.tool %t.json > /dev/null
 
@@ -103,7 +104,9 @@ end subroutine
 ! TTIR: arith.cmpf
 ! TTIR: math.sqrt
 ! TTIR: arith.xori
-! TTIR-COUNT-30: tt.store
+
+! STORES-COUNT-30: tt.store
+! STORES-NOT: tt.store
 
 ! JSON: "kind": "stencil2d"
 ! JSON: "rank": 2

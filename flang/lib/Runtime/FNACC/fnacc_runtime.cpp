@@ -759,8 +759,7 @@ static void fnaccValidateVariadicKernelMetadata(const FNACCKernelDesc &desc) {
   bool isMultiReduction = desc.kind == "reduction_multi2d";
   bool isMatmul = desc.kind == "matmul2d";
 
-  if (isReduction &&
-      (isMultiReduction ? desc.outputCount < 2 : desc.outputCount != 1)) {
+  if (isReduction && !isMultiReduction && desc.outputCount != 1) {
     std::fprintf(stderr,
         "FNACC error: invalid v2 reduction output count for kernel id %d\n",
         desc.id);
@@ -3281,6 +3280,7 @@ static void fnaccCommitReductionTypedV2(
   CUdeviceptr dPartials = fnaccReserveReductionBuffer(
       workspace.partials, partialBytes, workspace.partialStats, "partials");
 
+  std::vector<int32_t> parameterValues(desc->parameters.size(), 0);
   std::vector<void *> arguments;
   arguments.reserve(desc->parameters.size() + 2);
   for (const FNACCKernelParameterDesc &parameter : desc->parameters) {
@@ -3313,6 +3313,23 @@ static void fnaccCommitReductionTypedV2(
     case FNACCKernelParameterRole::ExtentX:
       arguments.push_back(&pending.extent[0]);
       break;
+    case FNACCKernelParameterRole::LoopLowerX:
+      arguments.push_back(&pending.loopLower[0]);
+      break;
+    case FNACCKernelParameterRole::ArrayLowerBound:
+    case FNACCKernelParameterRole::ArrayStride: {
+      const FNACCPendingArrayV2 &array = pending.arrays[parameter.arrayIndex];
+      int64_t value =
+          parameter.role == FNACCKernelParameterRole::ArrayLowerBound
+          ? array.lower[parameter.dimension]
+          : array.stride[parameter.dimension];
+      parameterValues[parameter.slot] = fnaccCheckedI32Layout(value,
+          parameter.role == FNACCKernelParameterRole::ArrayLowerBound
+              ? "array lower bound"
+              : "array stride");
+      arguments.push_back(&parameterValues[parameter.slot]);
+      break;
+    }
     default:
       std::fprintf(stderr,
           "FNACC error: unsupported reduction v2 parameter for kernel id %d "

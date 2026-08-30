@@ -484,8 +484,10 @@ materializeTripExtent(OpBuilder &builder, Location loc,
 
   Value difference =
       arith::SubIOp::create(builder, loc, upperValue, lowerValue);
-  return arith::AddIOp::create(builder, loc, difference,
-                               constantI32(builder, loc, 1));
+  Value tripCount = arith::AddIOp::create(builder, loc, difference,
+                                          constantI32(builder, loc, 1));
+  return arith::MaxSIOp::create(builder, loc, tripCount,
+                                constantI32(builder, loc, 0));
 }
 
 static std::optional<int64_t> getElementByteSize(Type elementType) {
@@ -1256,11 +1258,14 @@ struct FNACCLowerToRuntimePass
       Value blockZValue =
           arith::ConstantIntOp::create(builder, loc, blockShape.z, 32);
 
-      bool isStencil2D = k.kind == fir::fnacc::ElementwiseKernelKind::Stencil2D;
-      bool isAffine1D =
-          k.kind == fir::fnacc::ElementwiseKernelKind::MultiExpr1D;
+      bool hasLogicalBounds2D =
+          k.kind == fir::fnacc::ElementwiseKernelKind::Stencil2D ||
+          k.kind == fir::fnacc::ElementwiseKernelKind::MultiReduction2D;
+      bool hasLogicalBounds1D =
+          k.kind == fir::fnacc::ElementwiseKernelKind::MultiExpr1D ||
+          (fir::fnacc::isReductionKernelKind(k.kind) && k.rank == 1);
       Value extentXValue =
-          isStencil2D || isAffine1D
+          hasLogicalBounds2D || hasLogicalBounds1D
               ? materializeTripExtent(builder, loc, launchOp, k.extentX,
                                       k.loopLowerX)
               : materializeExtentValue(builder, loc, launchOp, k.extentX);
@@ -1268,7 +1273,7 @@ struct FNACCLowerToRuntimePass
       Value extentYValue;
       if (k.rank == 2) {
         extentYValue =
-            isStencil2D
+            hasLogicalBounds2D
                 ? materializeTripExtent(builder, loc, launchOp, k.extentY,
                                         k.loopLowerY)
                 : materializeExtentValue(builder, loc, launchOp, k.extentY);
@@ -1290,11 +1295,11 @@ struct FNACCLowerToRuntimePass
       }
 
       Value loopLowerXValue =
-          isStencil2D || isAffine1D
+          hasLogicalBounds2D || hasLogicalBounds1D
               ? materializeExtentValue(builder, loc, launchOp, k.loopLowerX)
               : constantI32(builder, loc, 1);
       Value loopLowerYValue =
-          isStencil2D
+          hasLogicalBounds2D
               ? materializeExtentValue(builder, loc, launchOp, k.loopLowerY)
               : constantI32(builder, loc, 1);
       Value loopLowerZValue = constantI32(builder, loc, 1);

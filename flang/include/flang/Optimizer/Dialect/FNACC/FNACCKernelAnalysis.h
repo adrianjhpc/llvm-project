@@ -88,6 +88,7 @@ enum class ElementwiseExprKind {
   AffineIndex,
   ConstantReal,
   ConstantInteger,
+  Convert,
 
   // Unary arithmetic.
   NegF,
@@ -178,7 +179,9 @@ enum class ElementwiseIndexExprKind {
   Constant,
   Add,
   Subtract,
-  Multiply
+  Multiply,
+  Min,
+  Select
 };
 
 /// Integer subscript expression for rank-projected pack/unpack accesses.
@@ -191,6 +194,10 @@ struct ElementwiseIndexExpr {
   mlir::Value capture;
   int32_t captureIndex = -1;
   int64_t constantValue = 0;
+  /// Source predicate for a data-dependent gather index. This is bound to an
+  /// elementwise predicate after all array accesses have been collected.
+  mlir::Value condition;
+  std::shared_ptr<ElementwiseExpr> conditionExpression;
   llvm::SmallVector<std::shared_ptr<ElementwiseIndexExpr>, 2> operands;
 };
 

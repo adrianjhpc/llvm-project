@@ -648,7 +648,7 @@ sameIndexExpression(const std::shared_ptr<ElementwiseIndexExpr> &lhs,
   if (!lhs || !rhs)
     return lhs == rhs;
   if (lhs->kind != rhs->kind || lhs->loopDimension != rhs->loopDimension ||
-      lhs->capture != rhs->capture ||
+      lhs->capture != rhs->capture || lhs->condition != rhs->condition ||
       lhs->constantValue != rhs->constantValue ||
       lhs->operands.size() != rhs->operands.size())
     return false;
@@ -668,6 +668,82 @@ sameIndexExpressions(ArrayRef<std::shared_ptr<ElementwiseIndexExpr>> lhs,
     if (!sameIndexExpression(lhsExpression, rhsExpression))
       return false;
   return true;
+}
+
+static bool regionStoresScalarReference(Region &region, Value reference);
+
+static std::shared_ptr<ElementwiseIndexExpr>
+matchGeneralIndexExpression(Value value, ArrayRef<Value> inductionMemrefs,
+                            Operation *before,
+                            llvm::SmallVectorImpl<Operation *> &consumedOps);
+
+/// Reconstruct an iteration-private integer used as an array subscript.  Walk
+/// backwards through straight-line stores and structured fir.if regions.  In
+/// particular, this follows branch-local aliases such as `dif = donor`, where
+/// both `dif` and `donor` are assigned inside the same arm of the conditional.
+static std::shared_ptr<ElementwiseIndexExpr>
+matchPrivateIndexValueBefore(Value reference, Operation *before,
+                             ArrayRef<Value> inductionMemrefs,
+                             llvm::SmallVectorImpl<Operation *> &consumedOps) {
+  if (!before)
+    return {};
+
+  Block *block = before->getBlock();
+  for (auto iterator = before->getIterator(); iterator != block->begin();) {
+    --iterator;
+    Operation *operation = &*iterator;
+
+    if (auto store = dyn_cast<fir::StoreOp>(operation)) {
+      if (!sameValueAfterFirConvert(store.getMemref(), reference))
+        continue;
+      if (!llvm::is_contained(consumedOps, store.getOperation()))
+        consumedOps.push_back(store.getOperation());
+      return matchGeneralIndexExpression(store.getValue(), inductionMemrefs,
+                                         store.getOperation(), consumedOps);
+    }
+
+    auto ifOp = dyn_cast<fir::IfOp>(operation);
+    if (!ifOp)
+      continue;
+    bool thenStores =
+        regionStoresScalarReference(ifOp.getThenRegion(), reference);
+    bool elseStores =
+        regionStoresScalarReference(ifOp.getElseRegion(), reference);
+    if (!thenStores && !elseStores)
+      continue;
+
+    if (!llvm::is_contained(consumedOps, ifOp.getOperation()))
+      consumedOps.push_back(ifOp.getOperation());
+
+    auto matchArm = [&](Region &region,
+                        bool stores) -> std::shared_ptr<ElementwiseIndexExpr> {
+      if (!stores)
+        return matchPrivateIndexValueBefore(reference, ifOp.getOperation(),
+                                            inductionMemrefs, consumedOps);
+      if (region.empty())
+        return {};
+      return matchPrivateIndexValueBefore(reference,
+                                          region.front().getTerminator(),
+                                          inductionMemrefs, consumedOps);
+    };
+
+    auto trueValue = matchArm(ifOp.getThenRegion(), thenStores);
+    auto falseValue = matchArm(ifOp.getElseRegion(), elseStores);
+    if (!trueValue || !falseValue)
+      return {};
+
+    auto expression = makeIndexExpr(ElementwiseIndexExprKind::Select);
+    expression->condition = ifOp.getCondition();
+    expression->operands.push_back(std::move(trueValue));
+    expression->operands.push_back(std::move(falseValue));
+    return expression;
+  }
+
+  Operation *parent = block->getParentOp();
+  if (!parent || isa<fir::DoLoopOp, fir::fnacc::LaunchOp>(parent))
+    return {};
+  return matchPrivateIndexValueBefore(reference, parent, inductionMemrefs,
+                                      consumedOps);
 }
 
 static std::shared_ptr<ElementwiseIndexExpr>
@@ -702,23 +778,11 @@ matchGeneralIndexExpression(Value value, ArrayRef<Value> inductionMemrefs,
       }
     }
 
-    // Resolve a straight-line iteration-private index temporary, as emitted
-    // for `index = ...; buffer(index) = ...` in CloverLeaf pack kernels.
-    if (before && before->getBlock() == load->getBlock()) {
-      for (auto iterator = before->getIterator();
-           iterator != before->getBlock()->begin();) {
-        --iterator;
-        auto store = dyn_cast<fir::StoreOp>(&*iterator);
-        if (!store ||
-            !sameValueAfterFirConvert(store.getMemref(), load.getMemref()))
-          continue;
-        if (!llvm::is_contained(consumedOps, load.getOperation()))
-          consumedOps.push_back(load.getOperation());
-        if (!llvm::is_contained(consumedOps, store.getOperation()))
-          consumedOps.push_back(store.getOperation());
-        return matchGeneralIndexExpression(store.getValue(), inductionMemrefs,
-                                           store.getOperation(), consumedOps);
-      }
+    if (auto expression = matchPrivateIndexValueBefore(
+            load.getMemref(), before, inductionMemrefs, consumedOps)) {
+      if (!llvm::is_contained(consumedOps, load.getOperation()))
+        consumedOps.push_back(load.getOperation());
+      return expression;
     }
     return {};
   }
@@ -734,6 +798,8 @@ matchGeneralIndexExpression(Value value, ArrayRef<Value> inductionMemrefs,
     kind = ElementwiseIndexExprKind::Subtract;
   else if (isa<arith::MulIOp>(operation))
     kind = ElementwiseIndexExprKind::Multiply;
+  else if (operation->getName().getStringRef() == "arith.minsi")
+    kind = ElementwiseIndexExprKind::Min;
   else
     return {};
 
@@ -1158,15 +1224,22 @@ static std::optional<int64_t> getIntegerConstantValue(Value v) {
   return integerAttr.getValue().getSExtValue();
 }
 
-/// Strip FIR operations that preserve an elementwise expression's value.
-/// `fir.no_reassoc` records an optimization constraint, but it is not a
-/// computation that needs to be reproduced in TTIR. The expression tree still
-/// preserves the source evaluation order after this wrapper is removed.
+/// Strip FIR operations that do not need separate expression nodes.
+/// `fir.no_reassoc` records an optimization constraint. A representation-only
+/// fir.convert between the same supported element type can also be discarded;
+/// type-changing converts are retained and become explicit expression nodes.
 static Value stripElementwiseWrappers(Value value) {
   while (true) {
-    value = stripFirConvert(value);
-
     Operation *operation = value.getDefiningOp();
+    if (auto convert = dyn_cast_or_null<fir::ConvertOp>(operation)) {
+      ElementType sourceType =
+          getSupportedElementType(convert.getValue().getType());
+      ElementType resultType = getSupportedElementType(value.getType());
+      if (sourceType != ElementType::Unknown && sourceType == resultType) {
+        value = convert.getValue();
+        continue;
+      }
+    }
     if (!operation || operation->getNumOperands() != 1 ||
         operation->getName().getStringRef() != "fir.no_reassoc")
       return value;
@@ -1647,6 +1720,29 @@ recognizeElementwiseExpr(Value value, const ArrayAccessInfo &accesses,
                          ElementwiseKernel &kernel, std::string &reason) {
   value = stripElementwiseWrappers(value);
 
+  // Preserve a type-changing conversion before any lookup that deliberately
+  // peers through fir.convert (array loads, forwarded values, and affine
+  // indices). Otherwise the conversion is mistaken for its source value and
+  // silently disappears from the emitted expression.
+  if (auto convert = value.getDefiningOp<fir::ConvertOp>()) {
+    ElementType sourceType =
+        getSupportedElementType(convert.getValue().getType());
+    ElementType destinationType = getSupportedElementType(value.getType());
+    if (sourceType == ElementType::Unknown ||
+        destinationType == ElementType::Unknown) {
+      reason = "fir.convert uses an unsupported element type";
+      return nullptr;
+    }
+    auto child =
+        recognizeElementwiseExpr(convert.getValue(), accesses, kernel, reason);
+    if (!child)
+      return nullptr;
+    auto expression = makeExpr(ElementwiseExprKind::Convert);
+    expression->elementType = destinationType;
+    expression->operands.push_back(std::move(child));
+    return expression;
+  }
+
   // Resolve an iteration-local read-after-write before treating the load as
   // a device-memory input. Reverse iteration selects the most recent
   // forwarding definition if a chain contains more than two stores.
@@ -1680,7 +1776,7 @@ recognizeElementwiseExpr(Value value, const ArrayAccessInfo &accesses,
         (!affine->baseRef || affine->baseCoefficient == 1 ||
          affine->baseCoefficient == -1)) {
       auto expression = makeExpr(ElementwiseExprKind::AffineIndex);
-      expression->elementType = kernel.elementType;
+      expression->elementType = getSupportedElementType(value.getType());
       expression->affineCoefficient = affine->coefficient;
       expression->affineBaseCoefficient = affine->baseCoefficient;
       expression->affineOffset = affine->offset;
@@ -2072,6 +2168,42 @@ static void bindIndexExpressionCaptures(
     bindIndexExpressionCaptures(kernel, expression);
 }
 
+static bool bindIndexExpressionConditions(
+    ElementwiseKernel &kernel,
+    const std::shared_ptr<ElementwiseIndexExpr> &expression,
+    const ArrayAccessInfo &accesses, std::string &reason) {
+  if (!expression)
+    return true;
+
+  if (expression->kind == ElementwiseIndexExprKind::Select) {
+    std::unique_ptr<ElementwiseExpr> condition = recognizeElementwiseExpr(
+        expression->condition, accesses, kernel, reason);
+    if (!condition)
+      return false;
+    if (condition->resultKind != ElementwiseExprResultKind::Predicate) {
+      reason = "conditional stencil index condition is not a predicate";
+      return false;
+    }
+    expression->conditionExpression =
+        std::shared_ptr<ElementwiseExpr>(std::move(condition));
+  }
+
+  for (const auto &operand : expression->operands)
+    if (!bindIndexExpressionConditions(kernel, operand, accesses, reason))
+      return false;
+  return true;
+}
+
+static bool bindIndexExpressionConditions(
+    ElementwiseKernel &kernel,
+    ArrayRef<std::shared_ptr<ElementwiseIndexExpr>> expressions,
+    const ArrayAccessInfo &accesses, std::string &reason) {
+  for (const auto &expression : expressions)
+    if (!bindIndexExpressionConditions(kernel, expression, accesses, reason))
+      return false;
+  return true;
+}
+
 static std::unique_ptr<ElementwiseExpr>
 buildWritePredicate(ArrayRef<ArrayAccessInfo::WriteCondition> conditions,
                     const ArrayAccessInfo &info, ElementwiseKernel &kernel,
@@ -2353,6 +2485,11 @@ static bool detectMultiExpr1D(ElementwiseKernel &kernel,
     kernel.arrayAccesses.push_back(std::move(access));
   }
 
+  for (ElementwiseArrayAccess &access : kernel.arrayAccesses)
+    if (!bindIndexExpressionConditions(kernel, access.indexExpressions, info,
+                                       reason))
+      return false;
+
   for (Value array : info.writeArrays) {
     getOrAddArrayIndex(kernel.writeArrays, array);
     getOrAddArrayArgument(kernel, array, false, true);
@@ -2365,6 +2502,10 @@ static bool detectMultiExpr1D(ElementwiseKernel &kernel,
 
   if (!appendRecognizedOutputs(kernel, info, reason))
     return false;
+  for (ElementwiseOutput &output : kernel.outputs)
+    if (!bindIndexExpressionConditions(kernel, output.indexExpressions, info,
+                                       reason))
+      return false;
 
   kernel.computeOp = kernel.outputs.front().storedValue.getDefiningOp();
   return inferAndCheckElementType(kernel, reason);
@@ -2407,6 +2548,11 @@ static bool detectStencil2D(ElementwiseKernel &kernel,
     kernel.arrayAccesses.push_back(std::move(access));
   }
 
+  for (ElementwiseArrayAccess &access : kernel.arrayAccesses)
+    if (!bindIndexExpressionConditions(kernel, access.indexExpressions, info,
+                                       reason))
+      return false;
+
   for (Value array : info.writeArrays) {
     getOrAddArrayIndex(kernel.writeArrays, array);
     getOrAddArrayArgument(kernel, array, false, true);
@@ -2420,6 +2566,10 @@ static bool detectStencil2D(ElementwiseKernel &kernel,
 
   if (!appendRecognizedOutputs(kernel, info, reason))
     return false;
+  for (ElementwiseOutput &output : kernel.outputs)
+    if (!bindIndexExpressionConditions(kernel, output.indexExpressions, info,
+                                       reason))
+      return false;
 
   kernel.computeOp = kernel.outputs.front().storedValue.getDefiningOp();
   return inferAndCheckElementType(kernel, reason);
@@ -2858,6 +3008,21 @@ static bool collectArrayAccesses1D(ElementwiseKernel &k, fir::DoLoopOp loop,
                             !info.readArrays.empty() &&
                             info.storedValues.size() == 1;
   if (!canonicalPointwise)
+    return detectMultiExpr1D(k, info, reason);
+
+  // The legacy pointwise ABI and its specialized emitters use one element
+  // type for every pointer. Route heterogeneous arrays through MultiExpr1D,
+  // whose array arguments and accesses retain their individual element types.
+  ElementType outputType = getArrayElementType(info.writeArray);
+  bool homogeneousArrays =
+      llvm::all_of(info.readArrays,
+                   [&](Value array) {
+                     return getArrayElementType(array) == outputType;
+                   }) &&
+      llvm::all_of(info.writeArrays, [&](Value array) {
+        return getArrayElementType(array) == outputType;
+      });
+  if (!homogeneousArrays)
     return detectMultiExpr1D(k, info, reason);
 
   // Existing direct form:
@@ -3450,9 +3615,9 @@ static ElementwiseRecognitionResult
 recognizeMultiReduction2D(fir::fnacc::LaunchOp launchOp) {
   std::optional<llvm::SmallVector<Value>> reductionScalars =
       getReductionScalarsFromLaunch(launchOp);
-  if (!reductionScalars || reductionScalars->size() < 2)
+  if (!reductionScalars || reductionScalars->empty())
     return fail(launchOp,
-                "multi-reduction recognition requires at least two results");
+                "2-D reduction recognition requires at least one result");
 
   std::optional<llvm::SmallVector<ReductionOperator>> reductionOperators =
       getReductionOperatorsFromLaunch(launchOp, reductionScalars->size());
@@ -3678,9 +3843,6 @@ recognizeReduction1D(fir::fnacc::LaunchOp launchOp) {
   std::string loopReason;
   if (!verifyLoopLowerBoundAndStep(loop, "reduction", loopReason))
     return fail(loop.getOperation(), loopReason);
-  if (!isConstantIntegerValue(loop.getLowerBound(), 1))
-    return fail(loop.getOperation(),
-                "reduction loop lower bound must be constant 1");
 
   ElementwiseExtentSource extentX = getLoopExtentSource(loop);
 
@@ -4338,6 +4500,22 @@ bool isSupportedElementwiseCompute(Operation *op) {
              arith::AddIOp, arith::SubIOp, arith::MulIOp, arith::DivSIOp>(op);
 }
 
+static bool hasDirectNestedLoop(fir::fnacc::LaunchOp launchOp) {
+  Region &region = launchOp.getRegion();
+  if (region.empty())
+    return false;
+
+  for (Operation &operation : region.front()) {
+    auto outerLoop = dyn_cast<fir::DoLoopOp>(operation);
+    if (!outerLoop)
+      continue;
+    return llvm::any_of(
+        outerLoop.getBody()->getOperations(),
+        [](Operation &nested) { return isa<fir::DoLoopOp>(nested); });
+  }
+  return false;
+}
+
 ElementwiseRecognitionResult
 recognizeElementwiseKernel(fir::fnacc::LaunchOp launchOp) {
   // Reductions are explicitly marked by lowering with fnacc.reduction_slots.
@@ -4346,7 +4524,8 @@ recognizeElementwiseKernel(fir::fnacc::LaunchOp launchOp) {
   if (launchOp->hasAttr("fnacc.reduction_slots")) {
     auto slots =
         launchOp->getAttrOfType<DenseI32ArrayAttr>("fnacc.reduction_slots");
-    if (slots && slots.asArrayRef().size() > 1) {
+    bool hasMultipleResults = slots && slots.asArrayRef().size() > 1;
+    if (hasMultipleResults || hasDirectNestedLoop(launchOp)) {
       auto multi = recognizeMultiReduction2D(launchOp);
       if (multi.succeeded())
         return validateRecognizedKernel(launchOp, std::move(multi));
@@ -4356,7 +4535,9 @@ recognizeElementwiseKernel(fir::fnacc::LaunchOp launchOp) {
             launchOp,
             "not a supported FNACC reduction kernel; reduction recognition "
             "requires exactly one reduction scalar");
-      std::string reason = "not a supported FNACC multi-reduction kernel; ";
+      std::string reason =
+          hasMultipleResults ? "not a supported FNACC multi-reduction kernel; "
+                             : "not a supported FNACC 2-D reduction kernel; ";
       reason += multi.getFailure().reason;
       return fail(launchOp, reason);
     }
@@ -4579,7 +4760,8 @@ static FNACCKernelABI buildKernelABI(fir::fnacc::LaunchOp launchOp,
                          FNACCKernelParameterPassing::Value, ElementType::I32,
                          "extent_k");
 
-    if (kernel.kind == ElementwiseKernelKind::MultiExpr1D) {
+    if (kernel.kind == ElementwiseKernelKind::MultiExpr1D ||
+        (isReduction && kernel.rank == 1)) {
       appendABIParameter(abi, FNACCKernelParameterRole::LoopLowerX,
                          FNACCKernelParameterPassing::Value, ElementType::I32,
                          "loop_lower_x");

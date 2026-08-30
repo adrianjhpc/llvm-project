@@ -242,6 +242,33 @@ static void emitLoad1D(StringRef ptr, StringRef dst, int64_t block,
      << "\n";
 }
 
+/// Load a rank-1 reduction operand using the original Fortran subscript.
+/// Triton lanes are zero based, while the source loop and array can have
+/// independent lower bounds.  Convert the logical source index to a physical
+/// element offset before forming the pointer.
+static void emitReductionLoad1D(StringRef ptr, StringRef dst,
+                                unsigned arrayIndex, int64_t block,
+                                fir::fnacc::ElementType type,
+                                llvm::raw_ostream &os) {
+  std::string ptrTy = ptrType(type);
+  std::string ptrVecTy = ptrTensorType(block, type);
+
+  os << "  " << dst << "_lower_s = tt.splat %array" << arrayIndex
+     << "_lower0 : i32 -> tensor<" << block << "xi32>\n";
+  os << "  " << dst << "_index = arith.subi %source_x, " << dst
+     << "_lower_s : tensor<" << block << "xi32>\n";
+  os << "  " << dst << "_stride_s = tt.splat %array" << arrayIndex
+     << "_stride0 : i32 -> tensor<" << block << "xi32>\n";
+  os << "  " << dst << "_offset = arith.muli " << dst << "_index, " << dst
+     << "_stride_s : tensor<" << block << "xi32>\n";
+  os << "  " << dst << "p = tt.splat " << ptr << " : " << ptrTy << " -> "
+     << ptrVecTy << "\n";
+  os << "  " << dst << "o = tt.addptr " << dst << "p, " << dst
+     << "_offset : " << ptrVecTy << ", tensor<" << block << "xi32>\n";
+  os << "  " << dst << " = tt.load " << dst << "o, %mask : " << ptrVecTy
+     << "\n";
+}
+
 static void emitStore1D(StringRef ptr, StringRef value, int64_t block,
                         fir::fnacc::ElementType type, llvm::raw_ostream &os) {
   std::string ptrTy = ptrType(type);
@@ -422,15 +449,15 @@ static std::string emitExprVector(const fir::fnacc::ElementwiseKernel &k,
       value = stem + "_adjusted";
     }
 
-    if (k.elementType == fir::fnacc::ElementType::I32)
+    if (expressionType == fir::fnacc::ElementType::I32)
       return value;
 
     std::string converted = stem + "_value";
-    if (k.elementType == fir::fnacc::ElementType::F32 ||
-        k.elementType == fir::fnacc::ElementType::F64) {
+    if (expressionType == fir::fnacc::ElementType::F32 ||
+        expressionType == fir::fnacc::ElementType::F64) {
       os << "  " << converted << " = arith.sitofp " << value << " : tensor<"
          << block << "xi32> to tensor<" << block << "x" << elemTy << ">\n";
-    } else if (k.elementType == fir::fnacc::ElementType::I64) {
+    } else if (expressionType == fir::fnacc::ElementType::I64) {
       os << "  " << converted << " = arith.extsi " << value << " : tensor<"
          << block << "xi32> to tensor<" << block << "xi64>\n";
     } else {
@@ -464,6 +491,56 @@ static std::string emitExprVector(const fir::fnacc::ElementwiseKernel &k,
     os << "  " << splat << " = tt.splat " << constant << " : " << elemTy
        << " -> tensor<" << block << "x" << elemTy << ">\n";
     return splat;
+  }
+
+  case fir::fnacc::ElementwiseExprKind::Convert: {
+    assert(expr.operands.size() == 1 && "convert requires one operand");
+    const fir::fnacc::ElementwiseExpr &sourceExpr = *expr.operands[0];
+    fir::fnacc::ElementType sourceType = sourceExpr.elementType;
+    fir::fnacc::ElementType destinationType = expressionType;
+    assert(sourceType != fir::fnacc::ElementType::Unknown &&
+           destinationType != fir::fnacc::ElementType::Unknown &&
+           "convert requires known element types");
+
+    std::string operand = emitExprVector(k, sourceExpr, state, os);
+    if (sourceType == destinationType)
+      return operand;
+
+    bool sourceInteger = isIntegerElementType(sourceType);
+    bool destinationInteger = isIntegerElementType(destinationType);
+    StringRef operation;
+    if (sourceInteger && !destinationInteger)
+      operation = "arith.sitofp";
+    else if (!sourceInteger && destinationInteger)
+      operation = "arith.fptosi";
+    else if (!sourceInteger && !destinationInteger)
+      operation = sourceType == fir::fnacc::ElementType::F32 ? "arith.extf"
+                                                             : "arith.truncf";
+    else {
+      auto integerWidth = [](fir::fnacc::ElementType type) -> unsigned {
+        switch (type) {
+        case fir::fnacc::ElementType::I8:
+          return 8;
+        case fir::fnacc::ElementType::I16:
+          return 16;
+        case fir::fnacc::ElementType::I32:
+          return 32;
+        case fir::fnacc::ElementType::I64:
+          return 64;
+        default:
+          llvm_unreachable("non-integer element type");
+        }
+      };
+      operation = integerWidth(sourceType) < integerWidth(destinationType)
+                      ? "arith.extsi"
+                      : "arith.trunci";
+    }
+
+    std::string result = "%expr" + std::to_string(state.nextTmp++);
+    os << "  " << result << " = " << operation << " " << operand << " : tensor<"
+       << block << "x" << ttElementType(sourceType) << "> to tensor<" << block
+       << "x" << elemTy << ">\n";
+    return result;
   }
 
   case fir::fnacc::ElementwiseExprKind::NegF:
@@ -918,6 +995,8 @@ static void emitTritonReduction1D(const fir::fnacc::ElementwiseKernel &k,
                                   int64_t block, StringRef kernelName,
                                   llvm::raw_ostream &os) {
   assert(!k.readArrays.empty() && "reduction requires an input array");
+  assert(k.arrayArguments.size() == k.readArrays.size() &&
+         "rank-1 reduction array bindings must match its read arrays");
   std::string ptrTy = ptrType(k.elementType);
   std::string elemTy = ttElementType(k.elementType).str();
 
@@ -934,7 +1013,13 @@ static void emitTritonReduction1D(const fir::fnacc::ElementwiseKernel &k,
   os << ", %partials: " << ptrTy;
   for (unsigned index = 0; index < k.scalarRefs.size(); ++index)
     os << ", %scalar" << index << ": " << elemTy;
-  os << ", %n: i32) attributes {noinline = false} {\n";
+  for (unsigned index = 0; index < k.indexRefs.size(); ++index)
+    os << ", %index" << index << ": i32";
+  os << ", %n: i32, %loop_lower_x: i32";
+  for (unsigned index = 0; index < k.arrayArguments.size(); ++index)
+    os << ", %array" << index << "_lower0: i32, %array" << index
+       << "_stride0: i32";
+  os << ") attributes {noinline = false} {\n";
 
   os << "  %pid  = tt.get_program_id x : i32\n";
   os << "  %blk  = arith.constant " << block << " : i32\n";
@@ -945,13 +1030,17 @@ static void emitTritonReduction1D(const fir::fnacc::ElementwiseKernel &k,
   os << "  %offs = arith.addi %base_s, %rng : tensor<" << block << "xi32>\n";
   os << "  %n_s = tt.splat %n : i32 -> tensor<" << block << "xi32>\n";
   os << "  %mask = arith.cmpi slt, %offs, %n_s : tensor<" << block << "xi32>\n";
+  os << "  %loop_lower_x_s = tt.splat %loop_lower_x : i32 -> tensor<" << block
+     << "xi32>\n";
+  os << "  %source_x = arith.addi %offs, %loop_lower_x_s : tensor<" << block
+     << "xi32>\n";
 
   std::string values = "%vals";
   if (k.expression) {
     for (unsigned index = 0; index < k.readArrays.size(); ++index) {
       std::string pointer = "%read" + std::to_string(index);
       std::string loaded = "%read" + std::to_string(index) + "v";
-      emitLoad1D(pointer, loaded, block, k.elementType, os);
+      emitReductionLoad1D(pointer, loaded, index, block, k.elementType, os);
     }
 
     ExprTritonEmitterState state;
@@ -960,12 +1049,7 @@ static void emitTritonReduction1D(const fir::fnacc::ElementwiseKernel &k,
     state.scalarSplatNames.resize(k.scalarRefs.size());
     values = emitExprVector(k, *k.expression, state, os);
   } else {
-    os << "  %ap = tt.splat %a : " << ptrTy << " -> tensor<" << block << "x"
-       << ptrTy << ">\n";
-    os << "  %ao = tt.addptr %ap, %offs : tensor<" << block << "x" << ptrTy
-       << ">, tensor<" << block << "xi32>\n";
-    os << "  %vals = tt.load %ao, %mask : tensor<" << block << "x" << ptrTy
-       << ">\n";
+    emitReductionLoad1D("%a", "%vals", 0, block, k.elementType, os);
   }
 
   os << "  %identity = arith.constant "
@@ -1103,6 +1187,8 @@ static void emitTritonReductionDot1D(const fir::fnacc::ElementwiseKernel &k,
          "expected ReductionDot1D kernel");
   assert(k.readArrays.size() == 2 &&
          "dot reduction requires exactly two read arrays");
+  assert(k.arrayArguments.size() == 2 &&
+         "dot reduction requires exactly two array bindings");
 
   std::string ptrTy = ptrType(k.elementType);
   std::string elemTy = ttElementType(k.elementType).str();
@@ -1113,6 +1199,7 @@ static void emitTritonReductionDot1D(const fir::fnacc::ElementwiseKernel &k,
   //   %b        read array 1
   //   %partials one output scalar per Triton program
   //   %n        number of elements
+  //   %loop_lower_x and per-array layout describe source indexing
   //
   // Runtime recursively reduces %partials on the GPU and copies back only the
   // final scalar.
@@ -1121,8 +1208,10 @@ static void emitTritonReductionDot1D(const fir::fnacc::ElementwiseKernel &k,
   // Triton build uses a slightly different printed form, adjust this block
   // while preserving the function ABI.
   os << "tt.func @" << kernelName << "(%a: " << ptrTy << ", %b: " << ptrTy
-     << ", %partials: " << ptrTy
-     << ", %n: i32) attributes {noinline = false} {\n";
+     << ", %partials: " << ptrTy << ", %n: i32, %loop_lower_x: i32"
+     << ", %array0_lower0: i32, %array0_stride0: i32"
+     << ", %array1_lower0: i32, %array1_stride0: i32"
+     << ") attributes {noinline = false} {\n";
 
   os << "  %pid  = tt.get_program_id x : i32\n";
   os << "  %blk  = arith.constant " << block << " : i32\n";
@@ -1136,20 +1225,13 @@ static void emitTritonReductionDot1D(const fir::fnacc::ElementwiseKernel &k,
 
   os << "  %n_s = tt.splat %n : i32 -> tensor<" << block << "xi32>\n";
   os << "  %mask = arith.cmpi slt, %offs, %n_s : tensor<" << block << "xi32>\n";
+  os << "  %loop_lower_x_s = tt.splat %loop_lower_x : i32 -> tensor<" << block
+     << "xi32>\n";
+  os << "  %source_x = arith.addi %offs, %loop_lower_x_s : tensor<" << block
+     << "xi32>\n";
 
-  os << "  %ap = tt.splat %a : " << ptrTy << " -> tensor<" << block << "x"
-     << ptrTy << ">\n";
-  os << "  %ao = tt.addptr %ap, %offs : tensor<" << block << "x" << ptrTy
-     << ">, tensor<" << block << "xi32>\n";
-  os << "  %av = tt.load %ao, %mask : tensor<" << block << "x" << ptrTy
-     << ">\n";
-
-  os << "  %bp = tt.splat %b : " << ptrTy << " -> tensor<" << block << "x"
-     << ptrTy << ">\n";
-  os << "  %bo = tt.addptr %bp, %offs : tensor<" << block << "x" << ptrTy
-     << ">, tensor<" << block << "xi32>\n";
-  os << "  %bv = tt.load %bo, %mask : tensor<" << block << "x" << ptrTy
-     << ">\n";
+  emitReductionLoad1D("%a", "%av", 0, block, k.elementType, os);
+  emitReductionLoad1D("%b", "%bv", 1, block, k.elementType, os);
 
   os << "  %prod = "
      << (isIntegerElementType(k.elementType) ? "arith.muli" : "arith.mulf")
@@ -1326,6 +1408,12 @@ static void emitTritonStencil2D(const fir::fnacc::ElementwiseKernel &k,
   os << "  %source_y = arith.addi %iy0, %loop_lower_y_s : tensor<" << block
      << "xi32>\n";
 
+  ExprTritonEmitterState state;
+  state.block = block;
+  state.scalarSplatEmitted.resize(k.scalarRefs.size(), false);
+  state.scalarSplatNames.resize(k.scalarRefs.size());
+  state.arrayAccessNames.resize(k.arrayAccesses.size());
+
   std::function<std::string(
       const std::shared_ptr<fir::fnacc::ElementwiseIndexExpr> &, StringRef)>
       emitIndexExpression;
@@ -1356,9 +1444,25 @@ static void emitTritonStencil2D(const fir::fnacc::ElementwiseKernel &k,
     case Kind::Add:
     case Kind::Subtract:
     case Kind::Multiply:
+    case Kind::Min:
       assert(expression->operands.size() == 2 &&
              "binary stencil index expression requires two operands");
       break;
+    case Kind::Select: {
+      assert(expression->conditionExpression &&
+             expression->operands.size() == 2 &&
+             "conditional stencil index is incomplete");
+      std::string condition =
+          emitExprVector(k, *expression->conditionExpression, state, os);
+      std::string trueValue =
+          emitIndexExpression(expression->operands[0], stem.str() + "_true");
+      std::string falseValue =
+          emitIndexExpression(expression->operands[1], stem.str() + "_false");
+      os << "  %" << stem << "_value = arith.select " << condition << ", "
+         << trueValue << ", " << falseValue << " : tensor<" << block
+         << "xi1>, tensor<" << block << "xi32>\n";
+      return "%" + stem.str() + "_value";
+    }
     }
 
     std::string lhs =
@@ -1367,7 +1471,8 @@ static void emitTritonStencil2D(const fir::fnacc::ElementwiseKernel &k,
         emitIndexExpression(expression->operands[1], stem.str() + "_rhs");
     StringRef operation = expression->kind == Kind::Add        ? "arith.addi"
                           : expression->kind == Kind::Subtract ? "arith.subi"
-                                                               : "arith.muli";
+                          : expression->kind == Kind::Multiply ? "arith.muli"
+                                                               : "arith.minsi";
     os << "  %" << stem << "_value = " << operation << " " << lhs << ", " << rhs
        << " : tensor<" << block << "xi32>\n";
     return "%" + stem.str() + "_value";
@@ -1474,12 +1579,6 @@ static void emitTritonStencil2D(const fir::fnacc::ElementwiseKernel &k,
         os << "  %" << stem << "_offset = arith.addi %" << stem << "_xpart, %"
            << stem << "_ypart : tensor<" << block << "xi32>\n";
       };
-
-  ExprTritonEmitterState state;
-  state.block = block;
-  state.scalarSplatEmitted.resize(k.scalarRefs.size(), false);
-  state.scalarSplatNames.resize(k.scalarRefs.size());
-  state.arrayAccessNames.resize(k.arrayAccesses.size());
 
   for (auto [index, access] : llvm::enumerate(k.arrayAccesses)) {
     std::string stem = "access" + std::to_string(index);
