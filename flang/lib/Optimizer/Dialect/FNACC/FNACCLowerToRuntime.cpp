@@ -1020,9 +1020,10 @@ static LogicalResult lowerFNACCDataOpsToRuntime(ModuleOp module,
 
   module.walk([&](Operation *op) {
     if (isa<fir::fnacc::UpdateHostOp, fir::fnacc::UpdateDeviceOp,
-            fir::fnacc::ReleaseOp, fir::fnacc::ReleaseAllOp,
-            fir::fnacc::CopyinOp, fir::fnacc::CreateOp, fir::fnacc::CopyoutOp,
-            fir::fnacc::DeleteOp, fir::fnacc::WaitOp>(op)) {
+            fir::fnacc::PresentOp, fir::fnacc::ReleaseOp,
+            fir::fnacc::ReleaseAllOp, fir::fnacc::CopyinOp,
+            fir::fnacc::CreateOp, fir::fnacc::CopyoutOp, fir::fnacc::DeleteOp,
+            fir::fnacc::WaitOp>(op)) {
       dataOps.push_back(op);
     }
   });
@@ -1065,6 +1066,29 @@ static LogicalResult lowerFNACCDataOpsToRuntime(ModuleOp module,
           << "FNACC create could not determine object size; create requires "
              "a sized scalar, explicit-shape array, or descriptor";
       return failure();
+    }
+
+    op->erase();
+    return success();
+  };
+
+  auto lowerPresent = [&](Operation *op, Value var) -> LogicalResult {
+    Location loc = op->getLoc();
+    builder.setInsertionPoint(op);
+
+    if (auto desc = tryCreateContiguousArrayDescriptorArgs(builder, loc, var)) {
+      createDescriptorRuntimeCall(module, builder, loc, "__fnacc_present_desc",
+                                  *desc);
+    } else if (auto bytes = tryCreateByteSizedRuntimeArgs(builder, loc, var)) {
+      createRuntimeCall(module, builder, loc, "__fnacc_present_bytes",
+                        bytes->values);
+    } else {
+      op->emitWarning()
+          << "FNACC present could not determine object size; checking only "
+             "for an existing raw-pointer allocation";
+      Value ptr = convertToOpaqueRuntimePtr(builder, loc, var);
+      createRuntimeCall(module, builder, loc, "__fnacc_present",
+                        ValueRange{ptr});
     }
 
     op->erase();
@@ -1132,6 +1156,12 @@ static LogicalResult lowerFNACCDataOpsToRuntime(ModuleOp module,
 
     if (auto create = dyn_cast<fir::fnacc::CreateOp>(op)) {
       if (failed(lowerCreate(op, create.getVar())))
+        return failure();
+      continue;
+    }
+
+    if (auto present = dyn_cast<fir::fnacc::PresentOp>(op)) {
+      if (failed(lowerPresent(op, present.getVar())))
         return failure();
       continue;
     }

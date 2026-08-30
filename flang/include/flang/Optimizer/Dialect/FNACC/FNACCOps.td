@@ -58,6 +58,16 @@ def FNACC_UpdateDeviceOp : FNACC_Op<"update_device", []> {
   let assemblyFormat = "$var attr-dict `:` type($var)";
 }
 
+def FNACC_PresentOp : FNACC_Op<"present", []> {
+  let summary = "Assert that an object is present in the FNACC device cache";
+  let description = [{
+    Checks that the object already has a sufficiently large cached device
+    allocation. The operation does not allocate memory or transfer data.
+  }];
+  let arguments = (ins AnyType:$var);
+  let assemblyFormat = "$var attr-dict `:` type($var)";
+}
+
 def FNACC_ReleaseOp : FNACC_Op<"release", []> {
   let arguments = (ins Variadic<AnyType>:$vars);
   let assemblyFormat = "$vars attr-dict `:` type($vars)";

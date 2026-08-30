@@ -65,6 +65,13 @@ struct FnACCUpdateDeviceDirective {
   std::tuple<std::list<Name>> t;
 };
 
+/// Assert that each named object already has a live FNACC device allocation.
+/// This directive never allocates or transfers data.
+struct FnACCPresentDirective {
+  TUPLE_CLASS_BOILERPLATE(FnACCPresentDirective);
+  std::tuple<std::list<Name>> t;
+};
+
 struct FnACCReleaseDirective {
   TUPLE_CLASS_BOILERPLATE(FnACCReleaseDirective);
   std::tuple<std::list<Name>> t;
@@ -119,8 +126,8 @@ struct FnACCExitDataDirective {
 struct FnACCStandaloneConstruct {
   UNION_CLASS_BOILERPLATE(FnACCStandaloneConstruct);
   std::variant<FnACCUpdateHostDirective, FnACCUpdateDeviceDirective,
-      FnACCReleaseDirective, FnACCReleaseAllDirective, FnACCEnterDataDirective,
-      FnACCExitDataDirective, FnACCWaitDirective>
+      FnACCPresentDirective, FnACCReleaseDirective, FnACCReleaseAllDirective,
+      FnACCEnterDataDirective, FnACCExitDataDirective, FnACCWaitDirective>
       u;
   CharBlock source;
 };

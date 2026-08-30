@@ -2509,6 +2509,82 @@ static FNACCDeviceAllocation &fnaccGetOrCreateCachedAllocation(void *hostPtr,
   return inserted.first->second;
 }
 
+static void fnaccRequirePresentAllocation(
+    const char *operationName, void *hostPtr, std::size_t requiredBytes) {
+  if (!hostPtr) {
+    std::fprintf(stderr, "FNACC error: %s received a null host pointer\n",
+        operationName);
+    std::abort();
+  }
+
+  auto &cache = fnaccActiveContextState().deviceCache;
+  auto it = cache.find(hostPtr);
+  if (it == cache.end() || it->second.ptr == 0 || it->second.bytes == 0) {
+    std::fprintf(stderr,
+        "FNACC error: %s requires host=%p to be present on the device; "
+        "use enter data copyin/create first\n",
+        operationName, hostPtr);
+    std::abort();
+  }
+
+  if (requiredBytes != 0 && it->second.bytes < requiredBytes) {
+    std::fprintf(stderr,
+        "FNACC error: %s requires %zu bytes for host=%p, but the present "
+        "allocation has only %zu bytes\n",
+        operationName, requiredBytes, hostPtr, it->second.bytes);
+    std::abort();
+  }
+
+  if (fnaccDebugEnabled()) {
+    std::fprintf(stderr,
+        "FNACC: %s confirmed host=%p device=0x%llx bytes=%zu\n", operationName,
+        hostPtr, static_cast<unsigned long long>(it->second.ptr),
+        it->second.bytes);
+  }
+}
+
+extern "C" void __fnacc_present(void *hostPtr) {
+  FNACC_RUNTIME_GUARD();
+  FNACCCurrentContextGuard contextGuard;
+  fnaccEnsureCurrentContext();
+  fnaccRequirePresentAllocation("present", hostPtr, 0);
+}
+
+extern "C" void __fnacc_present_bytes(void *hostPtr, int64_t bytesValue) {
+  FNACC_RUNTIME_GUARD();
+  FNACCCurrentContextGuard contextGuard;
+  fnaccEnsureCurrentContext();
+
+  if (bytesValue < 0) {
+    std::fprintf(stderr,
+        "FNACC error: present_bytes received negative byte count %lld\n",
+        static_cast<long long>(bytesValue));
+    std::abort();
+  }
+  if (bytesValue == 0)
+    return;
+
+  fnaccRequirePresentAllocation(
+      "present_bytes", hostPtr, static_cast<std::size_t>(bytesValue));
+}
+
+extern "C" void __fnacc_present_desc(void *hostPtr, int64_t elementBytes,
+    int32_t rank, int64_t extent0, int64_t extent1, int64_t extent2,
+    int64_t stride0, int64_t stride1, int64_t stride2) {
+  FNACC_RUNTIME_GUARD();
+  FNACCCurrentContextGuard contextGuard;
+  fnaccEnsureCurrentContext();
+
+  fnaccValidateContiguousDescriptor("__fnacc_present_desc", elementBytes, rank,
+      extent0, extent1, extent2, stride0, stride1, stride2);
+  std::size_t bytes =
+      fnaccBytesFromDescriptor(elementBytes, rank, extent0, extent1, extent2);
+  if (bytes == 0)
+    return;
+
+  fnaccRequirePresentAllocation("present_desc", hostPtr, bytes);
+}
+
 extern "C" void __fnacc_create_bytes(void *hostPtr, int64_t bytesValue) {
   FNACC_RUNTIME_GUARD();
   FNACCCurrentContextGuard contextGuard;

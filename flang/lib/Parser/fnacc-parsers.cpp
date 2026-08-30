@@ -57,6 +57,9 @@ TYPE_PARSER(construct<FnACCUpdateHostDirective>(
 TYPE_PARSER(construct<FnACCUpdateDeviceDirective>(
     "UPDATE"_tok >> "DEVICE"_tok >> parenthesized(nonemptyList(name))))
 
+TYPE_PARSER(construct<FnACCPresentDirective>(
+    "PRESENT"_tok >> parenthesized(nonemptyList(name))))
+
 TYPE_PARSER(construct<FnACCReleaseDirective>(
     "RELEASE"_tok >> parenthesized(nonemptyList(name))))
 
@@ -102,6 +105,8 @@ TYPE_PARSER(construct<FnACCStandaloneConstruct>(startfnaccLine >>
         startfnaccLine >> Parser<FnACCUpdateHostDirective>{} / endOfLine) ||
     construct<FnACCStandaloneConstruct>(
         startfnaccLine >> Parser<FnACCUpdateDeviceDirective>{} / endOfLine) ||
+    construct<FnACCStandaloneConstruct>(
+        startfnaccLine >> Parser<FnACCPresentDirective>{} / endOfLine) ||
     construct<FnACCStandaloneConstruct>(
         startfnaccLine >> Parser<FnACCReleaseAllDirective>{} / endOfLine) ||
     construct<FnACCStandaloneConstruct>(

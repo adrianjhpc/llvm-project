@@ -377,6 +377,7 @@ public:
   NODE(parser, FnACCStandaloneConstruct)
   NODE(parser, FnACCUpdateHostDirective)
   NODE(parser, FnACCUpdateDeviceDirective)
+  NODE(parser, FnACCPresentDirective)
   NODE(parser, FnACCReleaseDirective)
   NODE(parser, FnACCReleaseAllDirective)
   NODE(parser, FnACCWaitDirective)

@@ -8,6 +8,7 @@ module {
       %b: !fir.ref<!fir.array<?xf32>>) {
     fnacc.update_host %a : !fir.ref<!fir.array<?xf32>>
     fnacc.update_device %a : !fir.ref<!fir.array<?xf32>>
+    fnacc.present %a : !fir.ref<!fir.array<?xf32>>
     fnacc.release %a, %b : !fir.ref<!fir.array<?xf32>>, !fir.ref<!fir.array<?xf32>>
     fnacc.release_all
     fnacc.wait
@@ -18,6 +19,7 @@ module {
 
 // CHECK-DAG: func.func private @__fnacc_update_host(!fir.ref<i8>)
 // CHECK-DAG: func.func private @__fnacc_update_device(!fir.ref<i8>)
+// CHECK-DAG: func.func private @__fnacc_present(!fir.ref<i8>)
 // CHECK-DAG: func.func private @__fnacc_release(!fir.ref<i8>)
 // CHECK-DAG: func.func private @__fnacc_release_all()
 // CHECK-DAG: func.func private @__fnacc_wait()
@@ -27,6 +29,7 @@ module {
 // CHECK: call @__fnacc_update_host
 // CHECK: fir.convert {{.*}} : (!fir.ref<!fir.array<?xf32>>) -> !fir.ref<i8>
 // CHECK: call @__fnacc_update_device
+// CHECK: call @__fnacc_present
 // CHECK: call @__fnacc_release
 // CHECK: call @__fnacc_release
 // CHECK: call @__fnacc_release_all
@@ -34,6 +37,7 @@ module {
 
 // CHECK-NOT: fnacc.update_host
 // CHECK-NOT: fnacc.update_device
+// CHECK-NOT: fnacc.present
 // CHECK-NOT: fnacc.release
 // CHECK-NOT: fnacc.release_all
 // CHECK-NOT: fnacc.wait

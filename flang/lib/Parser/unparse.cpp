@@ -2929,6 +2929,12 @@ public:
     Walk(std::get<0>(x.t), ", ");
     Put(")");
   }
+  void Unparse(const FnACCPresentDirective &x) {
+    Word("PRESENT");
+    Put("(");
+    Walk(std::get<0>(x.t), ", ");
+    Put(")");
+  }
   void Unparse(const FnACCReleaseDirective &x) {
     Word("RELEASE");
     Put("(");

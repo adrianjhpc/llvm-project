@@ -3738,6 +3738,18 @@ private:
               }
             },
 
+            [&](const Fortran::parser::FnACCPresentDirective &dir) {
+              const auto &names{std::get<0>(dir.t)};
+
+              for (const Fortran::parser::Name &name : names) {
+                mlir::Value value = getValueForName(name);
+                if (!value)
+                  continue;
+
+                fir::fnacc::PresentOp::create(*builder, loc, value);
+              }
+            },
+
             [&](const Fortran::parser::FnACCReleaseDirective &dir) {
               const auto &names{std::get<0>(dir.t)};
 

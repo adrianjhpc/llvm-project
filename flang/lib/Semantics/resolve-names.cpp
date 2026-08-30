@@ -2232,6 +2232,15 @@ public:
       ResolveFNACCName(name, "UPDATE DEVICE directive");
   }
 
+  // !$fnacc present(a, b)
+  void Post(const parser::FnACCPresentDirective &dir) {
+    auto &names{const_cast<std::list<parser::Name> &>(
+        std::get<std::list<parser::Name>>(dir.t))};
+
+    for (parser::Name &name : names)
+      ResolveFNACCName(name, "PRESENT directive");
+  }
+
   // !$fnacc release(a, b)
   void Post(const parser::FnACCReleaseDirective &dir) {
     auto &names{const_cast<std::list<parser::Name> &>(
