@@ -5,7 +5,7 @@ subroutine test_fnacc_data_directives(n, a, b, c)
   real :: a(n), b(n), c(n)
   integer :: i
 
-  !$fnacc parallel tile(128) pack(a:device, c:device)
+  !$fnacc parallel tile(128) no_copyback pack(a:device, c:device)
   do i = 1, n
     c(i) = a(i) + b(i)
   end do
@@ -19,6 +19,7 @@ end subroutine
 ! CHECK: FnACCConstruct
 ! CHECK: FnACCParallelDirective
 ! CHECK: FnACCTileClause
+! CHECK: FnACCNoCopybackClause
 ! CHECK: FnACCPackClause
 
 ! CHECK: FnACCStandaloneConstruct

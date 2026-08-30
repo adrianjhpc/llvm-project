@@ -18,6 +18,10 @@ struct FnACCTileClause {
   WRAPPER_CLASS_BOILERPLATE(FnACCTileClause, std::list<ScalarIntConstantExpr>);
 };
 
+struct FnACCNoCopybackClause {
+  WRAPPER_CLASS_BOILERPLATE(FnACCNoCopybackClause, bool);
+};
+
 ENUM_CLASS(FnACCReductionOperator, Add, Multiply, Min, Max);
 
 struct FnACCReductionClause {
@@ -31,7 +35,9 @@ struct FnACCReductionClause {
 
 struct FnACCClause {
   UNION_CLASS_BOILERPLATE(FnACCClause);
-  std::variant<FnACCTileClause, FnACCPackClause, FnACCReductionClause> u;
+  std::variant<FnACCTileClause, FnACCPackClause, FnACCReductionClause,
+      FnACCNoCopybackClause>
+      u;
 };
 
 struct FnACCParallelDirective {

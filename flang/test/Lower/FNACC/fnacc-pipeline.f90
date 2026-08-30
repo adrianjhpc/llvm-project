@@ -10,7 +10,7 @@ subroutine fnacc_pipeline_test(n, a, b, c)
   real :: a(n), b(n), c(n)
   integer :: i
 
-  !$fnacc parallel tile(128) pack(a:device, c:device)
+  !$fnacc parallel tile(128) no_copyback pack(a:device)
   do i = 1, n
     c(i) = a(i) + b(i)
   end do
@@ -57,10 +57,8 @@ end subroutine
 ! JSON: "array_count": 3
 ! JSON: "scalar_count": 0
 ! JSON: "output_count": 1
+! JSON: "copy_back_writes": false
 ! JSON: "pack": [
 ! JSON: "kernel_arg_slot": 0
-! JSON: "target": 1
-! JSON: "target_name": "device"
-! JSON: "kernel_arg_slot": 2
 ! JSON: "target": 1
 ! JSON: "target_name": "device"

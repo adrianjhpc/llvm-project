@@ -3565,6 +3565,7 @@ private:
     llvm::SmallVector<int32_t> packTargets;
     llvm::SmallVector<mlir::Value> reductionVars;
     llvm::SmallVector<int32_t> reductionOps;
+    bool noCopyback = false;
 
     for (const Fortran::parser::FnACCClause &clause : clauses) {
       Fortran::common::visit(
@@ -3644,6 +3645,9 @@ private:
                   }
                 }
               },
+              [&](const Fortran::parser::FnACCNoCopybackClause &) {
+                noCopyback = true;
+              },
               [&](const auto &) {}},
           clause.u);
     }
@@ -3663,6 +3667,9 @@ private:
     auto launchOp = fir::fnacc::LaunchOp::create(
         *builder, loc, builder->getDenseI64ArrayAttr(tileSizes), packVars,
         builder->getDenseI32ArrayAttr(packTargets));
+
+    if (noCopyback)
+      launchOp->setAttr("fnacc.no_copyback", builder->getUnitAttr());
 
     if (!reductionVars.empty()) {
       llvm::SmallVector<int32_t> reductionSlots;

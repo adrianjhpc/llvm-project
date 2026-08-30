@@ -2170,6 +2170,7 @@ public:
     unsigned tileClauses = 0;
     unsigned packClauses = 0;
     unsigned reductionClauses = 0;
+    unsigned noCopybackClauses = 0;
     for (const parser::FnACCClause &clause : std::get<0>(dir.t)) {
       tileClauses +=
           std::holds_alternative<parser::FnACCTileClause>(clause.u) ? 1 : 0;
@@ -2178,6 +2179,9 @@ public:
       reductionClauses +=
           std::holds_alternative<parser::FnACCReductionClause>(clause.u) ? 1
                                                                          : 0;
+      noCopybackClauses +=
+          std::holds_alternative<parser::FnACCNoCopybackClause>(clause.u) ? 1
+                                                                          : 0;
     }
     if (tileClauses > 1)
       Say(dir.source, "FNACC TILE clause may appear at most once"_err_en_US);
@@ -2186,6 +2190,9 @@ public:
     if (reductionClauses > 1)
       Say(dir.source,
           "FNACC REDUCTION clause may appear at most once"_err_en_US);
+    if (noCopybackClauses > 1)
+      Say(dir.source,
+          "FNACC NO_COPYBACK clause may appear at most once"_err_en_US);
   }
 
   bool Pre(const parser::FnACCStandaloneConstruct &construct) {

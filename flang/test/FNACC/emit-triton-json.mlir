@@ -50,7 +50,7 @@ module {
       }
 
       fnacc.terminator
-    } attributes {pack_targets = array<i32>}
+    } attributes {fnacc.no_copyback, pack_targets = array<i32>}
 
     return
   }
@@ -133,11 +133,13 @@ module {
 // JSON: "rank": 1
 // JSON: "tile": [128, 1, 1]
 // JSON: "private_pointer_args": 2
+// JSON: "copy_back_writes": false
 
 // JSON: "id": 1
 // JSON: "name": "fnacc_kernel_1"
 // JSON: "rank": 2
 // JSON: "tile": [16, 16, 1]
+// JSON: "copy_back_writes": true
 // JSON: "grid": ["cdiv(extent_x, tile_x)", "cdiv(extent_y, tile_y)", "1"]
 
 // FALLBACK: warning: requested backend 'cuda-tile' is not registered; falling back to 'triton'

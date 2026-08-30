@@ -239,6 +239,29 @@ static bool jsonFindInt(
   return true;
 }
 
+static bool jsonFindBool(const std::string &text, const char *key, bool &out) {
+  std::size_t keyPos = jsonFindKey(text, key);
+  if (keyPos == std::string::npos)
+    return false;
+
+  std::size_t colon = text.find(':', keyPos);
+  if (colon == std::string::npos)
+    return false;
+
+  std::size_t value = text.find_first_not_of(" \t\n\r", colon + 1);
+  if (value == std::string::npos)
+    return false;
+  if (text.compare(value, 4, "true") == 0) {
+    out = true;
+    return true;
+  }
+  if (text.compare(value, 5, "false") == 0) {
+    out = false;
+    return true;
+  }
+  return false;
+}
+
 static bool jsonFindString(
     const std::string &text, const char *key, std::string &out) {
   std::size_t keyPos = jsonFindKey(text, key);
@@ -706,6 +729,7 @@ struct FNACCKernelDesc {
   int32_t arrayCount = 0;
   int32_t scalarCount = 0;
   int32_t outputCount = 0;
+  bool copyBackWrites = true;
 
   enum class ReductionOperator { Add, Multiply, Min, Max };
   ReductionOperator reductionOp = ReductionOperator::Add;
@@ -1297,6 +1321,7 @@ fnaccParseKernelDescsFromJson(const std::string &json) {
     jsonFindInt(objectText, "array_count", desc.arrayCount);
     jsonFindInt(objectText, "scalar_count", desc.scalarCount);
     jsonFindInt(objectText, "output_count", desc.outputCount);
+    jsonFindBool(objectText, "copy_back_writes", desc.copyBackWrites);
 
     desc.pack = jsonParsePackEntries(objectText);
     desc.parameters = jsonParseParameterEntries(objectText);
@@ -1943,6 +1968,13 @@ static int32_t fnaccEffectivePackTargetForSlot(
     return FNACC_PACK_TARGET_DEVICE;
 
   return FNACC_PACK_TARGET_HOST;
+}
+
+static int32_t fnaccEffectiveWriteTargetForSlot(
+    const FNACCKernelDesc *desc, int32_t slot, void *hostPtr) {
+  if (desc && !desc->copyBackWrites)
+    return FNACC_PACK_TARGET_DEVICE;
+  return fnaccEffectivePackTargetForSlot(desc, slot, hostPtr);
 }
 
 static int32_t fnaccEffectivePackTargetForArray(
@@ -3863,6 +3895,8 @@ extern "C" void __fnacc_commit_launch_v2() {
     FNACCPendingArrayV2 &array = pending.arrays[slot];
     int32_t target = fnaccEffectivePackTargetForArray(
         desc, static_cast<int32_t>(slot), array.host);
+    if ((array.flags & 2) && !desc->copyBackWrites)
+      target = FNACC_PACK_TARGET_DEVICE;
     FNACCDeviceArg device = (array.flags & 1)
         ? fnaccPrepareReadBuffer(
               array.host, array.bytes, target, static_cast<int32_t>(slot))
@@ -4327,7 +4361,8 @@ extern "C" void __fnacc_launch_f32_v1(int32_t kernelId, int32_t rank,
       ? fnaccEffectivePackTargetForSlot(desc, read2Slot, read2)
       : FNACC_PACK_TARGET_HOST;
 
-  int32_t writeTarget = fnaccEffectivePackTargetForSlot(desc, writeSlot, write);
+  int32_t writeTarget =
+      fnaccEffectiveWriteTargetForSlot(desc, writeSlot, write);
 
   if (fnaccDebugEnabled()) {
     std::fprintf(stderr,
@@ -4567,7 +4602,8 @@ extern "C" void __fnacc_launch_f64_v1(int32_t kernelId, int32_t rank,
       ? fnaccEffectivePackTargetForSlot(desc, read2Slot, read2)
       : FNACC_PACK_TARGET_HOST;
 
-  int32_t writeTarget = fnaccEffectivePackTargetForSlot(desc, writeSlot, write);
+  int32_t writeTarget =
+      fnaccEffectiveWriteTargetForSlot(desc, writeSlot, write);
 
   FNACCDeviceArg read0Dev =
       fnaccPrepareReadBuffer(read0, numBytes, read0Target, read0Slot);
@@ -4768,7 +4804,8 @@ static void fnaccLaunchIntegerV1(const char *abiName, const char *typeName,
   int32_t read2Target = numReadArrays >= 3
       ? fnaccEffectivePackTargetForSlot(desc, read2Slot, read2)
       : FNACC_PACK_TARGET_HOST;
-  int32_t writeTarget = fnaccEffectivePackTargetForSlot(desc, writeSlot, write);
+  int32_t writeTarget =
+      fnaccEffectiveWriteTargetForSlot(desc, writeSlot, write);
 
   FNACCDeviceArg read0Dev =
       fnaccPrepareReadBuffer(read0, numBytes, read0Target, read0Slot);
@@ -4947,7 +4984,7 @@ extern "C" void __fnacc_launch_matmul_f32_v1(int32_t kernelId, int32_t blockX,
 
   int32_t aTarget = fnaccEffectivePackTargetForSlot(desc, 0, a);
   int32_t bTarget = fnaccEffectivePackTargetForSlot(desc, 1, b);
-  int32_t cTarget = fnaccEffectivePackTargetForSlot(desc, 2, c);
+  int32_t cTarget = fnaccEffectiveWriteTargetForSlot(desc, 2, c);
 
   FNACCDeviceArg aDev = fnaccPrepareReadBuffer(a, bytesA, aTarget, 0);
   FNACCDeviceArg bDev = fnaccPrepareReadBuffer(b, bytesB, bTarget, 1);
@@ -5090,7 +5127,7 @@ extern "C" void __fnacc_launch_matmul_f64_v1(int32_t kernelId, int32_t blockX,
 
   int32_t aTarget = fnaccEffectivePackTargetForSlot(desc, 0, a);
   int32_t bTarget = fnaccEffectivePackTargetForSlot(desc, 1, b);
-  int32_t cTarget = fnaccEffectivePackTargetForSlot(desc, 2, c);
+  int32_t cTarget = fnaccEffectiveWriteTargetForSlot(desc, 2, c);
 
   FNACCDeviceArg aDev = fnaccPrepareReadBuffer(a, bytesA, aTarget, 0);
   FNACCDeviceArg bDev = fnaccPrepareReadBuffer(b, bytesB, bTarget, 1);

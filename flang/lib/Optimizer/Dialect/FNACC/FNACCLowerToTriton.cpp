@@ -2627,6 +2627,9 @@ static void emitJsonDescriptor(const fir::fnacc::FNACCKernelPlan &plan,
     os << ",\n";
   }
 
+  os << "      \"copy_back_writes\": "
+     << (plan.copyBackWrites ? "true" : "false") << ",\n";
+
   if (plan.reductionStage)
     os << "      \"reduction_stage_id\": " << plan.reductionStage->id << ",\n";
 

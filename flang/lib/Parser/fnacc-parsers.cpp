@@ -40,9 +40,12 @@ TYPE_PARSER(construct<FnACCReductionClause>("REDUCTION"_tok >>
 TYPE_PARSER(construct<FnACCTileClause>(
     "TILE"_tok >> parenthesized(nonemptyList(scalarIntConstantExpr))))
 
+TYPE_PARSER(construct<FnACCNoCopybackClause>("NO_COPYBACK"_tok >> pure(true)))
+
 TYPE_PARSER(construct<FnACCClause>(Parser<FnACCTileClause>{}) ||
     construct<FnACCClause>(Parser<FnACCPackClause>{}) ||
-    construct<FnACCClause>(Parser<FnACCReductionClause>{}))
+    construct<FnACCClause>(Parser<FnACCReductionClause>{}) ||
+    construct<FnACCClause>(Parser<FnACCNoCopybackClause>{}))
 
 TYPE_PARSER(construct<FnACCParallelDirective>(
     "PARALLEL"_tok >> many(Parser<FnACCClause>{})))

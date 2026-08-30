@@ -127,6 +127,7 @@ struct FNACCKernelPlan {
   std::string name;
   ElementwiseKernel kernel;
   bool usesVariadicABI = false;
+  bool copyBackWrites = true;
   FNACCKernelSchedule schedule;
   FNACCKernelABI abi;
   std::optional<FNACCReductionStagePlan> reductionStage;

@@ -5002,6 +5002,7 @@ buildFNACCKernelPlan(fir::fnacc::LaunchOp launchOp, int32_t fallbackId,
   plan.name = getPlannedKernelName(launchOp, plan.id);
   plan.kernel = std::move(kernel);
   plan.usesVariadicABI = usesVariadicLaunchABI(plan.kernel.kind);
+  plan.copyBackWrites = !launchOp->hasAttr("fnacc.no_copyback");
   plan.schedule.tile = getPlannedTileShape(launchOp, plan.kernel);
   plan.schedule.parallelSubgroups = getPlannedParallelSubgroups(
       plan.kernel, options.requestedParallelSubgroups);

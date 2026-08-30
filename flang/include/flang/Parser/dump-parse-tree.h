@@ -368,6 +368,7 @@ public:
   NODE(parser, FnACCParallelDirective)
   NODE(parser, FnACCClause)
   NODE(parser, FnACCTileClause)
+  NODE(parser, FnACCNoCopybackClause)
   NODE(parser, FnACCReductionClause)
   NODE(FnACCReductionClause, Item)
   NODE_NAME(FnACCReductionOperator, "FnACCReductionOperator")
