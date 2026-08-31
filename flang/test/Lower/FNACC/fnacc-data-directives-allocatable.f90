@@ -12,17 +12,20 @@ subroutine data_allocatable_f64(a)
   !$fnacc exit data delete(a)
 end subroutine
 
-! HOST-DAG: func.func private @__fnacc_create_desc
+! HOST-DAG: func.func private @__fnacc_enter_data_region
+! HOST-DAG: func.func private @__fnacc_data_create_desc
 ! HOST-DAG: func.func private @__fnacc_update_device_desc
 ! HOST-DAG: func.func private @__fnacc_update_host_desc
-! HOST-DAG: func.func private @__fnacc_release_desc
+! HOST-DAG: func.func private @__fnacc_data_delete
+! HOST-DAG: func.func private @__fnacc_exit_data_region
 
 ! HOST-LABEL: func.func @_QPdata_allocatable_f64
 
+! HOST: call @__fnacc_enter_data_region
 ! HOST: %[[CREATE_BOX:.*]] = fir.load {{.*}} : !fir.ref<!fir.box<!fir.heap<!fir.array<?xf64>>>>
 ! HOST: fir.box_addr %[[CREATE_BOX]] : (!fir.box<!fir.heap<!fir.array<?xf64>>>) -> !fir.heap<!fir.array<?xf64>>
 ! HOST: fir.box_dims %[[CREATE_BOX]]
-! HOST: call @__fnacc_create_desc
+! HOST: call @__fnacc_data_create_desc
 
 ! HOST: %[[DEVICE_BOX:.*]] = fir.load {{.*}} : !fir.ref<!fir.box<!fir.heap<!fir.array<?xf64>>>>
 ! HOST: fir.box_addr %[[DEVICE_BOX]] : (!fir.box<!fir.heap<!fir.array<?xf64>>>) -> !fir.heap<!fir.array<?xf64>>
@@ -36,7 +39,8 @@ end subroutine
 
 ! HOST: %[[DELETE_BOX:.*]] = fir.load {{.*}} : !fir.ref<!fir.box<!fir.heap<!fir.array<?xf64>>>>
 ! HOST: fir.box_addr %[[DELETE_BOX]] : (!fir.box<!fir.heap<!fir.array<?xf64>>>) -> !fir.heap<!fir.array<?xf64>>
-! HOST: call @__fnacc_release_desc
+! HOST: call @__fnacc_data_delete
+! HOST: call @__fnacc_exit_data_region
 
 ! HOST-NOT: call @__fnacc_update_device(
 ! HOST-NOT: call @__fnacc_update_host(

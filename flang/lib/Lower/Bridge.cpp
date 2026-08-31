@@ -3772,6 +3772,8 @@ private:
             },
 
             [&](const Fortran::parser::FnACCEnterDataDirective &dir) {
+              fir::fnacc::DataRegionEnterOp::create(*builder, loc);
+
               const auto &clauses{std::get<0>(dir.t)};
 
               for (const Fortran::parser::FnACCEnterDataClause &clause :
@@ -3830,6 +3832,8 @@ private:
                         }},
                     clause.u);
               }
+
+              fir::fnacc::DataRegionExitOp::create(*builder, loc);
             },
 
             [&](const Fortran::parser::FnACCReleaseAllDirective &) {

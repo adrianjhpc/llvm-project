@@ -93,6 +93,26 @@ def FNACC_WaitOp : FNACC_Op<"wait", []> {
   let assemblyFormat = "attr-dict";
 }
 
+def FNACC_DataRegionEnterOp : FNACC_Op<"data_region_enter", []> {
+  let summary = "Begin a nested FNACC data ownership region";
+  let description = [{
+    Begins a data-region frame. COPYIN and CREATE operations following this
+    marker acquire ownership in this frame without disturbing allocations
+    owned by an enclosing frame.
+  }];
+  let assemblyFormat = "attr-dict";
+}
+
+def FNACC_DataRegionExitOp : FNACC_Op<"data_region_exit", []> {
+  let summary = "End the current nested FNACC data ownership region";
+  let description = [{
+    Ends the innermost data-region frame and releases the ownership acquired
+    by that frame. Allocations still referenced by enclosing frames remain
+    resident on the device.
+  }];
+  let assemblyFormat = "attr-dict";
+}
+
 def FNACC_CopyinOp : FNACC_Op<"copyin", []> {
   let summary = "Begin FNACC device lifetime and copy host data to device";
   let arguments = (ins AnyType:$var);
@@ -106,13 +126,13 @@ def FNACC_CreateOp : FNACC_Op<"create", []> {
 }
 
 def FNACC_CopyoutOp : FNACC_Op<"copyout", []> {
-  let summary = "Copy FNACC cached device data back to host";
+  let summary = "Copy final-owner FNACC device data back to host";
   let arguments = (ins AnyType:$var);
   let assemblyFormat = "$var attr-dict `:` type($var)";
 }
 
 def FNACC_DeleteOp : FNACC_Op<"delete", []> {
-  let summary = "Release one FNACC cached device allocation";
+  let summary = "Mark one allocation for release at data-region exit";
   let arguments = (ins AnyType:$var);
   let assemblyFormat = "$var attr-dict `:` type($var)";
 }

@@ -1023,27 +1023,36 @@ static LogicalResult lowerFNACCDataOpsToRuntime(ModuleOp module,
             fir::fnacc::PresentOp, fir::fnacc::ReleaseOp,
             fir::fnacc::ReleaseAllOp, fir::fnacc::CopyinOp,
             fir::fnacc::CreateOp, fir::fnacc::CopyoutOp, fir::fnacc::DeleteOp,
-            fir::fnacc::WaitOp>(op)) {
+            fir::fnacc::DeleteOp, fir::fnacc::WaitOp,
+            fir::fnacc::DataRegionEnterOp, fir::fnacc::DataRegionExitOp>(op)) {
       dataOps.push_back(op);
     }
   });
 
-  auto lowerCopyToDevice = [&](Operation *op, Value var) -> LogicalResult {
+  auto lowerCopyToDevice = [&](Operation *op, Value var,
+                               bool acquireRegionOwnership) -> LogicalResult {
     Location loc = op->getLoc();
     builder.setInsertionPoint(op);
 
     if (auto desc = tryCreateContiguousArrayDescriptorArgs(builder, loc, var)) {
       createDescriptorRuntimeCall(module, builder, loc,
-                                  "__fnacc_update_device_desc", *desc);
+                                  acquireRegionOwnership
+                                      ? "__fnacc_data_copyin_desc"
+                                      : "__fnacc_update_device_desc",
+                                  *desc);
     } else if (auto bytes = tryCreateByteSizedRuntimeArgs(builder, loc, var)) {
-      createRuntimeCall(module, builder, loc, "__fnacc_update_device_bytes",
+      createRuntimeCall(module, builder, loc,
+                        acquireRegionOwnership ? "__fnacc_data_copyin_bytes"
+                                               : "__fnacc_update_device_bytes",
                         bytes->values);
     } else {
       op->emitWarning()
           << "FNACC update/copyin device could not determine object size; "
              "falling back to existing-allocation raw pointer update";
       Value ptr = convertToOpaqueRuntimePtr(builder, loc, var);
-      createRuntimeCall(module, builder, loc, "__fnacc_update_device",
+      createRuntimeCall(module, builder, loc,
+                        acquireRegionOwnership ? "__fnacc_data_copyin"
+                                               : "__fnacc_update_device",
                         ValueRange{ptr});
     }
 
@@ -1056,10 +1065,10 @@ static LogicalResult lowerFNACCDataOpsToRuntime(ModuleOp module,
     builder.setInsertionPoint(op);
 
     if (auto desc = tryCreateContiguousArrayDescriptorArgs(builder, loc, var)) {
-      createDescriptorRuntimeCall(module, builder, loc, "__fnacc_create_desc",
-                                  *desc);
+      createDescriptorRuntimeCall(module, builder, loc,
+                                  "__fnacc_data_create_desc", *desc);
     } else if (auto bytes = tryCreateByteSizedRuntimeArgs(builder, loc, var)) {
-      createRuntimeCall(module, builder, loc, "__fnacc_create_bytes",
+      createRuntimeCall(module, builder, loc, "__fnacc_data_create_bytes",
                         bytes->values);
     } else {
       op->emitError()
@@ -1095,22 +1104,30 @@ static LogicalResult lowerFNACCDataOpsToRuntime(ModuleOp module,
     return success();
   };
 
-  auto lowerCopyToHost = [&](Operation *op, Value var) -> LogicalResult {
+  auto lowerCopyToHost = [&](Operation *op, Value var,
+                             bool requireRegionOwnership) -> LogicalResult {
     Location loc = op->getLoc();
     builder.setInsertionPoint(op);
 
     if (auto desc = tryCreateContiguousArrayDescriptorArgs(builder, loc, var)) {
       createDescriptorRuntimeCall(module, builder, loc,
-                                  "__fnacc_update_host_desc", *desc);
+                                  requireRegionOwnership
+                                      ? "__fnacc_data_copyout_desc"
+                                      : "__fnacc_update_host_desc",
+                                  *desc);
     } else if (auto bytes = tryCreateByteSizedRuntimeArgs(builder, loc, var)) {
-      createRuntimeCall(module, builder, loc, "__fnacc_update_host_bytes",
+      createRuntimeCall(module, builder, loc,
+                        requireRegionOwnership ? "__fnacc_data_copyout_bytes"
+                                               : "__fnacc_update_host_bytes",
                         bytes->values);
     } else {
       op->emitWarning()
           << "FNACC update/copyout host could not determine object size; "
              "falling back to existing-allocation raw pointer update";
       Value ptr = convertToOpaqueRuntimePtr(builder, loc, var);
-      createRuntimeCall(module, builder, loc, "__fnacc_update_host",
+      createRuntimeCall(module, builder, loc,
+                        requireRegionOwnership ? "__fnacc_data_copyout"
+                                               : "__fnacc_update_host",
                         ValueRange{ptr});
     }
 
@@ -1118,13 +1135,17 @@ static LogicalResult lowerFNACCDataOpsToRuntime(ModuleOp module,
     return success();
   };
 
-  auto lowerReleaseOne = [&](Operation *op, Value var) -> LogicalResult {
+  auto lowerReleaseOne = [&](Operation *op, Value var,
+                             bool releaseRegionOwnership) -> LogicalResult {
     Location loc = op->getLoc();
     builder.setInsertionPoint(op);
 
     Value ptr = convertToOpaqueRuntimePtr(builder, loc, var);
 
-    if (getBoxTypeFromBoxLike(var.getType())) {
+    if (releaseRegionOwnership) {
+      createRuntimeCall(module, builder, loc, "__fnacc_data_delete",
+                        ValueRange{ptr});
+    } else if (getBoxTypeFromBoxLike(var.getType())) {
       createRuntimeCall(module, builder, loc, "__fnacc_release_desc",
                         ValueRange{ptr});
     } else {
@@ -1137,19 +1158,22 @@ static LogicalResult lowerFNACCDataOpsToRuntime(ModuleOp module,
 
   for (Operation *op : dataOps) {
     if (auto updateHost = dyn_cast<fir::fnacc::UpdateHostOp>(op)) {
-      if (failed(lowerCopyToHost(op, updateHost.getVar())))
+      if (failed(lowerCopyToHost(op, updateHost.getVar(),
+                                 /*requireRegionOwnership=*/false)))
         return failure();
       continue;
     }
 
     if (auto updateDevice = dyn_cast<fir::fnacc::UpdateDeviceOp>(op)) {
-      if (failed(lowerCopyToDevice(op, updateDevice.getVar())))
+      if (failed(lowerCopyToDevice(op, updateDevice.getVar(),
+                                   /*acquireRegionOwnership=*/false)))
         return failure();
       continue;
     }
 
     if (auto copyin = dyn_cast<fir::fnacc::CopyinOp>(op)) {
-      if (failed(lowerCopyToDevice(op, copyin.getVar())))
+      if (failed(lowerCopyToDevice(op, copyin.getVar(),
+                                   /*acquireRegionOwnership=*/true)))
         return failure();
       continue;
     }
@@ -1167,13 +1191,15 @@ static LogicalResult lowerFNACCDataOpsToRuntime(ModuleOp module,
     }
 
     if (auto copyout = dyn_cast<fir::fnacc::CopyoutOp>(op)) {
-      if (failed(lowerCopyToHost(op, copyout.getVar())))
+      if (failed(lowerCopyToHost(op, copyout.getVar(),
+                                 /*requireRegionOwnership=*/true)))
         return failure();
       continue;
     }
 
     if (auto del = dyn_cast<fir::fnacc::DeleteOp>(op)) {
-      if (failed(lowerReleaseOne(op, del.getVar())))
+      if (failed(lowerReleaseOne(op, del.getVar(),
+                                 /*releaseRegionOwnership=*/true)))
         return failure();
       op->erase();
       continue;
@@ -1181,10 +1207,28 @@ static LogicalResult lowerFNACCDataOpsToRuntime(ModuleOp module,
 
     if (auto release = dyn_cast<fir::fnacc::ReleaseOp>(op)) {
       for (Value var : release.getVars()) {
-        if (failed(lowerReleaseOne(op, var)))
+        if (failed(lowerReleaseOne(op, var, /*releaseRegionOwnership=*/false)))
           return failure();
       }
 
+      op->erase();
+      continue;
+    }
+
+    if (isa<fir::fnacc::DataRegionEnterOp>(op)) {
+      Location loc = op->getLoc();
+      builder.setInsertionPoint(op);
+      createRuntimeCall(module, builder, loc, "__fnacc_enter_data_region",
+                        ValueRange{});
+      op->erase();
+      continue;
+    }
+
+    if (isa<fir::fnacc::DataRegionExitOp>(op)) {
+      Location loc = op->getLoc();
+      builder.setInsertionPoint(op);
+      createRuntimeCall(module, builder, loc, "__fnacc_exit_data_region",
+                        ValueRange{});
       op->erase();
       continue;
     }

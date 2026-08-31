@@ -55,7 +55,7 @@ static void fnaccCudaCheck(
   } while (false)
 
 static constexpr const char *FNACC_RUNTIME_BUILD_ID =
-    "FNACC_RUNTIME_BUILD_ID_fused_multi_reduction_v10";
+    "FNACC_RUNTIME_BUILD_ID_nested_data_regions_v11";
 
 static std::size_t fnaccCheckedMul(
     std::size_t a, std::size_t b, const char *what) {
@@ -916,6 +916,11 @@ static void fnaccValidateVariadicKernelMetadata(const FNACCKernelDesc &desc) {
 struct FNACCDeviceAllocation {
   CUdeviceptr ptr = 0;
   std::size_t bytes = 0;
+  std::size_t dataRegionReferences = 0;
+};
+
+struct FNACCDataRegionFrame {
+  std::vector<void *> allocations;
 };
 
 struct FNACCReductionBufferStats {
@@ -951,6 +956,7 @@ struct FNACCContextState {
   std::vector<CUmodule> modules;
   std::unordered_map<int32_t, CUfunction> functionCache;
   std::unordered_map<void *, FNACCDeviceAllocation> deviceCache;
+  std::vector<FNACCDataRegionFrame> dataRegions;
   FNACCReductionWorkspace reductionWorkspace;
 };
 
@@ -1423,6 +1429,7 @@ static void fnaccCleanup() {
       if (allocation.second.ptr)
         cuMemFree(allocation.second.ptr);
     state.deviceCache.clear();
+    state.dataRegions.clear();
     state.functionCache.clear();
     for (CUmodule module : state.modules)
       if (module)
@@ -2062,6 +2069,13 @@ static FNACCDeviceArg fnaccGetCachedDeviceBuffer(void *hostPtr,
   if (it == cache.end()) {
     needAllocate = true;
   } else if (it->second.bytes != bytes) {
+    if (it->second.dataRegionReferences != 0) {
+      std::fprintf(stderr,
+          "FNACC error: cannot resize cached allocation for %s slot %d "
+          "while it is owned by %zu data region(s)\n",
+          role, slot, it->second.dataRegionReferences);
+      std::abort();
+    }
     if (fnaccDebugEnabled()) {
       std::fprintf(stderr,
           "FNACC: cache size mismatch for %s slot %d host=%p; "
@@ -2504,6 +2518,14 @@ static FNACCDeviceAllocation &fnaccGetOrCreateCachedAllocation(void *hostPtr,
     if (it->second.bytes == bytes)
       return it->second;
 
+    if (it->second.dataRegionReferences != 0) {
+      std::fprintf(stderr,
+          "FNACC error: %s cannot resize host=%p while it is owned by %zu "
+          "data region(s)\n",
+          operationName, hostPtr, it->second.dataRegionReferences);
+      std::abort();
+    }
+
     if (fnaccDebugEnabled()) {
       std::fprintf(stderr,
           "FNACC: %s resizing cached allocation for host=%p "
@@ -2539,6 +2561,354 @@ static FNACCDeviceAllocation &fnaccGetOrCreateCachedAllocation(void *hostPtr,
   }
 
   return inserted.first->second;
+}
+
+static FNACCDataRegionFrame &fnaccCurrentDataRegion(const char *operationName) {
+  auto &regions = fnaccActiveContextState().dataRegions;
+  if (regions.empty()) {
+    std::fprintf(stderr,
+        "FNACC error: %s requires an active ENTER DATA region\n",
+        operationName);
+    std::abort();
+  }
+  return regions.back();
+}
+
+static bool fnaccFrameOwnsAllocation(
+    const FNACCDataRegionFrame &frame, void *hostPtr) {
+  return std::find(frame.allocations.begin(), frame.allocations.end(),
+             hostPtr) != frame.allocations.end();
+}
+
+static FNACCDeviceAllocation &fnaccAcquireDataRegionAllocation(void *hostPtr,
+    std::size_t bytes, bool copyHostToDeviceOnCreate,
+    const char *operationName) {
+  FNACCDataRegionFrame &frame = fnaccCurrentDataRegion(operationName);
+  auto &cache = fnaccActiveContextState().deviceCache;
+
+  if (fnaccFrameOwnsAllocation(frame, hostPtr)) {
+    auto existing = cache.find(hostPtr);
+    if (existing == cache.end()) {
+      std::fprintf(stderr,
+          "FNACC error: %s found corrupt data-region ownership for host=%p\n",
+          operationName, hostPtr);
+      std::abort();
+    }
+    if (existing->second.bytes != bytes) {
+      std::fprintf(stderr,
+          "FNACC error: %s repeats host=%p with a different size inside one "
+          "data region (%zu versus %zu bytes)\n",
+          operationName, hostPtr, existing->second.bytes, bytes);
+      std::abort();
+    }
+    return existing->second;
+  }
+
+  FNACCDeviceAllocation *allocation = nullptr;
+  if (bytes == 0) {
+    auto inserted = cache.emplace(hostPtr, FNACCDeviceAllocation{});
+    if (!inserted.second && inserted.first->second.bytes != 0) {
+      std::fprintf(stderr,
+          "FNACC error: %s cannot acquire zero-sized host=%p while a "
+          "non-empty allocation is present\n",
+          operationName, hostPtr);
+      std::abort();
+    }
+    allocation = &inserted.first->second;
+  } else {
+    allocation = &fnaccGetOrCreateCachedAllocation(
+        hostPtr, bytes, copyHostToDeviceOnCreate, operationName);
+  }
+  ++allocation->dataRegionReferences;
+  frame.allocations.push_back(hostPtr);
+
+  if (fnaccDebugEnabled()) {
+    std::fprintf(stderr,
+        "FNACC: %s acquired host=%p in data region depth=%zu references=%zu\n",
+        operationName, hostPtr, fnaccActiveContextState().dataRegions.size(),
+        allocation->dataRegionReferences);
+  }
+  return *allocation;
+}
+
+static FNACCDeviceAllocation &fnaccAcquireExistingDataRegionAllocation(
+    void *hostPtr, const char *operationName) {
+  FNACCDataRegionFrame &frame = fnaccCurrentDataRegion(operationName);
+  auto &cache = fnaccActiveContextState().deviceCache;
+  auto it = cache.find(hostPtr);
+  if (it == cache.end()) {
+    std::fprintf(stderr,
+        "FNACC error: %s has no sized cached allocation for host=%p\n",
+        operationName, hostPtr);
+    std::abort();
+  }
+
+  if (!fnaccFrameOwnsAllocation(frame, hostPtr)) {
+    ++it->second.dataRegionReferences;
+    frame.allocations.push_back(hostPtr);
+  }
+  return it->second;
+}
+
+static FNACCDeviceAllocation &fnaccGetOwnedDataRegionAllocation(
+    void *hostPtr, const char *operationName) {
+  FNACCDataRegionFrame &frame = fnaccCurrentDataRegion(operationName);
+  if (!fnaccFrameOwnsAllocation(frame, hostPtr)) {
+    std::fprintf(stderr,
+        "FNACC error: %s for host=%p does not belong to the innermost data "
+        "region\n",
+        operationName, hostPtr);
+    std::abort();
+  }
+
+  auto &cache = fnaccActiveContextState().deviceCache;
+  auto it = cache.find(hostPtr);
+  if (it == cache.end() || it->second.dataRegionReferences == 0) {
+    std::fprintf(stderr,
+        "FNACC error: %s found corrupt data-region allocation for host=%p\n",
+        operationName, hostPtr);
+    std::abort();
+  }
+  return it->second;
+}
+
+static void fnaccCopyoutDataRegionAllocation(
+    void *hostPtr, std::size_t bytes, const char *operationName) {
+  FNACCDeviceAllocation &allocation =
+      fnaccGetOwnedDataRegionAllocation(hostPtr, operationName);
+  if (allocation.bytes < bytes) {
+    std::fprintf(stderr,
+        "FNACC error: %s requested %zu bytes for host=%p, but the cached "
+        "allocation has only %zu bytes\n",
+        operationName, bytes, hostPtr, allocation.bytes);
+    std::abort();
+  }
+
+  // Present-or-copyout semantics: an inner region relinquishes only its own
+  // reference. The host is updated only by the last owning region.
+  if (allocation.dataRegionReferences == 1) {
+    if (bytes != 0)
+      FNACC_CUDA_CHECK(cuMemcpyDtoH(hostPtr, allocation.ptr, bytes));
+  } else if (fnaccDebugEnabled()) {
+    std::fprintf(stderr,
+        "FNACC: %s deferred host copy for host=%p; %zu enclosing data "
+        "region reference(s) remain\n",
+        operationName, hostPtr, allocation.dataRegionReferences - 1);
+  }
+}
+
+static void fnaccReleaseDataRegionAllocation(
+    void *hostPtr, const char *operationName) {
+  FNACCDataRegionFrame &frame = fnaccCurrentDataRegion(operationName);
+  auto owned =
+      std::find(frame.allocations.begin(), frame.allocations.end(), hostPtr);
+  if (owned == frame.allocations.end()) {
+    std::fprintf(stderr,
+        "FNACC error: %s for host=%p does not belong to the innermost data "
+        "region\n",
+        operationName, hostPtr);
+    std::abort();
+  }
+
+  auto &cache = fnaccActiveContextState().deviceCache;
+  auto allocation = cache.find(hostPtr);
+  if (allocation == cache.end() ||
+      allocation->second.dataRegionReferences == 0) {
+    std::fprintf(stderr,
+        "FNACC error: %s found corrupt data-region allocation for host=%p\n",
+        operationName, hostPtr);
+    std::abort();
+  }
+
+  frame.allocations.erase(owned);
+  --allocation->second.dataRegionReferences;
+  if (allocation->second.dataRegionReferences != 0)
+    return;
+
+  CUdeviceptr devicePtr = allocation->second.ptr;
+  std::size_t bytes = allocation->second.bytes;
+  fnaccSynchronizeActiveContext();
+  if (devicePtr)
+    FNACC_CUDA_CHECK(cuMemFree(devicePtr));
+  cache.erase(allocation);
+
+  if (fnaccDebugEnabled()) {
+    std::fprintf(stderr,
+        "FNACC: %s released final data-region allocation host=%p "
+        "device=0x%llx bytes=%zu\n",
+        operationName, hostPtr, static_cast<unsigned long long>(devicePtr),
+        bytes);
+  }
+}
+
+extern "C" void __fnacc_enter_data_region() {
+  FNACC_RUNTIME_GUARD();
+  FNACCCurrentContextGuard contextGuard;
+  fnaccEnsureCurrentContext();
+
+  fnaccActiveContextState().dataRegions.emplace_back();
+  if (fnaccDebugEnabled())
+    std::fprintf(stderr, "FNACC: enter data region depth=%zu\n",
+        fnaccActiveContextState().dataRegions.size());
+}
+
+extern "C" void __fnacc_exit_data_region() {
+  FNACC_RUNTIME_GUARD();
+  FNACCCurrentContextGuard contextGuard;
+  fnaccEnsureCurrentContext();
+
+  auto &regions = fnaccActiveContextState().dataRegions;
+  if (regions.empty()) {
+    std::fprintf(stderr,
+        "FNACC error: EXIT DATA has no matching active ENTER DATA region\n");
+    std::abort();
+  }
+
+  while (!regions.back().allocations.empty()) {
+    void *hostPtr = regions.back().allocations.back();
+    fnaccReleaseDataRegionAllocation(hostPtr, "exit_data_region");
+  }
+  regions.pop_back();
+
+  if (fnaccDebugEnabled())
+    std::fprintf(stderr, "FNACC: exit data region depth=%zu\n", regions.size());
+}
+
+extern "C" void __fnacc_data_copyin_bytes(void *hostPtr, int64_t bytesValue) {
+  FNACC_RUNTIME_GUARD();
+  FNACCCurrentContextGuard contextGuard;
+  fnaccEnsureCurrentContext();
+  if (!hostPtr)
+    return;
+  if (bytesValue < 0) {
+    std::fprintf(stderr,
+        "FNACC error: data_copyin_bytes received negative byte count %lld\n",
+        static_cast<long long>(bytesValue));
+    std::abort();
+  }
+  fnaccAcquireDataRegionAllocation(hostPtr,
+      static_cast<std::size_t>(bytesValue),
+      /*copyHostToDeviceOnCreate=*/true, "data_copyin_bytes");
+}
+
+extern "C" void __fnacc_data_create_bytes(void *hostPtr, int64_t bytesValue) {
+  FNACC_RUNTIME_GUARD();
+  FNACCCurrentContextGuard contextGuard;
+  fnaccEnsureCurrentContext();
+  if (!hostPtr)
+    return;
+  if (bytesValue < 0) {
+    std::fprintf(stderr,
+        "FNACC error: data_create_bytes received negative byte count %lld\n",
+        static_cast<long long>(bytesValue));
+    std::abort();
+  }
+  fnaccAcquireDataRegionAllocation(hostPtr,
+      static_cast<std::size_t>(bytesValue),
+      /*copyHostToDeviceOnCreate=*/false, "data_create_bytes");
+}
+
+extern "C" void __fnacc_data_copyout_bytes(void *hostPtr, int64_t bytesValue) {
+  FNACC_RUNTIME_GUARD();
+  FNACCCurrentContextGuard contextGuard;
+  fnaccEnsureCurrentContext();
+  if (!hostPtr)
+    return;
+  if (bytesValue < 0) {
+    std::fprintf(stderr,
+        "FNACC error: data_copyout_bytes received negative byte count %lld\n",
+        static_cast<long long>(bytesValue));
+    std::abort();
+  }
+  fnaccCopyoutDataRegionAllocation(
+      hostPtr, static_cast<std::size_t>(bytesValue), "data_copyout_bytes");
+}
+
+extern "C" void __fnacc_data_copyin_desc(void *hostPtr, int64_t elementBytes,
+    int32_t rank, int64_t extent0, int64_t extent1, int64_t extent2,
+    int64_t stride0, int64_t stride1, int64_t stride2) {
+  FNACC_RUNTIME_GUARD();
+  FNACCCurrentContextGuard contextGuard;
+  fnaccEnsureCurrentContext();
+  if (!hostPtr)
+    return;
+  fnaccValidateContiguousDescriptor("__fnacc_data_copyin_desc", elementBytes,
+      rank, extent0, extent1, extent2, stride0, stride1, stride2);
+  std::size_t bytes =
+      fnaccBytesFromDescriptor(elementBytes, rank, extent0, extent1, extent2);
+  fnaccAcquireDataRegionAllocation(hostPtr, bytes,
+      /*copyHostToDeviceOnCreate=*/true, "data_copyin_desc");
+}
+
+extern "C" void __fnacc_data_create_desc(void *hostPtr, int64_t elementBytes,
+    int32_t rank, int64_t extent0, int64_t extent1, int64_t extent2,
+    int64_t stride0, int64_t stride1, int64_t stride2) {
+  FNACC_RUNTIME_GUARD();
+  FNACCCurrentContextGuard contextGuard;
+  fnaccEnsureCurrentContext();
+  if (!hostPtr)
+    return;
+  fnaccValidateContiguousDescriptor("__fnacc_data_create_desc", elementBytes,
+      rank, extent0, extent1, extent2, stride0, stride1, stride2);
+  std::size_t bytes =
+      fnaccBytesFromDescriptor(elementBytes, rank, extent0, extent1, extent2);
+  fnaccAcquireDataRegionAllocation(hostPtr, bytes,
+      /*copyHostToDeviceOnCreate=*/false, "data_create_desc");
+}
+
+extern "C" void __fnacc_data_copyout_desc(void *hostPtr, int64_t elementBytes,
+    int32_t rank, int64_t extent0, int64_t extent1, int64_t extent2,
+    int64_t stride0, int64_t stride1, int64_t stride2) {
+  FNACC_RUNTIME_GUARD();
+  FNACCCurrentContextGuard contextGuard;
+  fnaccEnsureCurrentContext();
+  if (!hostPtr)
+    return;
+  fnaccValidateContiguousDescriptor("__fnacc_data_copyout_desc", elementBytes,
+      rank, extent0, extent1, extent2, stride0, stride1, stride2);
+  std::size_t bytes =
+      fnaccBytesFromDescriptor(elementBytes, rank, extent0, extent1, extent2);
+  fnaccCopyoutDataRegionAllocation(hostPtr, bytes, "data_copyout_desc");
+}
+
+extern "C" void __fnacc_data_copyin(void *hostPtr) {
+  FNACC_RUNTIME_GUARD();
+  FNACCCurrentContextGuard contextGuard;
+  fnaccEnsureCurrentContext();
+  if (hostPtr)
+    fnaccAcquireExistingDataRegionAllocation(hostPtr, "data_copyin");
+}
+
+extern "C" void __fnacc_data_copyout(void *hostPtr) {
+  FNACC_RUNTIME_GUARD();
+  FNACCCurrentContextGuard contextGuard;
+  fnaccEnsureCurrentContext();
+  if (!hostPtr)
+    return;
+  FNACCDeviceAllocation &allocation =
+      fnaccGetOwnedDataRegionAllocation(hostPtr, "data_copyout");
+  fnaccCopyoutDataRegionAllocation(hostPtr, allocation.bytes, "data_copyout");
+}
+
+extern "C" void __fnacc_data_delete(void *hostPtr) {
+  FNACC_RUNTIME_GUARD();
+  FNACCCurrentContextGuard contextGuard;
+  fnaccEnsureCurrentContext();
+  if (!hostPtr)
+    return;
+
+  // Validate that DELETE names an allocation owned by this frame. Actual
+  // release is performed by the following data-region-exit marker so clause
+  // source order cannot make DELETE run before COPYOUT.
+  FNACCDeviceAllocation &allocation =
+      fnaccGetOwnedDataRegionAllocation(hostPtr, "data_delete");
+  if (fnaccDebugEnabled()) {
+    std::fprintf(stderr,
+        "FNACC: data_delete marked host=%p device=0x%llx for release at "
+        "region exit (references=%zu)\n",
+        hostPtr, static_cast<unsigned long long>(allocation.ptr),
+        allocation.dataRegionReferences);
+  }
 }
 
 static void fnaccRequirePresentAllocation(
@@ -2917,6 +3287,14 @@ extern "C" void __fnacc_release_desc(void *hostPtr) {
           hostPtr);
     }
     return;
+  }
+
+  if (it->second.dataRegionReferences != 0) {
+    std::fprintf(stderr,
+        "FNACC error: release_desc cannot release host=%p while it is owned "
+        "by %zu data region(s); exit the owning region first\n",
+        hostPtr, it->second.dataRegionReferences);
+    std::abort();
   }
 
   CUdeviceptr devicePtr = it->second.ptr;
@@ -5848,6 +6226,14 @@ extern "C" void __fnacc_release(void *hostPtr) {
     return;
   }
 
+  if (it->second.dataRegionReferences != 0) {
+    std::fprintf(stderr,
+        "FNACC error: release cannot release host=%p while it is owned by "
+        "%zu data region(s); exit the owning region first\n",
+        hostPtr, it->second.dataRegionReferences);
+    std::abort();
+  }
+
   CUdeviceptr devicePtr = it->second.ptr;
   std::size_t bytes = it->second.bytes;
 
@@ -5869,6 +6255,14 @@ extern "C" void __fnacc_release_all() {
   fnaccEnsureCurrentContext();
 
   auto &cache = fnaccActiveContextState().deviceCache;
+  auto &regions = fnaccActiveContextState().dataRegions;
+  if (!regions.empty()) {
+    std::fprintf(stderr,
+        "FNACC error: release_all cannot be used while %zu data region(s) "
+        "are active; exit the regions first\n",
+        regions.size());
+    std::abort();
+  }
   if (fnaccDebugEnabled()) {
     std::fprintf(stderr,
         "FNACC: release_all releasing %zu cached allocations\n", cache.size());
@@ -5884,7 +6278,8 @@ extern "C" void __fnacc_release_all() {
           static_cast<unsigned long long>(allocation.ptr), allocation.bytes);
     }
     fnaccSynchronizeActiveContext();
-    FNACC_CUDA_CHECK(cuMemFree(allocation.ptr));
+    if (allocation.ptr)
+      FNACC_CUDA_CHECK(cuMemFree(allocation.ptr));
   }
 
   cache.clear();
