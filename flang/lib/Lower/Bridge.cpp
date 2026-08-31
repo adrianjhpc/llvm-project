@@ -3700,16 +3700,29 @@ private:
   void genFIR(const Fortran::parser::FnACCStandaloneConstruct &fnacc) {
     setCurrentPositionAt(fnacc);
     mlir::Location loc = toLocation();
+    Fortran::lower::StatementContext stmtCtx;
 
-    auto getValueForName =
-        [&](const Fortran::parser::Name &name) -> mlir::Value {
-      if (!name.symbol) {
+    auto getValueForVariable =
+        [&](const Fortran::parser::Variable &variable) -> mlir::Value {
+      const Fortran::lower::SomeExpr *expr =
+          Fortran::semantics::GetExpr(variable);
+      if (!expr) {
         mlir::emitError(loc)
-            << "FNACC data directive variable has no resolved symbol";
+            << "FNACC data directive variable has no semantic expression";
         return {};
       }
 
-      mlir::Value value = getSymbolAddress(*name.symbol);
+      mlir::Value value;
+      if (Fortran::evaluate::IsAllocatableDesignator(*expr) ||
+          Fortran::evaluate::IsObjectPointer(*expr)) {
+        // Keep the descriptor so runtime lowering can recover dynamic bounds,
+        // extents, and the current data address. genExprAddr() deliberately
+        // unwraps allocatable and pointer variables to the data address.
+        value = genExprMutableBox(loc, *expr).getAddr();
+      } else {
+        fir::ExtendedValue exv = genExprAddr(*expr, stmtCtx, &loc);
+        value = fir::getBase(exv);
+      }
       if (!value) {
         mlir::emitError(loc)
             << "FNACC data directive variable has no FIR address";
@@ -3722,10 +3735,10 @@ private:
     Fortran::common::visit(
         Fortran::common::visitors{
             [&](const Fortran::parser::FnACCUpdateHostDirective &dir) {
-              const auto &names{std::get<0>(dir.t)};
+              const auto &variables{std::get<0>(dir.t)};
 
-              for (const Fortran::parser::Name &name : names) {
-                mlir::Value value = getValueForName(name);
+              for (const Fortran::parser::Variable &variable : variables) {
+                mlir::Value value = getValueForVariable(variable);
                 if (!value)
                   continue;
 
@@ -3734,10 +3747,10 @@ private:
             },
 
             [&](const Fortran::parser::FnACCUpdateDeviceDirective &dir) {
-              const auto &names{std::get<0>(dir.t)};
+              const auto &variables{std::get<0>(dir.t)};
 
-              for (const Fortran::parser::Name &name : names) {
-                mlir::Value value = getValueForName(name);
+              for (const Fortran::parser::Variable &variable : variables) {
+                mlir::Value value = getValueForVariable(variable);
                 if (!value)
                   continue;
 
@@ -3746,10 +3759,10 @@ private:
             },
 
             [&](const Fortran::parser::FnACCPresentDirective &dir) {
-              const auto &names{std::get<0>(dir.t)};
+              const auto &variables{std::get<0>(dir.t)};
 
-              for (const Fortran::parser::Name &name : names) {
-                mlir::Value value = getValueForName(name);
+              for (const Fortran::parser::Variable &variable : variables) {
+                mlir::Value value = getValueForVariable(variable);
                 if (!value)
                   continue;
 
@@ -3758,11 +3771,11 @@ private:
             },
 
             [&](const Fortran::parser::FnACCReleaseDirective &dir) {
-              const auto &names{std::get<0>(dir.t)};
+              const auto &variables{std::get<0>(dir.t)};
 
               llvm::SmallVector<mlir::Value> values;
-              for (const Fortran::parser::Name &name : names) {
-                mlir::Value value = getValueForName(name);
+              for (const Fortran::parser::Variable &variable : variables) {
+                mlir::Value value = getValueForVariable(variable);
                 if (value)
                   values.push_back(value);
               }
@@ -3781,8 +3794,9 @@ private:
                 Fortran::common::visit(
                     Fortran::common::visitors{
                         [&](const Fortran::parser::FnACCCopyinClause &copyin) {
-                          for (const Fortran::parser::Name &name : copyin.v) {
-                            mlir::Value value = getValueForName(name);
+                          for (const Fortran::parser::Variable &variable :
+                               copyin.v) {
+                            mlir::Value value = getValueForVariable(variable);
                             if (!value)
                               continue;
 
@@ -3791,8 +3805,9 @@ private:
                         },
 
                         [&](const Fortran::parser::FnACCCreateClause &create) {
-                          for (const Fortran::parser::Name &name : create.v) {
-                            mlir::Value value = getValueForName(name);
+                          for (const Fortran::parser::Variable &variable :
+                               create.v) {
+                            mlir::Value value = getValueForVariable(variable);
                             if (!value)
                               continue;
 
@@ -3812,8 +3827,9 @@ private:
                     Fortran::common::visitors{
                         [&](const Fortran::parser::FnACCCopyoutClause
                                 &copyout) {
-                          for (const Fortran::parser::Name &name : copyout.v) {
-                            mlir::Value value = getValueForName(name);
+                          for (const Fortran::parser::Variable &variable :
+                               copyout.v) {
+                            mlir::Value value = getValueForVariable(variable);
                             if (!value)
                               continue;
 
@@ -3822,8 +3838,9 @@ private:
                         },
 
                         [&](const Fortran::parser::FnACCDeleteClause &del) {
-                          for (const Fortran::parser::Name &name : del.v) {
-                            mlir::Value value = getValueForName(name);
+                          for (const Fortran::parser::Variable &variable :
+                               del.v) {
+                            mlir::Value value = getValueForVariable(variable);
                             if (!value)
                               continue;
 

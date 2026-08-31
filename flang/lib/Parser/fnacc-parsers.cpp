@@ -55,16 +55,16 @@ TYPE_PARSER(construct<FnACCConstruct>(
     Parser<DoConstruct>{}))
 
 TYPE_PARSER(construct<FnACCUpdateHostDirective>(
-    "UPDATE"_tok >> "HOST"_tok >> parenthesized(nonemptyList(name))))
+    "UPDATE"_tok >> "HOST"_tok >> parenthesized(nonemptyList(variable))))
 
 TYPE_PARSER(construct<FnACCUpdateDeviceDirective>(
-    "UPDATE"_tok >> "DEVICE"_tok >> parenthesized(nonemptyList(name))))
+    "UPDATE"_tok >> "DEVICE"_tok >> parenthesized(nonemptyList(variable))))
 
 TYPE_PARSER(construct<FnACCPresentDirective>(
-    "PRESENT"_tok >> parenthesized(nonemptyList(name))))
+    "PRESENT"_tok >> parenthesized(nonemptyList(variable))))
 
 TYPE_PARSER(construct<FnACCReleaseDirective>(
-    "RELEASE"_tok >> parenthesized(nonemptyList(name))))
+    "RELEASE"_tok >> parenthesized(nonemptyList(variable))))
 
 TYPE_PARSER(construct<FnACCReleaseAllDirective>(
     ("RELEASE"_tok >> "ALL"_tok >> pure(true)) ||
@@ -73,16 +73,16 @@ TYPE_PARSER(construct<FnACCReleaseAllDirective>(
 TYPE_PARSER(construct<FnACCWaitDirective>("WAIT"_tok >> pure(true)))
 
 TYPE_PARSER(construct<FnACCCopyinClause>(
-    "COPYIN"_tok >> parenthesized(nonemptyList(name))))
+    "COPYIN"_tok >> parenthesized(nonemptyList(variable))))
 
 TYPE_PARSER(construct<FnACCCreateClause>(
-    "CREATE"_tok >> parenthesized(nonemptyList(name))))
+    "CREATE"_tok >> parenthesized(nonemptyList(variable))))
 
 TYPE_PARSER(construct<FnACCCopyoutClause>(
-    "COPYOUT"_tok >> parenthesized(nonemptyList(name))))
+    "COPYOUT"_tok >> parenthesized(nonemptyList(variable))))
 
 TYPE_PARSER(construct<FnACCDeleteClause>(
-    "DELETE"_tok >> parenthesized(nonemptyList(name))))
+    "DELETE"_tok >> parenthesized(nonemptyList(variable))))
 
 TYPE_PARSER(construct<FnACCEnterDataClause>(Parser<FnACCCopyinClause>{}) ||
     construct<FnACCEnterDataClause>(Parser<FnACCCreateClause>{}))

@@ -2221,71 +2221,11 @@ public:
     ResolveFNACCName(name, "PACK clause");
   }
 
-  // !$fnacc update host(a, b)
-  void Post(const parser::FnACCUpdateHostDirective &dir) {
-    auto &names{const_cast<std::list<parser::Name> &>(
-        std::get<std::list<parser::Name>>(dir.t))};
-
-    for (parser::Name &name : names)
-      ResolveFNACCName(name, "UPDATE HOST directive");
-  }
-
-  // !$fnacc update device(a, b)
-  void Post(const parser::FnACCUpdateDeviceDirective &dir) {
-    auto &names{const_cast<std::list<parser::Name> &>(
-        std::get<std::list<parser::Name>>(dir.t))};
-
-    for (parser::Name &name : names)
-      ResolveFNACCName(name, "UPDATE DEVICE directive");
-  }
-
-  // !$fnacc present(a, b)
-  void Post(const parser::FnACCPresentDirective &dir) {
-    auto &names{const_cast<std::list<parser::Name> &>(
-        std::get<std::list<parser::Name>>(dir.t))};
-
-    for (parser::Name &name : names)
-      ResolveFNACCName(name, "PRESENT directive");
-  }
-
-  // !$fnacc release(a, b)
-  void Post(const parser::FnACCReleaseDirective &dir) {
-    auto &names{const_cast<std::list<parser::Name> &>(
-        std::get<std::list<parser::Name>>(dir.t))};
-
-    for (parser::Name &name : names)
-      ResolveFNACCName(name, "RELEASE directive");
-  }
-
   // !$fnacc release all
   void Post(const parser::FnACCReleaseAllDirective &) {}
 
   // !$fnacc wait
   void Post(const parser::FnACCWaitDirective &) {}
-
-  void Post(const parser::FnACCCopyinClause &clause) {
-    auto &names{const_cast<std::list<parser::Name> &>(clause.v)};
-    for (parser::Name &name : names)
-      ResolveFNACCName(name, "ENTER DATA COPYIN clause");
-  }
-
-  void Post(const parser::FnACCCreateClause &clause) {
-    auto &names{const_cast<std::list<parser::Name> &>(clause.v)};
-    for (parser::Name &name : names)
-      ResolveFNACCName(name, "ENTER DATA CREATE clause");
-  }
-
-  void Post(const parser::FnACCCopyoutClause &clause) {
-    auto &names{const_cast<std::list<parser::Name> &>(clause.v)};
-    for (parser::Name &name : names)
-      ResolveFNACCName(name, "EXIT DATA COPYOUT clause");
-  }
-
-  void Post(const parser::FnACCDeleteClause &clause) {
-    auto &names{const_cast<std::list<parser::Name> &>(clause.v)};
-    for (parser::Name &name : names)
-      ResolveFNACCName(name, "EXIT DATA DELETE clause");
-  }
 
   void Post(const parser::FnACCTileClause &clause) {
     if (clause.v.empty() || clause.v.size() > 3) {

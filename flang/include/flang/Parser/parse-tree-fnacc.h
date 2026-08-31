@@ -63,24 +63,24 @@ struct FnACCConstruct {
 
 struct FnACCUpdateHostDirective {
   TUPLE_CLASS_BOILERPLATE(FnACCUpdateHostDirective);
-  std::tuple<std::list<Name>> t;
+  std::tuple<std::list<Variable>> t;
 };
 
 struct FnACCUpdateDeviceDirective {
   TUPLE_CLASS_BOILERPLATE(FnACCUpdateDeviceDirective);
-  std::tuple<std::list<Name>> t;
+  std::tuple<std::list<Variable>> t;
 };
 
 /// Assert that each named object already has a live FNACC device allocation.
 /// This directive never allocates or transfers data.
 struct FnACCPresentDirective {
   TUPLE_CLASS_BOILERPLATE(FnACCPresentDirective);
-  std::tuple<std::list<Name>> t;
+  std::tuple<std::list<Variable>> t;
 };
 
 struct FnACCReleaseDirective {
   TUPLE_CLASS_BOILERPLATE(FnACCReleaseDirective);
-  std::tuple<std::list<Name>> t;
+  std::tuple<std::list<Variable>> t;
 };
 
 struct FnACCReleaseAllDirective {
@@ -92,19 +92,19 @@ struct FnACCWaitDirective {
 };
 
 struct FnACCCopyinClause {
-  WRAPPER_CLASS_BOILERPLATE(FnACCCopyinClause, std::list<Name>);
+  WRAPPER_CLASS_BOILERPLATE(FnACCCopyinClause, std::list<Variable>);
 };
 
 struct FnACCCreateClause {
-  WRAPPER_CLASS_BOILERPLATE(FnACCCreateClause, std::list<Name>);
+  WRAPPER_CLASS_BOILERPLATE(FnACCCreateClause, std::list<Variable>);
 };
 
 struct FnACCCopyoutClause {
-  WRAPPER_CLASS_BOILERPLATE(FnACCCopyoutClause, std::list<Name>);
+  WRAPPER_CLASS_BOILERPLATE(FnACCCopyoutClause, std::list<Variable>);
 };
 
 struct FnACCDeleteClause {
-  WRAPPER_CLASS_BOILERPLATE(FnACCDeleteClause, std::list<Name>);
+  WRAPPER_CLASS_BOILERPLATE(FnACCDeleteClause, std::list<Variable>);
 };
 
 struct FnACCEnterDataClause {
