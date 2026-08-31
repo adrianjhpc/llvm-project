@@ -46,11 +46,49 @@ struct FNACCEmitFortranAliasesPass
       if (!isTopLevelFlangProcedureName(targetName))
         continue;
 
-      // Only create aliases for definitions.
-      if (target.isDeclaration())
-        continue;
-
       std::string aliasName = getExternalUnderscoreAlias(targetName);
+      StringAttr aliasNameAttr = builder.getStringAttr(aliasName);
+
+      // Normal Flang compilation exports top-level external procedures using
+      // the trailing-underscore ABI name (foo_), while FIR initially refers
+      // to them using the internal _QPfoo spelling.  Definitions need a
+      // wrapper in the former direction, but declarations and their call
+      // sites must be renamed in the latter direction so that an FNACC object
+      // can call a procedure from an ordinary Flang object.
+      if (target.isDeclaration()) {
+        if (Operation *existing = symbolTable.lookup(aliasName)) {
+          auto existingFunction = dyn_cast<func::FuncOp>(existing);
+          if (!existingFunction ||
+              existingFunction.getFunctionType() != target.getFunctionType()) {
+            target.emitError(
+                "existing FNACC Fortran declaration has an incompatible "
+                "type: ")
+                << aliasName;
+            signalPassFailure();
+            return;
+          }
+
+          if (failed(SymbolTable::replaceAllSymbolUses(target, aliasNameAttr,
+                                                       module))) {
+            target.emitError("could not redirect FNACC Fortran declaration ")
+                << targetName << " to " << aliasName;
+            signalPassFailure();
+            return;
+          }
+
+          symbolTable.erase(target);
+          continue;
+        }
+
+        if (failed(symbolTable.rename(SymbolTable::getSymbolName(target),
+                                      aliasNameAttr))) {
+          target.emitError("could not rename FNACC Fortran declaration ")
+              << targetName << " to " << aliasName;
+          signalPassFailure();
+          return;
+        }
+        continue;
+      }
 
       if (Operation *existing = symbolTable.lookup(aliasName)) {
         auto existingFunction = dyn_cast<func::FuncOp>(existing);
@@ -64,11 +102,23 @@ struct FNACCEmitFortranAliasesPass
           return;
         }
 
+        // A definition already provides the ABI entry point.  A declaration
+        // can be completed below with the forwarding wrapper body.
+        if (!existingFunction.isDeclaration())
+          continue;
+
+        existingFunction.setPublic();
+        Block *entry = existingFunction.addEntryBlock();
+        builder.setInsertionPointToStart(entry);
+
+        llvm::SmallVector<Value> args(entry->getArguments().begin(),
+                                      entry->getArguments().end());
+        auto call = builder.create<func::CallOp>(
+            target.getLoc(), target.getSymName(),
+            target.getFunctionType().getResults(), args);
+        builder.create<func::ReturnOp>(target.getLoc(), call.getResults());
         continue;
       }
-
-      if (symbolTable.lookup(aliasName))
-        continue;
 
       Location loc = target.getLoc();
       FunctionType fnType = target.getFunctionType();
