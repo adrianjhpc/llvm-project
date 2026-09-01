@@ -2246,6 +2246,54 @@ buildWritePredicate(ArrayRef<ArrayAccessInfo::WriteCondition> conditions,
 static bool appendRecognizedOutputs(ElementwiseKernel &kernel,
                                     const ArrayAccessInfo &info,
                                     std::string &reason) {
+  // Forward loads from an earlier unconditional store to the same logical
+  // element.  This is required not only for chains that update one output
+  // array more than once, but also when a later output consumes a value just
+  // written to a different output array, for example:
+  //
+  //   post(i, j) = ...
+  //   pre(i, j) = post(i, j) + ...
+  //
+  // Triton emission materializes array loads before output stores.  Leaving
+  // the intervening load as an ArrayLoad expression would therefore read the
+  // value of post from before the kernel.  Replacing it with the earlier
+  // stored SSA value preserves the sequential semantics of one Fortran loop
+  // iteration and lets expression lowering recompute the value directly.
+  ArrayAccessInfo iterationInfo = info;
+  for (unsigned readIndex = 0; readIndex < info.readValues.size();
+       ++readIndex) {
+    Operation *load = info.readValues[readIndex].getDefiningOp();
+    if (!load)
+      continue;
+
+    std::optional<unsigned> nearestWrite;
+    for (unsigned writeIndex = 0; writeIndex < info.writeStores.size();
+         ++writeIndex) {
+      Operation *store = info.writeStores[writeIndex];
+      if (!store || !info.writeConditions[writeIndex].empty() ||
+          store->getBlock() != load->getBlock() ||
+          !store->isBeforeInBlock(load) ||
+          !sameArrayBase(info.writeArrays[writeIndex],
+                         info.readArrays[readIndex]) ||
+          info.writeDimensions[writeIndex] != info.readDimensions[readIndex] ||
+          info.writeCoefficients[writeIndex] !=
+              info.readCoefficients[readIndex] ||
+          info.writeBaseRefs[writeIndex] != info.readBaseRefs[readIndex] ||
+          info.writeOffsets[writeIndex] != info.readOffsets[readIndex] ||
+          !sameIndexExpressions(info.writeIndexExpressions[writeIndex],
+                                info.readIndexExpressions[readIndex]))
+        continue;
+
+      if (!nearestWrite ||
+          info.writeStores[*nearestWrite]->isBeforeInBlock(store))
+        nearestWrite = writeIndex;
+    }
+
+    if (nearestWrite)
+      iterationInfo.forwardedValues.push_back(
+          {info.readValues[readIndex], info.storedValues[*nearestWrite]});
+  }
+
   auto makeOutput = [&](unsigned index) {
     ElementwiseOutput output;
     output.array = info.writeArrays[index];
@@ -2289,7 +2337,7 @@ static bool appendRecognizedOutputs(ElementwiseKernel &kernel,
       return info.writeConditions[index].empty();
     });
     if (allUnconditional) {
-      ArrayAccessInfo forwardedInfo = info;
+      ArrayAccessInfo forwardedInfo = iterationInfo;
       for (unsigned stage = 1; stage < group.size(); ++stage) {
         unsigned previousIndex = group[stage - 1];
         unsigned currentIndex = group[stage];
@@ -2351,8 +2399,8 @@ static bool appendRecognizedOutputs(ElementwiseKernel &kernel,
       unsigned falseIndex = lhs.thenBranch ? group[1] : group[0];
       markConsumed(kernel, lhs.ifOperation);
 
-      auto condition =
-          recognizeElementwiseExpr(lhs.condition, info, kernel, reason);
+      auto condition = recognizeElementwiseExpr(lhs.condition, iterationInfo,
+                                                kernel, reason);
       if (!condition)
         return false;
       if (condition->resultKind != ElementwiseExprResultKind::Predicate) {
@@ -2361,11 +2409,11 @@ static bool appendRecognizedOutputs(ElementwiseKernel &kernel,
       }
 
       auto trueValue = recognizeElementwiseExpr(info.storedValues[trueIndex],
-                                                info, kernel, reason);
+                                                iterationInfo, kernel, reason);
       if (!trueValue)
         return false;
       auto falseValue = recognizeElementwiseExpr(info.storedValues[falseIndex],
-                                                 info, kernel, reason);
+                                                 iterationInfo, kernel, reason);
       if (!falseValue)
         return false;
 
@@ -2378,12 +2426,12 @@ static bool appendRecognizedOutputs(ElementwiseKernel &kernel,
     } else {
       for (unsigned index : group) {
         ElementwiseOutput guarded = makeOutput(index);
-        guarded.expression =
-            recognizeElementwiseExpr(guarded.storedValue, info, kernel, reason);
+        guarded.expression = recognizeElementwiseExpr(
+            guarded.storedValue, iterationInfo, kernel, reason);
         if (!guarded.expression)
           return false;
         guarded.predicate = buildWritePredicate(info.writeConditions[index],
-                                                info, kernel, reason);
+                                                iterationInfo, kernel, reason);
         if (!guarded.predicate)
           return false;
         kernel.outputs.push_back(std::move(guarded));

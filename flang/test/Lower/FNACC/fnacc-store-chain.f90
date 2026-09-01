@@ -53,6 +53,23 @@ subroutine store_chain_kernel(xmin, xmax, ymin, ymax, ht, &
   end do
 end subroutine
 
+subroutine cross_array_store_chain(xmin, xmax, ymin, ymax, a, post, pre)
+  implicit none
+  integer :: xmin, xmax, ymin, ymax
+  real(8) :: a(xmin:xmax, ymin:ymax)
+  real(8) :: post(xmin:xmax, ymin:ymax)
+  real(8) :: pre(xmin:xmax, ymin:ymax)
+  integer :: j, k
+
+  !$fnacc parallel tile(16, 16)
+  do k = ymin, ymax
+    do j = xmin, xmax
+      post(j, k) = a(j, k) + 1.0_8
+      pre(j, k) = post(j, k) * 2.0_8
+    end do
+  end do
+end subroutine
+
 ! HOST-DAG: func.func private @__fnacc_begin_launch_v2
 ! HOST-DAG: func.func private @__fnacc_bind_array_v2
 ! HOST-DAG: func.func private @__fnacc_commit_launch_v2
@@ -75,4 +92,20 @@ end subroutine
 ! JSON: "launch_abi_version": 2
 ! JSON: "array_count": 10
 ! JSON: "scalar_count": 1
+! JSON: "output_count": 2
+
+! TTIR-LABEL: tt.func @fnacc_kernel_1(
+! TTIR-SAME: %array0: !tt.ptr<f64>
+! TTIR-SAME: %array1: !tt.ptr<f64>
+! TTIR-SAME: %array2: !tt.ptr<f64>
+! TTIR: %[[POST0:expr[0-9]+]] = arith.addf %access0_value,
+! TTIR: tt.store {{.*}}, %[[POST0]], %mask
+! TTIR: %[[FORWARDED_POST:expr[0-9]+]] = arith.addf %access0_value,
+! TTIR: %[[PRE:expr[0-9]+]] = arith.mulf %[[FORWARDED_POST]],
+! TTIR: tt.store {{.*}}, %[[PRE]], %mask
+! TTIR-NOT: arith.mulf %access1_value
+
+! JSON: "id": 1
+! JSON: "kind": "stencil2d"
+! JSON: "array_count": 3
 ! JSON: "output_count": 2
