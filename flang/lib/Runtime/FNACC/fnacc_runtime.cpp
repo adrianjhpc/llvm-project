@@ -1,4 +1,140 @@
+#include <cstddef>
+#include <cstdint>
+
+#if defined(FNACC_RUNTIME_USE_HIP)
+#include <hip/hip_runtime_api.h>
+
+// Keep the implementation below on one small driver-style API.  HIP's module
+// API deliberately mirrors the CUDA driver API, so adapting it here avoids
+// duplicating the cache, data-lifetime, launch, and reduction machinery.
+using CUresult = hipError_t;
+using CUdevice = hipDevice_t;
+using CUcontext = hipCtx_t;
+using CUstream = hipStream_t;
+using CUevent = hipEvent_t;
+using CUmodule = hipModule_t;
+using CUfunction = hipFunction_t;
+using CUdeviceptr = std::uintptr_t;
+using CUfunction_attribute = hipFunction_attribute;
+
+static constexpr CUresult CUDA_SUCCESS = hipSuccess;
+static constexpr CUresult CUDA_ERROR_NOT_INITIALIZED = hipErrorNotInitialized;
+static constexpr CUresult CUDA_ERROR_ILLEGAL_ADDRESS = hipErrorIllegalAddress;
+static constexpr unsigned CU_STREAM_DEFAULT = hipStreamDefault;
+static constexpr unsigned CU_EVENT_DISABLE_TIMING = hipEventDisableTiming;
+static constexpr CUfunction_attribute CU_FUNC_ATTRIBUTE_MAX_THREADS_PER_BLOCK =
+    HIP_FUNC_ATTRIBUTE_MAX_THREADS_PER_BLOCK;
+static constexpr CUfunction_attribute CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES =
+    HIP_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES;
+static constexpr CUfunction_attribute CU_FUNC_ATTRIBUTE_NUM_REGS =
+    HIP_FUNC_ATTRIBUTE_NUM_REGS;
+static constexpr CUfunction_attribute CU_FUNC_ATTRIBUTE_PTX_VERSION =
+    HIP_FUNC_ATTRIBUTE_PTX_VERSION;
+static constexpr CUfunction_attribute CU_FUNC_ATTRIBUTE_BINARY_VERSION =
+    HIP_FUNC_ATTRIBUTE_BINARY_VERSION;
+static constexpr CUfunction_attribute
+    CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES =
+        HIP_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES;
+
+static CUresult cuGetErrorName(CUresult error, const char **name) {
+  *name = hipGetErrorName(error);
+  return hipSuccess;
+}
+static CUresult cuGetErrorString(CUresult error, const char **description) {
+  *description = hipGetErrorString(error);
+  return hipSuccess;
+}
+static CUresult cuInit(unsigned flags) { return hipInit(flags); }
+static CUresult cuDeviceGet(CUdevice *device, int ordinal) {
+  return hipDeviceGet(device, ordinal);
+}
+static CUresult cuDevicePrimaryCtxRetain(CUcontext *context, CUdevice device) {
+  return hipDevicePrimaryCtxRetain(context, device);
+}
+static CUresult cuDevicePrimaryCtxRelease(CUdevice device) {
+  return hipDevicePrimaryCtxRelease(device);
+}
+static CUresult cuCtxGetCurrent(CUcontext *context) {
+  return hipCtxGetCurrent(context);
+}
+static CUresult cuCtxGetDevice(CUdevice *device) {
+  return hipCtxGetDevice(device);
+}
+static CUresult cuCtxSetCurrent(CUcontext context) {
+  return hipCtxSetCurrent(context);
+}
+static CUresult cuStreamCreate(CUstream *stream, unsigned flags) {
+  return hipStreamCreateWithFlags(stream, flags);
+}
+static CUresult cuStreamDestroy(CUstream stream) {
+  return hipStreamDestroy(stream);
+}
+static CUresult cuStreamSynchronize(CUstream stream) {
+  return hipStreamSynchronize(stream);
+}
+static CUresult cuEventCreate(CUevent *event, unsigned flags) {
+  return hipEventCreateWithFlags(event, flags);
+}
+static CUresult cuEventDestroy(CUevent event) { return hipEventDestroy(event); }
+static CUresult cuEventRecord(CUevent event, CUstream stream) {
+  return hipEventRecord(event, stream);
+}
+static CUresult cuEventSynchronize(CUevent event) {
+  return hipEventSynchronize(event);
+}
+static CUresult cuModuleLoadDataEx(
+    CUmodule *module, const void *image, unsigned, void *, void *) {
+  return hipModuleLoadData(module, image);
+}
+static CUresult cuModuleUnload(CUmodule module) {
+  return hipModuleUnload(module);
+}
+static CUresult cuModuleGetFunction(
+    CUfunction *function, CUmodule module, const char *name) {
+  return hipModuleGetFunction(function, module, name);
+}
+static CUresult cuFuncGetAttribute(
+    int *value, CUfunction_attribute attribute, CUfunction function) {
+  return hipFuncGetAttribute(value, attribute, function);
+}
+static CUresult cuFuncSetAttribute(
+    CUfunction, CUfunction_attribute, int) {
+  // AMD LDS does not use CUDA's per-function dynamic shared-memory opt-in.
+  return hipSuccess;
+}
+static CUresult cuMemAlloc(CUdeviceptr *pointer, std::size_t bytes) {
+  void *allocation = nullptr;
+  CUresult result = hipMalloc(&allocation, bytes);
+  if (result == hipSuccess)
+    *pointer = reinterpret_cast<CUdeviceptr>(allocation);
+  return result;
+}
+static CUresult cuMemFree(CUdeviceptr pointer) {
+  return hipFree(reinterpret_cast<void *>(pointer));
+}
+static CUresult cuMemcpyHtoD(
+    CUdeviceptr destination, const void *source, std::size_t bytes) {
+  return hipMemcpy(reinterpret_cast<void *>(destination), source, bytes,
+                   hipMemcpyHostToDevice);
+}
+static CUresult cuMemcpyDtoH(
+    void *destination, CUdeviceptr source, std::size_t bytes) {
+  return hipMemcpy(destination, reinterpret_cast<const void *>(source), bytes,
+                   hipMemcpyDeviceToHost);
+}
+static CUresult cuLaunchKernel(CUfunction function, unsigned gridX,
+    unsigned gridY, unsigned gridZ, unsigned blockX, unsigned blockY,
+    unsigned blockZ, unsigned sharedBytes, CUstream stream,
+    void **kernelParams, void **extra) {
+  return hipModuleLaunchKernel(function, gridX, gridY, gridZ, blockX, blockY,
+      blockZ, sharedBytes, stream, kernelParams, extra);
+}
+
+static constexpr const char *FNACC_ACCELERATOR_NAME = "HIP";
+#else
 #include <cuda.h>
+static constexpr const char *FNACC_ACCELERATOR_NAME = "CUDA";
+#endif
 
 #include <algorithm>
 #include <cerrno>
@@ -43,8 +179,9 @@ static void fnaccCudaCheck(
   cuGetErrorString(result, &desc);
 
   std::fprintf(stderr,
-      "FNACC CUDA driver error at %s:%d while executing %s: %s: %s\n", file,
-      line, expr, name ? name : "<unknown>", desc ? desc : "<no description>");
+      "FNACC %s driver error at %s:%d while executing %s: %s: %s\n",
+      FNACC_ACCELERATOR_NAME, file, line, expr, name ? name : "<unknown>",
+      desc ? desc : "<no description>");
 
   std::abort();
 }
@@ -55,7 +192,7 @@ static void fnaccCudaCheck(
   } while (false)
 
 static constexpr const char *FNACC_RUNTIME_BUILD_ID =
-    "FNACC_RUNTIME_BUILD_ID_nested_data_regions_v11";
+    "FNACC_RUNTIME_BUILD_ID_multivendor_gpu_v12";
 
 static std::size_t fnaccCheckedMul(
     std::size_t a, std::size_t b, const char *what) {
@@ -155,8 +292,17 @@ static void fnaccValidateCudaBlockSize(
   }
 }
 
-static int fnaccGetCudaDeviceOrdinal() {
-  const char *value = std::getenv("FNACC_CUDA_DEVICE");
+static int fnaccGetDeviceOrdinal() {
+  const char *variable = "FNACC_DEVICE";
+  const char *value = std::getenv(variable);
+  if (!value || value[0] == '\0') {
+#if defined(FNACC_RUNTIME_USE_HIP)
+    variable = "FNACC_HIP_DEVICE";
+#else
+    variable = "FNACC_CUDA_DEVICE";
+#endif
+    value = std::getenv(variable);
+  }
   if (!value || value[0] == '\0')
     return 0;
 
@@ -164,7 +310,7 @@ static int fnaccGetCudaDeviceOrdinal() {
   long parsed = std::strtol(value, &end, 10);
   if (end == value || *end != '\0' || parsed < 0) {
     std::fprintf(
-        stderr, "FNACC error: invalid FNACC_CUDA_DEVICE value '%s'\n", value);
+        stderr, "FNACC error: invalid %s value '%s'\n", variable, value);
     std::abort();
   }
 
@@ -719,6 +865,7 @@ struct FNACCKernelDesc {
   int32_t tritonHiddenPtrArgs = 2;
 
   std::string backend = "triton";
+  std::string acceleratorTarget = "cuda";
   std::string deviceImageKind = "ptx";
 
   // Synthetic kernel used to recursively reduce a partials buffer. A negative
@@ -965,6 +1112,7 @@ struct FNACCKernelRegistry {
 
   std::unordered_map<int32_t, FNACCKernelDesc> kernels;
   std::vector<std::string> ptxTexts;
+  std::vector<int32_t> embeddedImageKinds;
 
   // CUDA modules, functions, allocations, streams and reduction buffers are
   // all context-owned. Never reuse any of them in a different context, even
@@ -976,7 +1124,7 @@ struct FNACCKernelRegistry {
 
 struct FNACCEmbeddedKernelBundle {
   // Keep these integer values in sync with the generated C bundle ABI.
-  enum ImageKind : int32_t { PTX = 1, Cubin = 2 };
+  enum ImageKind : int32_t { PTX = 1, Cubin = 2, HSACO = 3 };
 
   std::vector<const void *> imageData;
   std::vector<std::size_t> imageSize;
@@ -1097,6 +1245,8 @@ static const char *fnaccEmbeddedImageKindName(int32_t kind) {
     return "ptx";
   case FNACCEmbeddedKernelBundle::Cubin:
     return "cubin";
+  case FNACCEmbeddedKernelBundle::HSACO:
+    return "hsaco";
   default:
     return "unknown";
   }
@@ -1114,7 +1264,8 @@ static bool fnaccHasEmbeddedBundles() {
     for (std::size_t i = 0; i < bundle.imageData.size(); ++i) {
       if (!bundle.imageData[i] || bundle.imageSize[i] == 0 ||
           (bundle.imageKind[i] != FNACCEmbeddedKernelBundle::PTX &&
-              bundle.imageKind[i] != FNACCEmbeddedKernelBundle::Cubin))
+              bundle.imageKind[i] != FNACCEmbeddedKernelBundle::Cubin &&
+              bundle.imageKind[i] != FNACCEmbeddedKernelBundle::HSACO))
         return false;
     }
   }
@@ -1142,6 +1293,17 @@ static std::vector<std::string> fnaccGetImagesFromEmbeddedBundles() {
       }
     }
   }
+  return result;
+}
+
+static std::vector<int32_t> fnaccGetImageKindsFromEmbeddedBundles() {
+  std::vector<int32_t> result;
+  if (!fnaccHasEmbeddedBundles())
+    return result;
+  for (const FNACCEmbeddedKernelBundle &bundle :
+      fnaccGetEmbeddedKernelBundles())
+    result.insert(
+        result.end(), bundle.imageKind.begin(), bundle.imageKind.end());
   return result;
 }
 
@@ -1283,6 +1445,8 @@ fnaccParseKernelDescsFromJson(const std::string &json) {
 
     jsonFindString(objectText, "kind", desc.kind);
     jsonFindString(objectText, "backend", desc.backend);
+    jsonFindString(
+        objectText, "accelerator_target", desc.acceleratorTarget);
     jsonFindString(objectText, "device_image_kind", desc.deviceImageKind);
 
     if (!jsonFindInt(objectText, "image_index", desc.ptxIndex))
@@ -1291,8 +1455,11 @@ fnaccParseKernelDescsFromJson(const std::string &json) {
       jsonFindString(objectText, "ptx_file", desc.ptxFile);
 
     if (desc.ptxFile.empty())
-      desc.ptxFile =
-          desc.name + (desc.deviceImageKind == "cubin" ? ".cubin" : ".ptx");
+      desc.ptxFile = desc.name +
+          (desc.deviceImageKind == "cubin" ? ".cubin"
+                                           : desc.deviceImageKind == "hsaco"
+                                               ? ".hsaco"
+                                               : ".ptx");
 
     if (desc.id < 0 || desc.ptxIndex < 0) {
       std::fprintf(stderr,
@@ -1300,7 +1467,8 @@ fnaccParseKernelDescsFromJson(const std::string &json) {
       std::abort();
     }
 
-    if (desc.deviceImageKind != "ptx" && desc.deviceImageKind != "cubin") {
+    if (desc.deviceImageKind != "ptx" && desc.deviceImageKind != "cubin" &&
+        desc.deviceImageKind != "hsaco") {
       std::fprintf(stderr,
           "FNACC error: kernel id %d has unsupported device image kind '%s'\n",
           desc.id, desc.deviceImageKind.c_str());
@@ -1316,8 +1484,11 @@ fnaccParseKernelDescsFromJson(const std::string &json) {
     jsonFindInt(objectText, "num_ctas", desc.numCTAs);
     jsonFindInt(objectText, "num_stages", desc.numStages);
 
-    bool hasCudaThreads =
-        jsonFindInt(objectText, "cuda_threads_per_cta", desc.cudaThreadsPerCTA);
+    bool hasThreadsPerCTA =
+        jsonFindInt(objectText, "threads_per_cta", desc.cudaThreadsPerCTA);
+    if (!hasThreadsPerCTA)
+      hasThreadsPerCTA = jsonFindInt(
+          objectText, "cuda_threads_per_cta", desc.cudaThreadsPerCTA);
 
     if (!jsonFindInt(
             objectText, "private_pointer_args", desc.tritonHiddenPtrArgs))
@@ -1353,8 +1524,13 @@ fnaccParseKernelDescsFromJson(const std::string &json) {
 
     int64_t expectedCudaThreads =
         static_cast<int64_t>(desc.numWarps) * desc.threadsPerWarp;
+    bool supportedSubgroupWidth = desc.threadsPerWarp == 32;
+#if defined(FNACC_RUNTIME_USE_HIP)
+    supportedSubgroupWidth = supportedSubgroupWidth ||
+        desc.threadsPerWarp == 64;
+#endif
     if (desc.rank < 1 || desc.rank > 3 || desc.tileX <= 0 || desc.tileY <= 0 ||
-        desc.tileZ <= 0 || desc.numWarps <= 0 || desc.threadsPerWarp != 32 ||
+        desc.tileZ <= 0 || desc.numWarps <= 0 || !supportedSubgroupWidth ||
         desc.numCTAs <= 0 || desc.numStages <= 0 || expectedCudaThreads <= 0 ||
         expectedCudaThreads > std::numeric_limits<int32_t>::max()) {
       std::fprintf(stderr,
@@ -1362,11 +1538,11 @@ fnaccParseKernelDescsFromJson(const std::string &json) {
       std::abort();
     }
 
-    if (!hasCudaThreads)
+    if (!hasThreadsPerCTA)
       desc.cudaThreadsPerCTA = static_cast<int32_t>(expectedCudaThreads);
     if (desc.cudaThreadsPerCTA != expectedCudaThreads) {
       std::fprintf(stderr,
-          "FNACC error: cuda_threads_per_cta disagrees with warp metadata "
+          "FNACC error: threads_per_cta disagrees with subgroup metadata "
           "for kernel id %d\n",
           desc.id);
       std::abort();
@@ -1378,6 +1554,26 @@ fnaccParseKernelDescsFromJson(const std::string &json) {
           desc.id, desc.tritonHiddenPtrArgs);
       std::abort();
     }
+#if defined(FNACC_RUNTIME_USE_HIP)
+    if (desc.acceleratorTarget != "hip" ||
+        desc.deviceImageKind != "hsaco") {
+      std::fprintf(stderr,
+          "FNACC error: HIP runtime cannot load target='%s' image_kind='%s' "
+          "for kernel id %d\n",
+          desc.acceleratorTarget.c_str(), desc.deviceImageKind.c_str(), desc.id);
+      std::abort();
+    }
+#else
+    if (desc.acceleratorTarget != "cuda" ||
+        (desc.deviceImageKind != "ptx" &&
+         desc.deviceImageKind != "cubin")) {
+      std::fprintf(stderr,
+          "FNACC error: CUDA runtime cannot load target='%s' image_kind='%s' "
+          "for kernel id %d\n",
+          desc.acceleratorTarget.c_str(), desc.deviceImageKind.c_str(), desc.id);
+      std::abort();
+    }
+#endif
     if (desc.kind == "stencil2d" && desc.launchAbiVersion != 2) {
       std::fprintf(stderr,
           "FNACC error: invalid stencil2d ABI metadata for kernel id %d\n",
@@ -1449,6 +1645,7 @@ static void fnaccCleanup() {
   fnaccRegistry.primaryContexts.clear();
   fnaccRegistry.activeContext = nullptr;
   fnaccRegistry.ptxTexts.clear();
+  fnaccRegistry.embeddedImageKinds.clear();
   fnaccRegistry.kernels.clear();
 
   fnaccRegistry.initialized = false;
@@ -1743,6 +1940,9 @@ static void fnaccEnsureInitialized() {
   }
 
   fnaccRegistry.ptxTexts = fnaccGetPtxTexts(fnaccRegistry.kernels);
+  if (useEmbeddedBundles)
+    fnaccRegistry.embeddedImageKinds =
+        fnaccGetImageKindsFromEmbeddedBundles();
 
   if (fnaccRegistry.ptxTexts.empty()) {
     std::fprintf(stderr, "FNACC error: no device images were available\n");
@@ -1754,6 +1954,33 @@ static void fnaccEnsureInitialized() {
       std::fprintf(stderr,
           "FNACC error: device image entry %zu is empty or missing\n", i);
       std::abort();
+    }
+  }
+
+  if (!fnaccRegistry.embeddedImageKinds.empty()) {
+    if (fnaccRegistry.embeddedImageKinds.size() !=
+        fnaccRegistry.ptxTexts.size()) {
+      std::fprintf(stderr,
+          "FNACC error: embedded image-kind table has the wrong size\n");
+      std::abort();
+    }
+    for (const auto &entry : fnaccRegistry.kernels) {
+      const FNACCKernelDesc &desc = entry.second;
+      int32_t expectedKind = desc.deviceImageKind == "ptx"
+          ? FNACCEmbeddedKernelBundle::PTX
+          : desc.deviceImageKind == "cubin"
+              ? FNACCEmbeddedKernelBundle::Cubin
+              : FNACCEmbeddedKernelBundle::HSACO;
+      if (static_cast<std::size_t>(desc.ptxIndex) >=
+              fnaccRegistry.embeddedImageKinds.size() ||
+          fnaccRegistry.embeddedImageKinds[
+              static_cast<std::size_t>(desc.ptxIndex)] != expectedKind) {
+        std::fprintf(stderr,
+            "FNACC error: embedded image kind disagrees with metadata for "
+            "kernel id %d\n",
+            desc.id);
+        std::abort();
+      }
     }
   }
 
@@ -1850,7 +2077,7 @@ static void fnaccEnsureCurrentContext() {
     return;
   }
 
-  int ordinal = fnaccGetCudaDeviceOrdinal();
+  int ordinal = fnaccGetDeviceOrdinal();
   FNACCContextState &state = fnaccGetOrCreatePrimaryContextState(ordinal);
   FNACC_CUDA_CHECK(cuCtxSetCurrent(state.context));
   fnaccRegistry.activeContext = state.context;
@@ -6296,7 +6523,8 @@ static void fnaccRegisterEmbeddedDeviceBundle(const void *const *imageData,
   for (std::size_t i = 0; i < imageCount; ++i) {
     if (!imageData[i] || imageSizes[i] == 0 ||
         (imageKinds[i] != FNACCEmbeddedKernelBundle::PTX &&
-            imageKinds[i] != FNACCEmbeddedKernelBundle::Cubin)) {
+            imageKinds[i] != FNACCEmbeddedKernelBundle::Cubin &&
+            imageKinds[i] != FNACCEmbeddedKernelBundle::HSACO)) {
       std::fprintf(
           stderr, "FNACC error: invalid embedded device image entry %zu\n", i);
       std::abort();

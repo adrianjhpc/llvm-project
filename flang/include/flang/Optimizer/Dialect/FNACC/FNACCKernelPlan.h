@@ -21,8 +21,8 @@ namespace fir::fnacc {
 /// runtime loader can consume directly.
 enum class FNACCDeviceIRKind { TTIR, LLVMIR, CUDATileIR, PTX };
 
-/// Runtime-consumable CUDA device image formats.
-enum class FNACCDeviceImageKind { PTX, Cubin };
+/// Runtime-consumable device image formats.
+enum class FNACCDeviceImageKind { PTX, Cubin, HSACO };
 
 inline llvm::StringRef fnaccDeviceIRKindName(FNACCDeviceIRKind kind) {
   switch (kind) {
@@ -44,6 +44,8 @@ inline llvm::StringRef fnaccDeviceImageKindName(FNACCDeviceImageKind kind) {
     return "ptx";
   case FNACCDeviceImageKind::Cubin:
     return "cubin";
+  case FNACCDeviceImageKind::HSACO:
+    return "hsaco";
   }
   return "unknown";
 }
@@ -184,6 +186,7 @@ public:
   virtual ~FNACCCodegenBackend() = default;
 
   virtual llvm::StringRef getName() const = 0;
+  virtual llvm::StringRef getAcceleratorTarget() const = 0;
   virtual FNACCDeviceIRKind getDeviceIRKind() const {
     return FNACCDeviceIRKind::TTIR;
   }

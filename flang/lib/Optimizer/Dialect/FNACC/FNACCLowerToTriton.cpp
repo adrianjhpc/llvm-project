@@ -105,6 +105,8 @@ static StringRef deviceImageExtension(fir::fnacc::FNACCDeviceImageKind kind) {
     return ".ptx";
   case fir::fnacc::FNACCDeviceImageKind::Cubin:
     return ".cubin";
+  case fir::fnacc::FNACCDeviceImageKind::HSACO:
+    return ".hsaco";
   }
   llvm_unreachable("unknown FNACC device image kind");
 }
@@ -2587,6 +2589,8 @@ static void emitJsonDescriptor(const fir::fnacc::FNACCKernelPlan &plan,
   os << "      \"id\": " << plan.id << ",\n";
   os << "      \"name\": \"" << plan.name << "\",\n";
   os << "      \"backend\": \"" << backend.getName() << "\",\n";
+  os << "      \"accelerator_target\": \"" << backend.getAcceleratorTarget()
+     << "\",\n";
   os << "      \"device_ir_kind\": \""
      << fir::fnacc::fnaccDeviceIRKindName(backend.getDeviceIRKind()) << "\",\n";
   os << "      \"device_image_kind\": \""
@@ -2595,9 +2599,12 @@ static void emitJsonDescriptor(const fir::fnacc::FNACCKernelPlan &plan,
   os << "      \"image_index\": " << ptxIndex << ",\n";
   os << "      \"image_file\": \"" << plan.name
      << deviceImageExtension(backend.getRuntimeImageKind()) << "\",\n";
-  // Legacy aliases consumed by existing wrappers and runtimes.
-  os << "      \"ptx_index\": " << ptxIndex << ",\n";
-  os << "      \"ptx_file\": \"" << plan.name << ".ptx\",\n";
+  // Legacy aliases consumed by existing CUDA wrappers and runtimes.
+  if (backend.getRuntimeImageKind() !=
+      fir::fnacc::FNACCDeviceImageKind::HSACO) {
+    os << "      \"ptx_index\": " << ptxIndex << ",\n";
+    os << "      \"ptx_file\": \"" << plan.name << ".ptx\",\n";
+  }
   os << "      \"kind\": \"" << fir::fnacc::fnaccKernelKindName(k.kind)
      << "\",\n";
   os << "      \"rank\": " << k.rank << ",\n";
@@ -2607,8 +2614,11 @@ static void emitJsonDescriptor(const fir::fnacc::FNACCKernelPlan &plan,
   os << "      \"threads_per_warp\": " << schedule.subgroupWidth << ",\n";
   os << "      \"num_ctas\": 1,\n";
   os << "      \"num_stages\": " << schedule.pipelineStages << ",\n";
-  os << "      \"cuda_threads_per_cta\": "
+  os << "      \"threads_per_cta\": "
      << schedule.parallelSubgroups * schedule.subgroupWidth << ",\n";
+  if (backend.getAcceleratorTarget() == "cuda")
+    os << "      \"cuda_threads_per_cta\": "
+       << schedule.parallelSubgroups * schedule.subgroupWidth << ",\n";
   os << "      \"private_pointer_args\": "
      << backend.getPrivatePointerArgumentCount(plan) << ",\n";
   os << "      \"triton_hidden_ptr_args\": "
@@ -2664,6 +2674,8 @@ emitJsonReductionStageDescriptor(const fir::fnacc::FNACCKernelPlan &plan,
   os << "      \"id\": " << stage.id << ",\n";
   os << "      \"name\": \"" << stage.name << "\",\n";
   os << "      \"backend\": \"" << backend.getName() << "\",\n";
+  os << "      \"accelerator_target\": \"" << backend.getAcceleratorTarget()
+     << "\",\n";
   os << "      \"device_ir_kind\": \""
      << fir::fnacc::fnaccDeviceIRKindName(backend.getDeviceIRKind()) << "\",\n";
   os << "      \"device_image_kind\": \""
@@ -2672,9 +2684,12 @@ emitJsonReductionStageDescriptor(const fir::fnacc::FNACCKernelPlan &plan,
   os << "      \"image_index\": " << ptxIndex << ",\n";
   os << "      \"image_file\": \"" << stage.name
      << deviceImageExtension(backend.getRuntimeImageKind()) << "\",\n";
-  // Legacy aliases consumed by existing wrappers and runtimes.
-  os << "      \"ptx_index\": " << ptxIndex << ",\n";
-  os << "      \"ptx_file\": \"" << stage.name << ".ptx\",\n";
+  // Legacy aliases consumed by existing CUDA wrappers and runtimes.
+  if (backend.getRuntimeImageKind() !=
+      fir::fnacc::FNACCDeviceImageKind::HSACO) {
+    os << "      \"ptx_index\": " << ptxIndex << ",\n";
+    os << "      \"ptx_file\": \"" << stage.name << ".ptx\",\n";
+  }
   os << "      \"kind\": \"reduction_stage1d\",\n";
   os << "      \"reduction_op\": \""
      << reductionOperatorName(stage.reductionOperator) << "\",\n";
@@ -2684,8 +2699,14 @@ emitJsonReductionStageDescriptor(const fir::fnacc::FNACCKernelPlan &plan,
   os << "      \"threads_per_warp\": " << plan.schedule.subgroupWidth << ",\n";
   os << "      \"num_ctas\": 1,\n";
   os << "      \"num_stages\": " << plan.schedule.pipelineStages << ",\n";
-  os << "      \"cuda_threads_per_cta\": "
+  os << "      \"threads_per_cta\": "
      << plan.schedule.parallelSubgroups * plan.schedule.subgroupWidth << ",\n";
+  if (backend.getAcceleratorTarget() == "cuda")
+    os << "      \"cuda_threads_per_cta\": "
+       << plan.schedule.parallelSubgroups * plan.schedule.subgroupWidth
+       << ",\n";
+  os << "      \"private_pointer_args\": "
+     << backend.getPrivatePointerArgumentCount(plan) << ",\n";
   os << "      \"triton_hidden_ptr_args\": "
      << backend.getPrivatePointerArgumentCount(plan) << ",\n";
   os << "      \"grid\": [\"cdiv(extent_x, tile_x)\", \"1\", \"1\"],\n";
@@ -2695,10 +2716,16 @@ emitJsonReductionStageDescriptor(const fir::fnacc::FNACCKernelPlan &plan,
 
 class TritonBackend final : public fir::fnacc::FNACCCodegenBackend {
 public:
+  explicit TritonBackend(bool isHIP) : isHIP(isHIP) {}
+
   StringRef getName() const override { return "triton"; }
+  StringRef getAcceleratorTarget() const override {
+    return isHIP ? "hip" : "cuda";
+  }
 
   fir::fnacc::FNACCDeviceImageKind getRuntimeImageKind() const override {
-    return fir::fnacc::FNACCDeviceImageKind::PTX;
+    return isHIP ? fir::fnacc::FNACCDeviceImageKind::HSACO
+                 : fir::fnacc::FNACCDeviceImageKind::PTX;
   }
 
   fir::fnacc::FNACCBackendSupport
@@ -2722,9 +2749,11 @@ public:
       return fir::fnacc::FNACCBackendSupport::failure(
           "parallel subgroup and pipeline-stage counts must be positive");
 
-    if (schedule.subgroupWidth != 32)
+    if ((!isHIP && schedule.subgroupWidth != 32) ||
+        (isHIP && schedule.subgroupWidth != 32 && schedule.subgroupWidth != 64))
       return fir::fnacc::FNACCBackendSupport::failure(
-          "Triton CUDA lowering requires subgroup width 32");
+          isHIP ? "Triton HIP lowering requires subgroup width 32 or 64"
+                : "Triton CUDA lowering requires subgroup width 32");
 
     for (auto [index, parameter] : llvm::enumerate(plan.abi.parameters))
       if (parameter.slot != index)
@@ -2815,6 +2844,9 @@ public:
       const fir::fnacc::FNACCKernelPlan &) const override {
     return 2;
   }
+
+private:
+  bool isHIP;
 };
 
 struct FNACCLowerToTritonPass
@@ -2824,6 +2856,7 @@ struct FNACCLowerToTritonPass
   FNACCLowerToTritonPass(llvm::StringRef ttirOutput, llvm::StringRef jsonOutput,
                          int32_t numWarps, int32_t threadsPerWarp,
                          int32_t numStages, llvm::StringRef f64MatmulStrategy,
+                         llvm::StringRef acceleratorTarget,
                          llvm::StringRef backend,
                          llvm::StringRef fallbackBackend,
                          bool allowBackendFallback) {
@@ -2833,6 +2866,7 @@ struct FNACCLowerToTritonPass
     this->threadsPerWarp = threadsPerWarp;
     this->numStages = numStages;
     this->f64MatmulStrategy = f64MatmulStrategy;
+    this->acceleratorTarget = acceleratorTarget.str();
     this->backend = backend.str();
     this->fallbackBackend = fallbackBackend.str();
     this->allowBackendFallback = allowBackendFallback;
@@ -2863,8 +2897,18 @@ struct FNACCLowerToTritonPass
       return;
     }
 
-    if (tritonThreadsPerWarp != 32) {
-      module.emitError("FNACC currently supports exactly 32 threads per warp");
+    bool isHIP = this->acceleratorTarget == "hip";
+    if (this->acceleratorTarget != "cuda" && !isHIP) {
+      module.emitError("FNACC accelerator-target must be cuda or hip");
+      signalPassFailure();
+      return;
+    }
+
+    if ((!isHIP && tritonThreadsPerWarp != 32) ||
+        (isHIP && tritonThreadsPerWarp != 32 && tritonThreadsPerWarp != 64)) {
+      module.emitError(isHIP
+                           ? "FNACC HIP supports 32 or 64 threads per subgroup"
+                           : "FNACC CUDA supports exactly 32 threads per warp");
       signalPassFailure();
       return;
     }
@@ -2895,7 +2939,7 @@ struct FNACCLowerToTritonPass
       return;
     }
 
-    TritonBackend tritonBackend;
+    TritonBackend tritonBackend(isHIP);
     llvm::SmallVector<const fir::fnacc::FNACCCodegenBackend *> backends{
         &tritonBackend};
     std::vector<fir::fnacc::FNACCKernelPlan> plans;
@@ -3019,6 +3063,8 @@ struct FNACCLowerToTritonPass
     jsonOs << "{\n";
     jsonOs << "  \"fnacc_schema_version\": 1,\n";
     jsonOs << "  \"backend_contract_version\": 1,\n";
+    jsonOs << "  \"accelerator_target\": \""
+           << this->acceleratorTarget.getValue() << "\",\n";
     jsonOs << "  \"requested_backend\": \"" << this->backend.getValue()
            << "\",\n";
     jsonOs << "  \"fallback_backend\": \"" << this->fallbackBackend.getValue()
@@ -3104,7 +3150,20 @@ std::unique_ptr<mlir::Pass> fir::fnacc::createFNACCLowerToTritonPass(
     int32_t threadsPerWarp, int32_t numStages,
     llvm::StringRef f64MatmulStrategy, llvm::StringRef backend,
     llvm::StringRef fallbackBackend, bool allowBackendFallback) {
+  return createFNACCLowerToTritonPass(
+      ttirOutput, jsonOutput, numWarps, threadsPerWarp, numStages,
+      f64MatmulStrategy, backend, fallbackBackend, allowBackendFallback,
+      "cuda");
+}
+
+std::unique_ptr<mlir::Pass> fir::fnacc::createFNACCLowerToTritonPass(
+    llvm::StringRef ttirOutput, llvm::StringRef jsonOutput, int32_t numWarps,
+    int32_t threadsPerWarp, int32_t numStages,
+    llvm::StringRef f64MatmulStrategy, llvm::StringRef backend,
+    llvm::StringRef fallbackBackend, bool allowBackendFallback,
+    llvm::StringRef acceleratorTarget) {
   return std::make_unique<FNACCLowerToTritonPass>(
       ttirOutput, jsonOutput, numWarps, threadsPerWarp, numStages,
-      f64MatmulStrategy, backend, fallbackBackend, allowBackendFallback);
+      f64MatmulStrategy, acceleratorTarget, backend, fallbackBackend,
+      allowBackendFallback);
 }

@@ -20,6 +20,12 @@ std::unique_ptr<mlir::Pass> createFNACCLowerToTritonPass(
     llvm::StringRef f64MatmulStrategy, llvm::StringRef backend = "auto",
     llvm::StringRef fallbackBackend = "triton",
     bool allowBackendFallback = true);
+std::unique_ptr<mlir::Pass> createFNACCLowerToTritonPass(
+    llvm::StringRef ttirOutput, llvm::StringRef jsonOutput, int32_t numWarps,
+    int32_t threadsPerWarp, int32_t numStages,
+    llvm::StringRef f64MatmulStrategy, llvm::StringRef backend,
+    llvm::StringRef fallbackBackend, bool allowBackendFallback,
+    llvm::StringRef acceleratorTarget);
 std::unique_ptr<mlir::Pass> createFNACCLowerToRuntimePass();
 
 void registerFNACCPipelines();

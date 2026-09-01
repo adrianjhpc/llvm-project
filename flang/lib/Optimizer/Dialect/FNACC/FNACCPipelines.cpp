@@ -29,7 +29,7 @@ struct FNACCPipelineOptions
 
   Option<int32_t> threadsPerWarp{
       *this, "threads-per-warp",
-      llvm::cl::desc("Number of CUDA threads per warp"), llvm::cl::init(32)};
+      llvm::cl::desc("Number of threads per GPU subgroup"), llvm::cl::init(32)};
 
   Option<int32_t> numStages{*this, "num-stages",
                             llvm::cl::desc("Number of Triton pipeline stages"),
@@ -39,6 +39,11 @@ struct FNACCPipelineOptions
       *this, "f64-matmul-strategy",
       llvm::cl::desc("Strategy for f64 matmul lowering: dot, reduce, or fma"),
       llvm::cl::init("reduce")};
+
+  Option<std::string> acceleratorTarget{
+      *this, "accelerator-target",
+      llvm::cl::desc("Accelerator target for Triton lowering: cuda or hip"),
+      llvm::cl::init("cuda")};
 
   Option<std::string> backend{
       *this, "backend",
@@ -64,7 +69,8 @@ void buildFNACCPipeline(mlir::OpPassManager &pm,
   pm.addPass(createFNACCLowerToTritonPass(
       options.ttirOutput, options.jsonOutput, options.numWarps,
       options.threadsPerWarp, options.numStages, options.f64MatmulStrategy,
-      options.backend, options.fallbackBackend, options.allowBackendFallback));
+      options.backend, options.fallbackBackend, options.allowBackendFallback,
+      options.acceleratorTarget));
 
   pm.addPass(createFNACCLowerToRuntimePass());
 

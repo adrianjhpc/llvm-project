@@ -10,6 +10,12 @@
 // RUN:   --fnacc-lower-to-triton="ttir-output=%t.fallback.ttir json-output=%t.fallback.json backend=cuda-tile fallback-backend=triton allow-backend-fallback=true" \
 // RUN:   %s -o /dev/null 2>&1 | FileCheck %s --check-prefix=FALLBACK
 // RUN: FileCheck %s --check-prefix=FALLBACK-JSON --input-file=%t.fallback.json
+// RUN: fir-opt \
+// RUN:   --fnacc-assign-kernel-ids \
+// RUN:   --fnacc-lower-to-triton="ttir-output=%t.hip.ttir json-output=%t.hip.json accelerator-target=hip threads-per-warp=64" \
+// RUN:   %s -o /dev/null
+// RUN: FileCheck %s --check-prefix=HIP-JSON --input-file=%t.hip.json
+// RUN: python3 -m json.tool %t.hip.json > /dev/null
 // RUN: not fir-opt \
 // RUN:   --fnacc-assign-kernel-ids \
 // RUN:   --fnacc-lower-to-triton="ttir-output=%t.no-fallback.ttir json-output=%t.no-fallback.json backend=cuda-tile allow-backend-fallback=false" \
@@ -121,6 +127,7 @@ module {
 // TTIR: arith.divf
 
 // JSON: "backend_contract_version": 1
+// JSON: "accelerator_target": "cuda"
 // JSON: "requested_backend": "auto"
 // JSON: "selected_backend": "triton"
 // JSON: "device_ir_kind": "ttir"
@@ -146,4 +153,11 @@ module {
 // FALLBACK-JSON: "requested_backend": "cuda-tile"
 // FALLBACK-JSON: "used_backend_fallback": true
 // FALLBACK-JSON: "selected_backend": "triton"
+// HIP-JSON: "accelerator_target": "hip"
+// HIP-JSON: "device_ir_kind": "ttir"
+// HIP-JSON: "device_image_kind": "hsaco"
+// HIP-JSON: "image_file": "fnacc_kernel_0.hsaco"
+// HIP-JSON: "threads_per_warp": 64
+// HIP-JSON: "threads_per_cta": 64
+// HIP-JSON-NOT: "cuda_threads_per_cta"
 // NO-FALLBACK: error: FNACC backend selection failed: requested backend 'cuda-tile' is not registered
