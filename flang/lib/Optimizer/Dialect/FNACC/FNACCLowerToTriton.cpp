@@ -9,6 +9,7 @@
 #include "mlir/Dialect/Arith/IR/Arith.h"
 
 #include "llvm/ADT/ArrayRef.h"
+#include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/ADT/StringRef.h"
@@ -361,12 +362,21 @@ struct ExprTritonEmitterState {
   llvm::SmallVector<std::string> arrayAccessNames;
   llvm::SmallVector<bool> scalarSplatEmitted;
   llvm::SmallVector<std::string> scalarSplatNames;
+  /// FIR is an SSA DAG, while ElementwiseExpr owns its operands as a tree.
+  /// Remember already emitted non-leaf SSA values so rebuilding the tree does
+  /// not duplicate their device computations.
+  llvm::DenseMap<mlir::Value, std::string> emittedExpressionValues;
 };
 
 static std::string emitExprVector(const fir::fnacc::ElementwiseKernel &k,
                                   const fir::fnacc::ElementwiseExpr &expr,
                                   ExprTritonEmitterState &state,
-                                  llvm::raw_ostream &os) {
+                                  llvm::raw_ostream &os);
+
+static std::string emitExprVectorImpl(const fir::fnacc::ElementwiseKernel &k,
+                                      const fir::fnacc::ElementwiseExpr &expr,
+                                      ExprTritonEmitterState &state,
+                                      llvm::raw_ostream &os) {
   int64_t block = state.block;
   fir::fnacc::ElementType expressionType =
       expr.elementType == fir::fnacc::ElementType::Unknown ? k.elementType
@@ -721,6 +731,36 @@ static std::string emitExprVector(const fir::fnacc::ElementwiseKernel &k,
   default:
     llvm_unreachable("unsupported FNACC expression reached TTIR emission");
   }
+}
+
+static bool
+canMemoizeExpression(const fir::fnacc::ElementwiseExpr &expression) {
+  if (!expression.source)
+    return false;
+
+  // ArrayLoad::source identifies the array base, not the particular load.
+  // Scalar leaves are already cached explicitly by their ABI slot.
+  using Kind = fir::fnacc::ElementwiseExprKind;
+  return expression.kind != Kind::ArrayLoad &&
+         expression.kind != Kind::ScalarLoad &&
+         expression.kind != Kind::IndexScalarLoad;
+}
+
+static std::string emitExprVector(const fir::fnacc::ElementwiseKernel &k,
+                                  const fir::fnacc::ElementwiseExpr &expr,
+                                  ExprTritonEmitterState &state,
+                                  llvm::raw_ostream &os) {
+  bool memoize = canMemoizeExpression(expr);
+  if (memoize) {
+    auto found = state.emittedExpressionValues.find(expr.source);
+    if (found != state.emittedExpressionValues.end())
+      return found->second;
+  }
+
+  std::string result = emitExprVectorImpl(k, expr, state, os);
+  if (memoize)
+    state.emittedExpressionValues.try_emplace(expr.source, result);
+  return result;
 }
 
 static void emitTritonExpr1D(const fir::fnacc::ElementwiseKernel &k,

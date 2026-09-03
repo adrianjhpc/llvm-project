@@ -1738,6 +1738,7 @@ recognizeElementwiseExpr(Value value, const ArrayAccessInfo &accesses,
     if (!child)
       return nullptr;
     auto expression = makeExpr(ElementwiseExprKind::Convert);
+    expression->source = value;
     expression->elementType = destinationType;
     expression->operands.push_back(std::move(child));
     return expression;
@@ -1827,6 +1828,7 @@ recognizeElementwiseExpr(Value value, const ArrayAccessInfo &accesses,
   // Floating-point constant.
   if (auto constantValue = getRealConstantValue(value)) {
     auto expression = makeExpr(ElementwiseExprKind::ConstantReal);
+    expression->source = value;
     expression->realValue = *constantValue;
     expression->elementType = getSupportedElementType(value.getType());
     return expression;
@@ -1834,6 +1836,7 @@ recognizeElementwiseExpr(Value value, const ArrayAccessInfo &accesses,
 
   if (auto constantValue = getIntegerConstantValue(value)) {
     auto expression = makeExpr(ElementwiseExprKind::ConstantInteger);
+    expression->source = value;
     expression->integerValue = *constantValue;
     expression->elementType = getSupportedElementType(value.getType());
     return expression;
@@ -1844,6 +1847,12 @@ recognizeElementwiseExpr(Value value, const ArrayAccessInfo &accesses,
     reason = "elementwise expression value has no defining operation";
     return nullptr;
   }
+
+  auto rememberSource = [&](std::unique_ptr<ElementwiseExpr> expression) {
+    if (expression)
+      expression->source = value;
+    return expression;
+  };
 
   Type resultType = value.getType();
 
@@ -1857,31 +1866,31 @@ recognizeElementwiseExpr(Value value, const ArrayAccessInfo &accesses,
 
   // Unary negation in canonical arith.negf form.
   if (auto neg = dyn_cast<arith::NegFOp>(operation)) {
-    return recognizeUnaryElementwiseExpr(
-        ElementwiseExprKind::NegF, neg.getOperand(), accesses, kernel, reason);
+    return rememberSource(recognizeUnaryElementwiseExpr(
+        ElementwiseExprKind::NegF, neg.getOperand(), accesses, kernel, reason));
   }
 
   // Flang or canonicalization may represent negation as 0.0 - value.
   if (auto sub = dyn_cast<arith::SubFOp>(operation)) {
     if (isZeroReal(sub.getLhs())) {
-      return recognizeUnaryElementwiseExpr(
-          ElementwiseExprKind::NegF, sub.getRhs(), accesses, kernel, reason);
+      return rememberSource(recognizeUnaryElementwiseExpr(
+          ElementwiseExprKind::NegF, sub.getRhs(), accesses, kernel, reason));
     }
 
-    return recognizeBinaryElementwiseExpr(ElementwiseExprKind::SubF,
-                                          sub.getLhs(), sub.getRhs(), accesses,
-                                          kernel, reason);
+    return rememberSource(
+        recognizeBinaryElementwiseExpr(ElementwiseExprKind::SubF, sub.getLhs(),
+                                       sub.getRhs(), accesses, kernel, reason));
   }
 
   if (auto abs = dyn_cast<math::AbsFOp>(operation)) {
-    return recognizeUnaryElementwiseExpr(
-        ElementwiseExprKind::AbsF, abs.getOperand(), accesses, kernel, reason);
+    return rememberSource(recognizeUnaryElementwiseExpr(
+        ElementwiseExprKind::AbsF, abs.getOperand(), accesses, kernel, reason));
   }
 
   if (auto sqrt = dyn_cast<math::SqrtOp>(operation)) {
-    return recognizeUnaryElementwiseExpr(ElementwiseExprKind::SqrtF,
-                                         sqrt.getOperand(), accesses, kernel,
-                                         reason);
+    return rememberSource(recognizeUnaryElementwiseExpr(
+        ElementwiseExprKind::SqrtF, sqrt.getOperand(), accesses, kernel,
+        reason));
   }
 
   if (operation->getName().getStringRef() == "math.fpowi" &&
@@ -1892,35 +1901,35 @@ recognizeElementwiseExpr(Value value, const ArrayAccessInfo &accesses,
       reason = "elementwise integer power currently requires exponent 2";
       return nullptr;
     }
-    return recognizeUnaryElementwiseExpr(ElementwiseExprKind::SquareF,
-                                         operation->getOperand(0), accesses,
-                                         kernel, reason);
+    return rememberSource(recognizeUnaryElementwiseExpr(
+        ElementwiseExprKind::SquareF, operation->getOperand(0), accesses,
+        kernel, reason));
   }
 
   if (auto exp = dyn_cast<math::ExpOp>(operation)) {
-    return recognizeUnaryElementwiseExpr(
-        ElementwiseExprKind::ExpF, exp.getOperand(), accesses, kernel, reason);
+    return rememberSource(recognizeUnaryElementwiseExpr(
+        ElementwiseExprKind::ExpF, exp.getOperand(), accesses, kernel, reason));
   }
 
   if (auto log = dyn_cast<math::LogOp>(operation)) {
-    return recognizeUnaryElementwiseExpr(
-        ElementwiseExprKind::LogF, log.getOperand(), accesses, kernel, reason);
+    return rememberSource(recognizeUnaryElementwiseExpr(
+        ElementwiseExprKind::LogF, log.getOperand(), accesses, kernel, reason));
   }
 
   if (auto sin = dyn_cast<math::SinOp>(operation)) {
-    return recognizeUnaryElementwiseExpr(
-        ElementwiseExprKind::SinF, sin.getOperand(), accesses, kernel, reason);
+    return rememberSource(recognizeUnaryElementwiseExpr(
+        ElementwiseExprKind::SinF, sin.getOperand(), accesses, kernel, reason));
   }
 
   if (auto cos = dyn_cast<math::CosOp>(operation)) {
-    return recognizeUnaryElementwiseExpr(
-        ElementwiseExprKind::CosF, cos.getOperand(), accesses, kernel, reason);
+    return rememberSource(recognizeUnaryElementwiseExpr(
+        ElementwiseExprKind::CosF, cos.getOperand(), accesses, kernel, reason));
   }
 
   if (auto tanh = dyn_cast<math::TanhOp>(operation)) {
-    return recognizeUnaryElementwiseExpr(ElementwiseExprKind::TanhF,
-                                         tanh.getOperand(), accesses, kernel,
-                                         reason);
+    return rememberSource(recognizeUnaryElementwiseExpr(
+        ElementwiseExprKind::TanhF, tanh.getOperand(), accesses, kernel,
+        reason));
   }
 
   StringRef operationName = operation->getName().getStringRef();
@@ -1930,55 +1939,55 @@ recognizeElementwiseExpr(Value value, const ArrayAccessInfo &accesses,
       reason = "integer absolute-value operation is not unary";
       return nullptr;
     }
-    return recognizeUnaryElementwiseExpr(ElementwiseExprKind::AbsI,
-                                         operation->getOperand(0), accesses,
-                                         kernel, reason);
+    return rememberSource(recognizeUnaryElementwiseExpr(
+        ElementwiseExprKind::AbsI, operation->getOperand(0), accesses, kernel,
+        reason));
   }
 
   if (auto add = dyn_cast<arith::AddFOp>(operation)) {
-    return recognizeBinaryElementwiseExpr(ElementwiseExprKind::AddF,
-                                          add.getLhs(), add.getRhs(), accesses,
-                                          kernel, reason);
+    return rememberSource(
+        recognizeBinaryElementwiseExpr(ElementwiseExprKind::AddF, add.getLhs(),
+                                       add.getRhs(), accesses, kernel, reason));
   }
 
   if (auto mul = dyn_cast<arith::MulFOp>(operation)) {
-    return recognizeBinaryElementwiseExpr(ElementwiseExprKind::MulF,
-                                          mul.getLhs(), mul.getRhs(), accesses,
-                                          kernel, reason);
+    return rememberSource(
+        recognizeBinaryElementwiseExpr(ElementwiseExprKind::MulF, mul.getLhs(),
+                                       mul.getRhs(), accesses, kernel, reason));
   }
 
   if (auto div = dyn_cast<arith::DivFOp>(operation)) {
-    return recognizeBinaryElementwiseExpr(ElementwiseExprKind::DivF,
-                                          div.getLhs(), div.getRhs(), accesses,
-                                          kernel, reason);
+    return rememberSource(
+        recognizeBinaryElementwiseExpr(ElementwiseExprKind::DivF, div.getLhs(),
+                                       div.getRhs(), accesses, kernel, reason));
   }
 
   if (auto add = dyn_cast<arith::AddIOp>(operation)) {
-    return recognizeBinaryElementwiseExpr(ElementwiseExprKind::AddI,
-                                          add.getLhs(), add.getRhs(), accesses,
-                                          kernel, reason);
+    return rememberSource(
+        recognizeBinaryElementwiseExpr(ElementwiseExprKind::AddI, add.getLhs(),
+                                       add.getRhs(), accesses, kernel, reason));
   }
 
   if (auto sub = dyn_cast<arith::SubIOp>(operation)) {
     if (std::optional<Value> absOperand = matchFlangIntegerAbs(value))
-      return recognizeUnaryElementwiseExpr(
-          ElementwiseExprKind::AbsI, *absOperand, accesses, kernel, reason);
+      return rememberSource(recognizeUnaryElementwiseExpr(
+          ElementwiseExprKind::AbsI, *absOperand, accesses, kernel, reason));
 
-    return recognizeBinaryElementwiseExpr(ElementwiseExprKind::SubI,
-                                          sub.getLhs(), sub.getRhs(), accesses,
-                                          kernel, reason);
+    return rememberSource(
+        recognizeBinaryElementwiseExpr(ElementwiseExprKind::SubI, sub.getLhs(),
+                                       sub.getRhs(), accesses, kernel, reason));
   }
 
   if (auto mul = dyn_cast<arith::MulIOp>(operation)) {
-    return recognizeBinaryElementwiseExpr(ElementwiseExprKind::MulI,
-                                          mul.getLhs(), mul.getRhs(), accesses,
-                                          kernel, reason);
+    return rememberSource(
+        recognizeBinaryElementwiseExpr(ElementwiseExprKind::MulI, mul.getLhs(),
+                                       mul.getRhs(), accesses, kernel, reason));
   }
 
   if (auto div = dyn_cast<arith::DivSIOp>(operation)) {
-    return recognizeBinaryElementwiseExpr(ElementwiseExprKind::DivSI,
-                                          div.getLhs(), div.getRhs(), accesses,
-                                          kernel, reason);
+    return rememberSource(
+        recognizeBinaryElementwiseExpr(ElementwiseExprKind::DivSI, div.getLhs(),
+                                       div.getRhs(), accesses, kernel, reason));
   }
 
   // Use operation names for min/max because exact generated C++ class names
@@ -1990,9 +1999,9 @@ recognizeElementwiseExpr(Value value, const ArrayAccessInfo &accesses,
       return nullptr;
     }
 
-    return recognizeBinaryElementwiseExpr(
+    return rememberSource(recognizeBinaryElementwiseExpr(
         ElementwiseExprKind::MinF, operation->getOperand(0),
-        operation->getOperand(1), accesses, kernel, reason);
+        operation->getOperand(1), accesses, kernel, reason));
   }
 
   if (operationName == "arith.maximumf") {
@@ -2001,9 +2010,9 @@ recognizeElementwiseExpr(Value value, const ArrayAccessInfo &accesses,
       return nullptr;
     }
 
-    return recognizeBinaryElementwiseExpr(
+    return rememberSource(recognizeBinaryElementwiseExpr(
         ElementwiseExprKind::MaxF, operation->getOperand(0),
-        operation->getOperand(1), accesses, kernel, reason);
+        operation->getOperand(1), accesses, kernel, reason));
   }
 
   // Do not collapse minnum/maxnum into minimum/maximum: their NaN behavior is
@@ -2015,9 +2024,9 @@ recognizeElementwiseExpr(Value value, const ArrayAccessInfo &accesses,
       return nullptr;
     }
 
-    return recognizeBinaryElementwiseExpr(
+    return rememberSource(recognizeBinaryElementwiseExpr(
         ElementwiseExprKind::MinNumF, operation->getOperand(0),
-        operation->getOperand(1), accesses, kernel, reason);
+        operation->getOperand(1), accesses, kernel, reason));
   }
 
   if (operationName == "arith.maxnumf") {
@@ -2026,9 +2035,9 @@ recognizeElementwiseExpr(Value value, const ArrayAccessInfo &accesses,
       return nullptr;
     }
 
-    return recognizeBinaryElementwiseExpr(
+    return rememberSource(recognizeBinaryElementwiseExpr(
         ElementwiseExprKind::MaxNumF, operation->getOperand(0),
-        operation->getOperand(1), accesses, kernel, reason);
+        operation->getOperand(1), accesses, kernel, reason));
   }
 
   if (operationName == "arith.minsi" || operationName == "arith.maxsi") {
@@ -2040,9 +2049,9 @@ recognizeElementwiseExpr(Value value, const ArrayAccessInfo &accesses,
     ElementwiseExprKind kind = operationName == "arith.minsi"
                                    ? ElementwiseExprKind::MinSI
                                    : ElementwiseExprKind::MaxSI;
-    return recognizeBinaryElementwiseExpr(kind, operation->getOperand(0),
-                                          operation->getOperand(1), accesses,
-                                          kernel, reason);
+    return rememberSource(recognizeBinaryElementwiseExpr(
+        kind, operation->getOperand(0), operation->getOperand(1), accesses,
+        kernel, reason));
   }
 
   if (auto compare = dyn_cast<arith::CmpFOp>(operation)) {
@@ -2054,9 +2063,9 @@ recognizeElementwiseExpr(Value value, const ArrayAccessInfo &accesses,
       return nullptr;
     }
 
-    return recognizeBinaryElementwiseExpr(
+    return rememberSource(recognizeBinaryElementwiseExpr(
         *comparisonKind, compare.getLhs(), compare.getRhs(), accesses, kernel,
-        reason, ElementwiseExprResultKind::Predicate);
+        reason, ElementwiseExprResultKind::Predicate));
   }
 
   if (auto compare = dyn_cast<arith::CmpIOp>(operation)) {
@@ -2068,9 +2077,9 @@ recognizeElementwiseExpr(Value value, const ArrayAccessInfo &accesses,
       return nullptr;
     }
 
-    return recognizeBinaryElementwiseExpr(
+    return rememberSource(recognizeBinaryElementwiseExpr(
         *comparisonKind, compare.getLhs(), compare.getRhs(), accesses, kernel,
-        reason, ElementwiseExprResultKind::Predicate);
+        reason, ElementwiseExprResultKind::Predicate));
   }
 
   if ((operationName == "arith.andi" || operationName == "arith.ori") &&
@@ -2078,9 +2087,9 @@ recognizeElementwiseExpr(Value value, const ArrayAccessInfo &accesses,
     ElementwiseExprKind kind = operationName == "arith.andi"
                                    ? ElementwiseExprKind::And
                                    : ElementwiseExprKind::Or;
-    return recognizeBinaryElementwiseExpr(
+    return rememberSource(recognizeBinaryElementwiseExpr(
         kind, operation->getOperand(0), operation->getOperand(1), accesses,
-        kernel, reason, ElementwiseExprResultKind::Predicate);
+        kernel, reason, ElementwiseExprResultKind::Predicate));
   }
 
   if (auto select = dyn_cast<arith::SelectOp>(operation)) {
@@ -2115,6 +2124,7 @@ recognizeElementwiseExpr(Value value, const ArrayAccessInfo &accesses,
     }
 
     auto expression = makeExpr(ElementwiseExprKind::Select);
+    expression->source = value;
     expression->resultKind = ElementwiseExprResultKind::Element;
     expression->elementType = trueValue->elementType;
     expression->operands.push_back(std::move(condition));

@@ -97,8 +97,7 @@ static CUresult cuFuncGetAttribute(
     int *value, CUfunction_attribute attribute, CUfunction function) {
   return hipFuncGetAttribute(value, attribute, function);
 }
-static CUresult cuFuncSetAttribute(
-    CUfunction, CUfunction_attribute, int) {
+static CUresult cuFuncSetAttribute(CUfunction, CUfunction_attribute, int) {
   // AMD LDS does not use CUDA's per-function dynamic shared-memory opt-in.
   return hipSuccess;
 }
@@ -115,17 +114,17 @@ static CUresult cuMemFree(CUdeviceptr pointer) {
 static CUresult cuMemcpyHtoD(
     CUdeviceptr destination, const void *source, std::size_t bytes) {
   return hipMemcpy(reinterpret_cast<void *>(destination), source, bytes,
-                   hipMemcpyHostToDevice);
+      hipMemcpyHostToDevice);
 }
 static CUresult cuMemcpyDtoH(
     void *destination, CUdeviceptr source, std::size_t bytes) {
   return hipMemcpy(destination, reinterpret_cast<const void *>(source), bytes,
-                   hipMemcpyDeviceToHost);
+      hipMemcpyDeviceToHost);
 }
 static CUresult cuLaunchKernel(CUfunction function, unsigned gridX,
     unsigned gridY, unsigned gridZ, unsigned blockX, unsigned blockY,
-    unsigned blockZ, unsigned sharedBytes, CUstream stream,
-    void **kernelParams, void **extra) {
+    unsigned blockZ, unsigned sharedBytes, CUstream stream, void **kernelParams,
+    void **extra) {
   return hipModuleLaunchKernel(function, gridX, gridY, gridZ, blockX, blockY,
       blockZ, sharedBytes, stream, kernelParams, extra);
 }
@@ -192,7 +191,7 @@ static void fnaccCudaCheck(
   } while (false)
 
 static constexpr const char *FNACC_RUNTIME_BUILD_ID =
-    "FNACC_RUNTIME_BUILD_ID_multivendor_gpu_v12";
+    "FNACC_RUNTIME_BUILD_ID_data_only_runtime_v13";
 
 static std::size_t fnaccCheckedMul(
     std::size_t a, std::size_t b, const char *what) {
@@ -1319,6 +1318,11 @@ static std::string fnaccReadTextFile(const char *path) {
   return ss.str();
 }
 
+static bool fnaccTextFileExists(const char *path) {
+  std::ifstream file(path, std::ios::in | std::ios::binary);
+  return static_cast<bool>(file);
+}
+
 static std::vector<std::string> fnaccGetPtxTextsFromDirectory(
     const std::unordered_map<int32_t, FNACCKernelDesc> &kernels) {
   std::vector<std::string> result;
@@ -1445,8 +1449,7 @@ fnaccParseKernelDescsFromJson(const std::string &json) {
 
     jsonFindString(objectText, "kind", desc.kind);
     jsonFindString(objectText, "backend", desc.backend);
-    jsonFindString(
-        objectText, "accelerator_target", desc.acceleratorTarget);
+    jsonFindString(objectText, "accelerator_target", desc.acceleratorTarget);
     jsonFindString(objectText, "device_image_kind", desc.deviceImageKind);
 
     if (!jsonFindInt(objectText, "image_index", desc.ptxIndex))
@@ -1456,10 +1459,9 @@ fnaccParseKernelDescsFromJson(const std::string &json) {
 
     if (desc.ptxFile.empty())
       desc.ptxFile = desc.name +
-          (desc.deviceImageKind == "cubin" ? ".cubin"
-                                           : desc.deviceImageKind == "hsaco"
-                                               ? ".hsaco"
-                                               : ".ptx");
+          (desc.deviceImageKind == "cubin"          ? ".cubin"
+                  : desc.deviceImageKind == "hsaco" ? ".hsaco"
+                                                    : ".ptx");
 
     if (desc.id < 0 || desc.ptxIndex < 0) {
       std::fprintf(stderr,
@@ -1526,8 +1528,8 @@ fnaccParseKernelDescsFromJson(const std::string &json) {
         static_cast<int64_t>(desc.numWarps) * desc.threadsPerWarp;
     bool supportedSubgroupWidth = desc.threadsPerWarp == 32;
 #if defined(FNACC_RUNTIME_USE_HIP)
-    supportedSubgroupWidth = supportedSubgroupWidth ||
-        desc.threadsPerWarp == 64;
+    supportedSubgroupWidth =
+        supportedSubgroupWidth || desc.threadsPerWarp == 64;
 #endif
     if (desc.rank < 1 || desc.rank > 3 || desc.tileX <= 0 || desc.tileY <= 0 ||
         desc.tileZ <= 0 || desc.numWarps <= 0 || !supportedSubgroupWidth ||
@@ -1555,22 +1557,22 @@ fnaccParseKernelDescsFromJson(const std::string &json) {
       std::abort();
     }
 #if defined(FNACC_RUNTIME_USE_HIP)
-    if (desc.acceleratorTarget != "hip" ||
-        desc.deviceImageKind != "hsaco") {
+    if (desc.acceleratorTarget != "hip" || desc.deviceImageKind != "hsaco") {
       std::fprintf(stderr,
           "FNACC error: HIP runtime cannot load target='%s' image_kind='%s' "
           "for kernel id %d\n",
-          desc.acceleratorTarget.c_str(), desc.deviceImageKind.c_str(), desc.id);
+          desc.acceleratorTarget.c_str(), desc.deviceImageKind.c_str(),
+          desc.id);
       std::abort();
     }
 #else
     if (desc.acceleratorTarget != "cuda" ||
-        (desc.deviceImageKind != "ptx" &&
-         desc.deviceImageKind != "cubin")) {
+        (desc.deviceImageKind != "ptx" && desc.deviceImageKind != "cubin")) {
       std::fprintf(stderr,
           "FNACC error: CUDA runtime cannot load target='%s' image_kind='%s' "
           "for kernel id %d\n",
-          desc.acceleratorTarget.c_str(), desc.deviceImageKind.c_str(), desc.id);
+          desc.acceleratorTarget.c_str(), desc.deviceImageKind.c_str(),
+          desc.id);
       std::abort();
     }
 #endif
@@ -1926,8 +1928,10 @@ static void fnaccEnsureInitialized() {
   };
 
   const char *jsonOverride = std::getenv("FNACC_KERNELS_JSON");
-  bool useEmbeddedBundles =
-      (!jsonOverride || jsonOverride[0] == '\0') && fnaccHasEmbeddedBundles();
+  bool hasJsonOverride = jsonOverride && jsonOverride[0] != '\0';
+  bool useEmbeddedBundles = !hasJsonOverride && fnaccHasEmbeddedBundles();
+  bool useLegacySidecars = !hasJsonOverride && !useEmbeddedBundles &&
+      fnaccTextFileExists("fnacc_kernels.json");
   if (useEmbeddedBundles) {
     int32_t imageBase = 0;
     for (const FNACCEmbeddedKernelBundle &bundle :
@@ -1935,16 +1939,21 @@ static void fnaccEnsureInitialized() {
       parseOneJson(std::string(bundle.jsonData, bundle.jsonSize), imageBase);
       imageBase += static_cast<int32_t>(bundle.imageData.size());
     }
-  } else {
+  } else if (hasJsonOverride || useLegacySidecars) {
     parseOneJson(fnaccGetJsonText(), 0);
+  } else if (fnaccDebugEnabled()) {
+    std::fprintf(stderr,
+        "FNACC: no kernel metadata found; initializing data-only runtime\n");
   }
 
-  fnaccRegistry.ptxTexts = fnaccGetPtxTexts(fnaccRegistry.kernels);
-  if (useEmbeddedBundles)
-    fnaccRegistry.embeddedImageKinds =
-        fnaccGetImageKindsFromEmbeddedBundles();
+  if (!fnaccRegistry.kernels.empty()) {
+    fnaccRegistry.ptxTexts = fnaccGetPtxTexts(fnaccRegistry.kernels);
+    if (useEmbeddedBundles)
+      fnaccRegistry.embeddedImageKinds =
+          fnaccGetImageKindsFromEmbeddedBundles();
+  }
 
-  if (fnaccRegistry.ptxTexts.empty()) {
+  if (!fnaccRegistry.kernels.empty() && fnaccRegistry.ptxTexts.empty()) {
     std::fprintf(stderr, "FNACC error: no device images were available\n");
     std::abort();
   }
@@ -1968,13 +1977,12 @@ static void fnaccEnsureInitialized() {
       const FNACCKernelDesc &desc = entry.second;
       int32_t expectedKind = desc.deviceImageKind == "ptx"
           ? FNACCEmbeddedKernelBundle::PTX
-          : desc.deviceImageKind == "cubin"
-              ? FNACCEmbeddedKernelBundle::Cubin
-              : FNACCEmbeddedKernelBundle::HSACO;
+          : desc.deviceImageKind == "cubin" ? FNACCEmbeddedKernelBundle::Cubin
+                                            : FNACCEmbeddedKernelBundle::HSACO;
       if (static_cast<std::size_t>(desc.ptxIndex) >=
               fnaccRegistry.embeddedImageKinds.size() ||
-          fnaccRegistry.embeddedImageKinds[
-              static_cast<std::size_t>(desc.ptxIndex)] != expectedKind) {
+          fnaccRegistry.embeddedImageKinds[static_cast<std::size_t>(
+              desc.ptxIndex)] != expectedKind) {
         std::fprintf(stderr,
             "FNACC error: embedded image kind disagrees with metadata for "
             "kernel id %d\n",

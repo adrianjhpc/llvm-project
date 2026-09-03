@@ -100,8 +100,7 @@ end subroutine
 ! TTIR-SAME: %array2: !tt.ptr<f64>
 ! TTIR: %[[POST0:expr[0-9]+]] = arith.addf %access0_value,
 ! TTIR: tt.store {{.*}}, %[[POST0]], %mask
-! TTIR: %[[FORWARDED_POST:expr[0-9]+]] = arith.addf %access0_value,
-! TTIR: %[[PRE:expr[0-9]+]] = arith.mulf %[[FORWARDED_POST]],
+! TTIR: %[[PRE:expr[0-9]+]] = arith.mulf %[[POST0]],
 ! TTIR: tt.store {{.*}}, %[[PRE]], %mask
 ! TTIR-NOT: arith.mulf %access1_value
 
