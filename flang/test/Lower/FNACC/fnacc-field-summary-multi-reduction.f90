@@ -4,6 +4,7 @@
 ! RUN:   %t.fir -o %t.host.fir
 ! RUN: FileCheck %s --check-prefix=HOST --input-file=%t.host.fir
 ! RUN: FileCheck %s --check-prefix=TTIR --input-file=%t.ttir
+! RUN: FileCheck %s --check-prefix=VERTICES --input-file=%t.ttir
 ! RUN: FileCheck %s --check-prefix=JSON --input-file=%t.json
 ! RUN: %python -m json.tool %t.json > /dev/null
 
@@ -73,3 +74,16 @@ end subroutine
 ! JSON: "output_count": 5
 ! JSON: "reduction_op": "add"
 
+! The four expanded iterations share FIR SSA identities, but must use distinct
+! vertex loads in the device arithmetic. Merely counting loads or reductions
+! misses reuse of the first vertex's squared velocities for all four vertices.
+! VERTICES-LABEL: tt.func @fnacc_kernel_0(
+! VERTICES-DAG: arith.mulf %access0_value, %access0_value
+! VERTICES-DAG: arith.mulf %access1_value, %access1_value
+! VERTICES-DAG: arith.mulf %access2_value, %access2_value
+! VERTICES-DAG: arith.mulf %access3_value, %access3_value
+! VERTICES-DAG: arith.mulf %access4_value, %access4_value
+! VERTICES-DAG: arith.mulf %access5_value, %access5_value
+! VERTICES-DAG: arith.mulf %access6_value, %access6_value
+! VERTICES-DAG: arith.mulf %access7_value, %access7_value
+! VERTICES: tt.return

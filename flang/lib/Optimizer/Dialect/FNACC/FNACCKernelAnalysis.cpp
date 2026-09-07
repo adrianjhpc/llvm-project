@@ -1418,6 +1418,20 @@ static bool matchFixedTwoIterationLoop(fir::DoLoopOp loop,
          upper->offset == 1;
 }
 
+/// A fixed-loop expansion substitutes different array accesses into the same
+/// FIR SSA expression. Its non-leaf source values therefore no longer identify
+/// a unique device computation. Keep leaf sources (array/scalar bindings), but
+/// drop composite source identities so backends cannot memoize one expanded
+/// iteration's arithmetic as another's. Ordinary, unexpanded DAGs retain their
+/// source identities and sharing.
+static void forgetExpandedExpressionSources(ElementwiseExpr &expression) {
+  if (expression.operands.empty())
+    return;
+  expression.source = {};
+  for (auto &operand : expression.operands)
+    forgetExpandedExpressionSources(*operand);
+}
+
 /// Expand the small vertex average used by CloverLeaf field-summary kernels:
 ///
 ///   acc = 0
@@ -1580,6 +1594,8 @@ recognizeFixedNestedScalarSum(fir::LoadOp load, const ArrayAccessInfo &accesses,
           recognizeElementwiseExpr(term, iterationAccesses, kernel, reason);
       if (!termExpression)
         return nullptr;
+
+      forgetExpandedExpressionSources(*termExpression);
 
       auto sum = makeExpr(add->getName().getStringRef() == "arith.addf"
                               ? ElementwiseExprKind::AddF
