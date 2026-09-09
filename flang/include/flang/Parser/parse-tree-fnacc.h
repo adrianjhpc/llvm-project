@@ -22,6 +22,12 @@ struct FnACCNoCopybackClause {
   WRAPPER_CLASS_BOILERPLATE(FnACCNoCopybackClause, bool);
 };
 
+ENUM_CLASS(FnACCMatmulPrecision, IEEE, TF32, TF32x3);
+
+struct FnACCMatmulPrecisionClause {
+  WRAPPER_CLASS_BOILERPLATE(FnACCMatmulPrecisionClause, FnACCMatmulPrecision);
+};
+
 ENUM_CLASS(FnACCReductionOperator, Add, Multiply, Min, Max);
 
 struct FnACCReductionClause {
@@ -36,7 +42,7 @@ struct FnACCReductionClause {
 struct FnACCClause {
   UNION_CLASS_BOILERPLATE(FnACCClause);
   std::variant<FnACCTileClause, FnACCPackClause, FnACCReductionClause,
-      FnACCNoCopybackClause>
+      FnACCNoCopybackClause, FnACCMatmulPrecisionClause>
       u;
 };
 

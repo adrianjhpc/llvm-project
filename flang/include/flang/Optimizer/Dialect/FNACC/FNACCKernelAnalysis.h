@@ -10,6 +10,7 @@
 
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/StringRef.h"
 
 #include <cstdint>
 #include <memory>
@@ -66,6 +67,10 @@ enum class ElementwiseKernelKind {
   ReductionMax1D,
   MultiReduction2D
 };
+
+/// Requested FP32 matmul input precision, preserved through backend planning.
+enum class MatmulInputPrecision { IEEE, TF32, TF32x3 };
+llvm::StringRef matmulInputPrecisionName(MatmulInputPrecision precision);
 
 /// Return true when the kernel uses the staged, dynamically-sized launch ABI.
 bool usesVariadicLaunchABI(ElementwiseKernelKind kind);
@@ -264,6 +269,7 @@ enum class ScalarReferenceKind {
 };
 
 struct ElementwiseKernel {
+  MatmulInputPrecision matmulPrecision = MatmulInputPrecision::IEEE;
   int32_t rank = 1;
 
   ElementwiseKernelKind kind = ElementwiseKernelKind::BinaryArrayArray;

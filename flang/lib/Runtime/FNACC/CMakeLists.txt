@@ -34,6 +34,25 @@ if(FNACC_RUNTIME_BACKEND STREQUAL "CUDA" OR
   add_flang_library(FortranFNACCRuntime
     fnacc_runtime.cpp
   )
+
+# For profling
+set(FNACC_NVTX_INCLUDE_DIR "" CACHE PATH
+    "Directory containing nvtx3/nvtx3.hpp")
+
+if(NOT EXISTS "${FNACC_NVTX_INCLUDE_DIR}/nvtx3/nvtx3.hpp")
+  message(FATAL_ERROR
+    "Set FNACC_NVTX_INCLUDE_DIR to the directory containing nvtx3/")
+endif()
+
+target_include_directories(FortranFNACCRuntime PRIVATE
+  "${FNACC_NVTX_INCLUDE_DIR}")
+
+target_link_libraries(FortranFNACCRuntime PRIVATE
+  ${CMAKE_DL_LIBS})
+
+# End for profiling
+
+
   target_link_libraries(FortranFNACCRuntime PRIVATE
     ${FNACC_CUDA_DRIVER_TARGET})
 endif()

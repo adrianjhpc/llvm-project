@@ -42,10 +42,18 @@ TYPE_PARSER(construct<FnACCTileClause>(
 
 TYPE_PARSER(construct<FnACCNoCopybackClause>("NO_COPYBACK"_tok >> pure(true)))
 
+TYPE_PARSER("IEEE"_tok >> pure(FnACCMatmulPrecision::IEEE) ||
+    "TF32X3"_tok >> pure(FnACCMatmulPrecision::TF32x3) ||
+    "TF32"_tok >> pure(FnACCMatmulPrecision::TF32))
+
+TYPE_PARSER(construct<FnACCMatmulPrecisionClause>(
+    "MATMUL_PRECISION"_tok >> parenthesized(Parser<FnACCMatmulPrecision>{})))
+
 TYPE_PARSER(construct<FnACCClause>(Parser<FnACCTileClause>{}) ||
     construct<FnACCClause>(Parser<FnACCPackClause>{}) ||
     construct<FnACCClause>(Parser<FnACCReductionClause>{}) ||
-    construct<FnACCClause>(Parser<FnACCNoCopybackClause>{}))
+    construct<FnACCClause>(Parser<FnACCNoCopybackClause>{}) ||
+    construct<FnACCClause>(Parser<FnACCMatmulPrecisionClause>{}))
 
 TYPE_PARSER(construct<FnACCParallelDirective>(
     "PARALLEL"_tok >> many(Parser<FnACCClause>{})))

@@ -2019,13 +2019,23 @@ static void emitTritonMatMul2DDot(const fir::fnacc::ElementwiseKernel &k,
   os << "    %b_ptrs = tt.addptr %b_base, %b_offsets : tensor<" << blockK << "x"
      << blockN << "x" << ptrTy << ">, tensor<" << blockK << "x" << blockN
      << "xi32>\n";
-  os << "    %a_tile = tt.load %a_ptrs, %mask_a : tensor<" << blockM << "x"
-     << blockK << "x" << ptrTy << ">\n";
-  os << "    %b_tile = tt.load %b_ptrs, %mask_b : tensor<" << blockK << "x"
-     << blockN << "x" << ptrTy << ">\n";
+  // Masked-off K lanes still participate in the dot product. A masked load
+  // without an explicit other value is undefined, not a zero-padding operation.
+  os << "    %a_zero = tt.splat %zero : " << elemTy << " -> tensor<" << blockM
+     << "x" << blockK << "x" << elemTy << ">\n";
+  os << "    %b_zero = tt.splat %zero : " << elemTy << " -> tensor<" << blockK
+     << "x" << blockN << "x" << elemTy << ">\n";
+  os << "    %a_tile = tt.load %a_ptrs, %mask_a, %a_zero : tensor<" << blockM
+     << "x" << blockK << "x" << ptrTy << ">\n";
+  os << "    %b_tile = tt.load %b_ptrs, %mask_b, %b_zero : tensor<" << blockK
+     << "x" << blockN << "x" << ptrTy << ">\n";
 
-  os << "    %acc_next = tt.dot %a_tile, %b_tile, %acc_body "
-        "{inputPrecision = 0 : i32} : tensor<"
+  // IEEE is the default; reduced precision requires an explicit source clause.
+  // The backend-neutral plan retains the request even during backend fallback.
+  // The input precision is ignored for FP64.
+  os << "    %acc_next = tt.dot %a_tile, %b_tile, %acc_body, "
+        "inputPrecision = "
+     << fir::fnacc::matmulInputPrecisionName(k.matmulPrecision) << " : tensor<"
      << blockM << "x" << blockK << "x" << elemTy << "> * tensor<" << blockK
      << "x" << blockN << "x" << elemTy << "> -> tensor<" << blockM << "x"
      << blockN << "x" << elemTy << ">\n";
@@ -2647,6 +2657,10 @@ static void emitJsonDescriptor(const fir::fnacc::FNACCKernelPlan &plan,
   }
   os << "      \"kind\": \"" << fir::fnacc::fnaccKernelKindName(k.kind)
      << "\",\n";
+  if (k.kind == fir::fnacc::ElementwiseKernelKind::MatMul2D &&
+      k.elementType == fir::fnacc::ElementType::F32)
+    os << "      \"matmul_precision\": \""
+       << fir::fnacc::matmulInputPrecisionName(k.matmulPrecision) << "\",\n";
   os << "      \"rank\": " << k.rank << ",\n";
   os << "      \"tile\": [" << schedule.tile.x << ", " << schedule.tile.y
      << ", " << schedule.tile.z << "],\n";
@@ -2772,6 +2786,17 @@ public:
   querySupport(const fir::fnacc::FNACCKernelPlan &plan) const override {
     const fir::fnacc::ElementwiseKernel &kernel = plan.kernel;
     const fir::fnacc::FNACCKernelSchedule &schedule = plan.schedule;
+
+    if (kernel.matmulPrecision != fir::fnacc::MatmulInputPrecision::IEEE) {
+      if (kernel.kind != fir::fnacc::ElementwiseKernelKind::MatMul2D ||
+          kernel.elementType != fir::fnacc::ElementType::F32)
+        return fir::fnacc::FNACCBackendSupport::failure(
+            "reduced matmul precision requires real(4) matmul");
+      if (isHIP)
+        return fir::fnacc::FNACCBackendSupport::failure(
+            "TF32 matmul precision is currently supported only by the CUDA "
+            "Triton backend");
+    }
 
     if (kernel.rank < 1 || kernel.rank > 2)
       return fir::fnacc::FNACCBackendSupport::failure(

@@ -3566,6 +3566,7 @@ private:
     llvm::SmallVector<mlir::Value> reductionVars;
     llvm::SmallVector<int32_t> reductionOps;
     bool noCopyback = false;
+    const char *matmulPrecision = nullptr;
 
     for (const Fortran::parser::FnACCClause &clause : clauses) {
       Fortran::common::visit(
@@ -3648,6 +3649,19 @@ private:
               [&](const Fortran::parser::FnACCNoCopybackClause &) {
                 noCopyback = true;
               },
+              [&](const Fortran::parser::FnACCMatmulPrecisionClause &clause) {
+                switch (clause.v) {
+                case Fortran::parser::FnACCMatmulPrecision::IEEE:
+                  matmulPrecision = "ieee";
+                  break;
+                case Fortran::parser::FnACCMatmulPrecision::TF32:
+                  matmulPrecision = "tf32";
+                  break;
+                case Fortran::parser::FnACCMatmulPrecision::TF32x3:
+                  matmulPrecision = "tf32x3";
+                  break;
+                }
+              },
               [&](const auto &) {}},
           clause.u);
     }
@@ -3670,6 +3684,10 @@ private:
 
     if (noCopyback)
       launchOp->setAttr("fnacc.no_copyback", builder->getUnitAttr());
+
+    if (matmulPrecision)
+      launchOp->setAttr("fnacc.matmul_precision",
+                        builder->getStringAttr(matmulPrecision));
 
     if (!reductionVars.empty()) {
       llvm::SmallVector<int32_t> reductionSlots;

@@ -18,6 +18,19 @@
 using namespace mlir;
 
 namespace fir::fnacc {
+
+llvm::StringRef matmulInputPrecisionName(MatmulInputPrecision precision) {
+  switch (precision) {
+  case MatmulInputPrecision::IEEE:
+    return "ieee";
+  case MatmulInputPrecision::TF32:
+    return "tf32";
+  case MatmulInputPrecision::TF32x3:
+    return "tf32x3";
+  }
+  llvm_unreachable("invalid matmul input precision");
+}
+
 namespace {
 
 static ElementwiseRecognitionResult fail(fir::fnacc::LaunchOp launchOp,
@@ -415,6 +428,21 @@ static ElementwiseRecognitionResult
 validateRecognizedKernel(fir::fnacc::LaunchOp launchOp,
                          ElementwiseRecognitionResult result) {
   ElementwiseKernel kernel = std::move(result.getKernel());
+  if (Attribute attr = launchOp->getAttr("fnacc.matmul_precision")) {
+    auto precision = dyn_cast<StringAttr>(attr);
+    if (!precision ||
+        (precision.getValue() != "ieee" && precision.getValue() != "tf32" &&
+         precision.getValue() != "tf32x3"))
+      return fail(launchOp, "matmul_precision must be ieee, tf32, or tf32x3");
+    if (kernel.kind != ElementwiseKernelKind::MatMul2D ||
+        kernel.elementType != ElementType::F32)
+      return fail(launchOp,
+                  "MATMUL_PRECISION requires a recognized real(4) matmul");
+    if (precision.getValue() == "tf32")
+      kernel.matmulPrecision = MatmulInputPrecision::TF32;
+    else if (precision.getValue() == "tf32x3")
+      kernel.matmulPrecision = MatmulInputPrecision::TF32x3;
+  }
   populateVariadicArrayArguments(kernel);
 
   if (Operation *unsupported = findDiscardedSideEffect(launchOp, kernel)) {
@@ -4671,22 +4699,6 @@ static std::string getPlannedKernelName(fir::fnacc::LaunchOp launchOp,
   return "fnacc_kernel_" + std::to_string(fallbackId);
 }
 
-static int32_t getPlannedParallelSubgroups(const ElementwiseKernel &kernel,
-                                           int32_t requestedParallelSubgroups) {
-  bool isF64ScalarElementwise =
-      kernel.elementType == ElementType::F64 && !kernel.scalarRefs.empty() &&
-      (kernel.kind == ElementwiseKernelKind::Saxpy1D ||
-       kernel.kind == ElementwiseKernelKind::Expr1D ||
-       kernel.kind == ElementwiseKernelKind::MultiExpr1D ||
-       kernel.kind == ElementwiseKernelKind::Expr2D);
-
-  if (isF64ScalarElementwise || isReductionKernelKind(kernel.kind) ||
-      kernel.kind == ElementwiseKernelKind::MatMul2D)
-    return requestedParallelSubgroups;
-
-  return 1;
-}
-
 static llvm::SmallVector<unsigned>
 getKernelParameterSlotsForValue(const ElementwiseKernel &kernel, Value value) {
   llvm::SmallVector<unsigned> slots;
@@ -5078,8 +5090,11 @@ buildFNACCKernelPlan(fir::fnacc::LaunchOp launchOp, int32_t fallbackId,
   plan.usesVariadicABI = usesVariadicLaunchABI(plan.kernel.kind);
   plan.copyBackWrites = !launchOp->hasAttr("fnacc.no_copyback");
   plan.schedule.tile = getPlannedTileShape(launchOp, plan.kernel);
-  plan.schedule.parallelSubgroups = getPlannedParallelSubgroups(
-      plan.kernel, options.requestedParallelSubgroups);
+  // Honour the configured subgroup count for every kernel kind. In particular,
+  // stencil/array-only kernels must not silently override --num-warps with 1.
+  // Keep this in the shared schedule so device compilation and host launch
+  // metadata agree. The pipeline/driver default remains one subgroup.
+  plan.schedule.parallelSubgroups = options.requestedParallelSubgroups;
   plan.schedule.subgroupWidth = options.subgroupWidth;
   plan.schedule.pipelineStages = options.pipelineStages;
   plan.schedule.f64MatmulStrategy = options.f64MatmulStrategy;

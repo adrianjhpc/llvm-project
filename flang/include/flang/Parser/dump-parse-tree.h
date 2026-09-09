@@ -369,6 +369,8 @@ public:
   NODE(parser, FnACCClause)
   NODE(parser, FnACCTileClause)
   NODE(parser, FnACCNoCopybackClause)
+  NODE(parser, FnACCMatmulPrecisionClause)
+  NODE_NAME(FnACCMatmulPrecision, "FnACCMatmulPrecision")
   NODE(parser, FnACCReductionClause)
   NODE(FnACCReductionClause, Item)
   NODE_NAME(FnACCReductionOperator, "FnACCReductionOperator")

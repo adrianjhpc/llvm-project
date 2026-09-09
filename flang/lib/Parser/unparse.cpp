@@ -2880,6 +2880,25 @@ public:
     Put(")");
   }
   void Unparse(const FnACCNoCopybackClause &) { Word("NO_COPYBACK"); }
+  void Unparse(const FnACCMatmulPrecision &x) {
+    switch (x) {
+    case FnACCMatmulPrecision::IEEE:
+      Word("IEEE");
+      break;
+    case FnACCMatmulPrecision::TF32:
+      Word("TF32");
+      break;
+    case FnACCMatmulPrecision::TF32x3:
+      Word("TF32X3");
+      break;
+    }
+  }
+  void Unparse(const FnACCMatmulPrecisionClause &x) {
+    Word("MATMUL_PRECISION");
+    Put("(");
+    Walk(x.v);
+    Put(")");
+  }
   void Unparse(const FnACCPackClause &x) {
     Word("PACK");
     Put("(");

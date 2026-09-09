@@ -46,11 +46,14 @@ end subroutine
 ! TTIR: tt.make_range {start = 0 : i32, end = 4 : i32}
 
 ! TTIR: scf.for
-! TTIR: tt.load
+! TTIR: %a_zero = tt.splat %zero : f64 -> tensor<8x4xf64>
+! TTIR: %b_zero = tt.splat %zero : f64 -> tensor<4x8xf64>
+! TTIR: tt.load %a_ptrs, %mask_a, %a_zero
 ! TTIR-SAME: tensor<8x4x!tt.ptr<f64>>
-! TTIR: tt.load
+! TTIR: tt.load %b_ptrs, %mask_b, %b_zero
 ! TTIR-SAME: tensor<4x8x!tt.ptr<f64>>
 ! TTIR: tt.dot
+! TTIR-SAME: inputPrecision = ieee
 ! TTIR-SAME: tensor<8x4xf64>
 ! TTIR-SAME: tensor<4x8xf64>
 ! TTIR-SAME: tensor<8x8xf64>

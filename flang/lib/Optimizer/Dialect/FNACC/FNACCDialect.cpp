@@ -67,6 +67,15 @@ llvm::LogicalResult fir::fnacc::LaunchOp::verify() {
       return emitOpError("pack target must be 0 (host) or 1 (device)");
   }
 
+  if (auto attr = (*this)->getAttr("fnacc.matmul_precision")) {
+    auto precision = mlir::dyn_cast<mlir::StringAttr>(attr);
+    if (!precision ||
+        (precision.getValue() != "ieee" && precision.getValue() != "tf32" &&
+         precision.getValue() != "tf32x3"))
+      return emitOpError(
+          "matmul_precision must be the string ieee, tf32, or tf32x3");
+  }
+
   auto reductionSlots =
       (*this)->getAttrOfType<mlir::DenseI32ArrayAttr>("fnacc.reduction_slots");
   auto reductionOps =

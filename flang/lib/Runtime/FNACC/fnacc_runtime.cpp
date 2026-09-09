@@ -1,6 +1,20 @@
 #include <cstddef>
 #include <cstdint>
 
+// For profiling
+// Optional instrumentation; disabled builds do not require NVTX headers.
+#if defined(FNACC_ENABLE_NVTX) && FNACC_ENABLE_NVTX
+#include <nvtx3/nvtx3.hpp>
+#define FNACC_PROFILE_SCOPE(name) \
+  nvtx3::scoped_range fnaccProfileRange { name }
+#define FNACC_PROFILE_PUSH(name) nvtxRangePushA(name)
+#define FNACC_PROFILE_POP() nvtxRangePop()
+#else
+#define FNACC_PROFILE_SCOPE(name) ((void)0)
+#define FNACC_PROFILE_PUSH(name) ((void)0)
+#define FNACC_PROFILE_POP() ((void)0)
+#endif
+
 #if defined(FNACC_RUNTIME_USE_HIP)
 #include <hip/hip_runtime_api.h>
 
@@ -121,6 +135,12 @@ static CUresult cuMemcpyDtoH(
   return hipMemcpy(destination, reinterpret_cast<const void *>(source), bytes,
       hipMemcpyDeviceToHost);
 }
+static CUresult cuMemcpyDtoDAsync(CUdeviceptr destination, CUdeviceptr source,
+    std::size_t bytes, CUstream stream) {
+  return hipMemcpyAsync(reinterpret_cast<void *>(destination),
+      reinterpret_cast<const void *>(source), bytes, hipMemcpyDeviceToDevice,
+      stream);
+}
 static CUresult cuLaunchKernel(CUfunction function, unsigned gridX,
     unsigned gridY, unsigned gridZ, unsigned blockX, unsigned blockY,
     unsigned blockZ, unsigned sharedBytes, CUstream stream, void **kernelParams,
@@ -144,8 +164,10 @@ static constexpr const char *FNACC_ACCELERATOR_NAME = "CUDA";
 
 #include <fstream>
 #include <limits>
+#include <memory>
 #include <mutex>
 #include <optional>
+#include <shared_mutex>
 #include <sstream>
 #include <string>
 #include <type_traits>
@@ -155,16 +177,24 @@ static constexpr const char *FNACC_ACCELERATOR_NAME = "CUDA";
 
 namespace {
 
-// This lock protects embedded registration, context selection, loaded-module
-// and function caches, device allocations, and reduction workspaces. Embedded
-// payload constructors can run before this translation unit's dynamic
-// initialization, so construct it on first use regardless of final link order.
+// Lock order: lifetime -> registry -> (release registry) -> context.
+// The shared lifetime lock prevents cleanup while an operation owns a state
+// pointer. No GPU wait or transfer holds the registry lock on a warm context.
 static std::recursive_mutex &fnaccGetRuntimeMutex() {
   static std::recursive_mutex mutex;
   return mutex;
 }
-#define FNACC_RUNTIME_GUARD() \
-  std::lock_guard<std::recursive_mutex> fnaccRuntimeLock(fnaccGetRuntimeMutex())
+static std::shared_mutex &fnaccGetLifetimeMutex() {
+  static std::shared_mutex mutex;
+  return mutex;
+}
+class FNACCOperationGuard;
+#define FNACC_RUNTIME_GUARD() FNACCOperationGuard fnaccRuntimeLock
+#define FNACC_REGISTRY_GUARD() \
+  std::unique_lock<std::shared_mutex> fnaccLifetimeLock( \
+      fnaccGetLifetimeMutex()); \
+  std::lock_guard<std::recursive_mutex> fnaccRegistryLock( \
+      fnaccGetRuntimeMutex())
 
 static void fnaccCudaCheck(
     CUresult result, const char *expr, const char *file, int line) {
@@ -214,6 +244,14 @@ static std::size_t fnaccCheckedAdd(
   return a + b;
 }
 
+// Properties belong to a loaded function in one context, not to a global
+// kernel id. The context owns and invalidates the cache with its modules.
+struct FNACCFunctionProperties {
+  int maxThreadsPerBlock = 0;
+  unsigned configuredDynamicSharedBytes = 0;
+};
+static FNACCFunctionProperties &fnaccGetFunctionProperties(CUfunction fn);
+
 static void fnaccConfigureDynamicSharedMemory(
     CUfunction fn, int32_t kernelId, unsigned dynamicSharedBytes) {
   if (dynamicSharedBytes == 0)
@@ -222,6 +260,9 @@ static void fnaccConfigureDynamicSharedMemory(
   // 48 KiB is usually available without opt-in on many NVIDIA GPUs.
   // Above that, opt in if the device/function supports it.
   if (dynamicSharedBytes > 49152) {
+    auto &properties = fnaccGetFunctionProperties(fn);
+    if (dynamicSharedBytes <= properties.configuredDynamicSharedBytes)
+      return;
     CUresult result =
         cuFuncSetAttribute(fn, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
             static_cast<int>(dynamicSharedBytes));
@@ -239,6 +280,7 @@ static void fnaccConfigureDynamicSharedMemory(
           desc ? desc : "<no description>");
       std::abort();
     }
+    properties.configuredDynamicSharedBytes = dynamicSharedBytes;
   }
 }
 
@@ -278,9 +320,11 @@ static std::size_t fnaccCheckedBytes2D(
 
 static void fnaccValidateCudaBlockSize(
     CUfunction fn, int32_t kernelId, unsigned cudaBlockX) {
-  int maxThreadsPerBlock = 0;
-  FNACC_CUDA_CHECK(cuFuncGetAttribute(
-      &maxThreadsPerBlock, CU_FUNC_ATTRIBUTE_MAX_THREADS_PER_BLOCK, fn));
+  auto &properties = fnaccGetFunctionProperties(fn);
+  if (properties.maxThreadsPerBlock == 0)
+    FNACC_CUDA_CHECK(cuFuncGetAttribute(&properties.maxThreadsPerBlock,
+        CU_FUNC_ATTRIBUTE_MAX_THREADS_PER_BLOCK, fn));
+  int maxThreadsPerBlock = properties.maxThreadsPerBlock;
 
   if (cudaBlockX > static_cast<unsigned>(maxThreadsPerBlock)) {
     std::fprintf(stderr,
@@ -846,6 +890,8 @@ struct FNACCKernelDesc {
   int32_t id = -1;
   std::string name;
   std::string kind = "binary";
+  bool isReduction = false;
+  bool isMatmul = false;
 
   int32_t rank = 1;
 
@@ -886,6 +932,11 @@ struct FNACCKernelDesc {
   // Ordered, source-visible device parameters used by launch ABI v2.
   std::vector<FNACCKernelParameterDesc> parameters;
 
+  // Derived only from validated, immutable v2 metadata. Device residency and
+  // actual array/scalar bindings are deliberately not cached here.
+  std::vector<std::optional<int32_t>> explicitArrayTargets;
+  std::vector<std::size_t> scalarParameterBytes;
+
   int32_t ptxIndex = 0;
   std::string ptxFile;
 };
@@ -905,6 +956,41 @@ static std::size_t fnaccScalarParameterBytes(const std::string &type) {
 static bool fnaccIsPointerParameterType(const std::string &type) {
   return type.size() > 5 && type.compare(0, 4, "ptr<") == 0 &&
       type.back() == '>';
+}
+
+// Build once after metadata validation, before publishing the descriptor.
+static void fnaccPrepareVariadicMetadata(FNACCKernelDesc &desc) {
+  desc.isReduction = desc.kind == "reduction_sum1d" ||
+      desc.kind == "reduction_dot1d" || desc.kind == "reduction_product1d" ||
+      desc.kind == "reduction_min1d" || desc.kind == "reduction_max1d" ||
+      desc.kind == "reduction_multi2d";
+  desc.isMatmul = desc.kind == "matmul2d";
+  desc.explicitArrayTargets.assign(desc.arrayCount, std::nullopt);
+  desc.scalarParameterBytes.assign(desc.parameters.size(), 0);
+  for (const FNACCKernelParameterDesc &parameter : desc.parameters) {
+    if (parameter.role == FNACCKernelParameterRole::Scalar)
+      desc.scalarParameterBytes[parameter.slot] =
+          fnaccScalarParameterBytes(parameter.type);
+    if (parameter.role != FNACCKernelParameterRole::Read &&
+        parameter.role != FNACCKernelParameterRole::Write &&
+        parameter.role != FNACCKernelParameterRole::ReadWrite)
+      continue;
+    auto &target = desc.explicitArrayTargets[parameter.arrayIndex];
+    for (const FNACCPackEntry &entry : desc.pack) {
+      if (entry.kernelArgSlot != parameter.slot)
+        continue;
+      if (target && *target != entry.target) {
+        std::fprintf(stderr,
+            "FNACC error: conflicting PACK targets for v2 array %d in "
+            "kernel id %d\n",
+            parameter.arrayIndex, desc.id);
+        std::abort();
+      }
+      target = entry.target;
+      // Match the existing first-entry lookup for each parameter slot.
+      break;
+    }
+  }
 }
 
 static void fnaccValidateVariadicKernelMetadata(const FNACCKernelDesc &desc) {
@@ -1089,11 +1175,16 @@ struct FNACCReductionWorkspace {
   FNACCDeviceAllocation scratch;
   FNACCReductionBufferStats scratchStats;
 
+  // Packed final results let multi-reductions share one host transfer.
+  FNACCDeviceAllocation results;
+  FNACCReductionBufferStats resultStats;
   uint64_t primaryLaunches = 0;
   uint64_t stageLaunches = 0;
 };
 
 struct FNACCContextState {
+  std::shared_ptr<std::recursive_mutex> mutex =
+      std::make_shared<std::recursive_mutex>();
   CUdevice device = 0;
   CUcontext context = nullptr;
   bool retainedPrimaryContext = false;
@@ -1101,6 +1192,8 @@ struct FNACCContextState {
   CUevent completionEvent = nullptr;
   std::vector<CUmodule> modules;
   std::unordered_map<int32_t, CUfunction> functionCache;
+  std::unordered_map<CUfunction, FNACCFunctionProperties> functionProperties;
+  bool pendingResidentLaunches = false;
   std::unordered_map<void *, FNACCDeviceAllocation> deviceCache;
   std::vector<FNACCDataRegionFrame> dataRegions;
   FNACCReductionWorkspace reductionWorkspace;
@@ -1118,7 +1211,6 @@ struct FNACCKernelRegistry {
   // when two contexts select the same CUDA device.
   std::unordered_map<CUcontext, FNACCContextState> contexts;
   std::unordered_map<int, CUcontext> primaryContexts;
-  CUcontext activeContext = nullptr;
 };
 
 struct FNACCEmbeddedKernelBundle {
@@ -1142,14 +1234,68 @@ static std::vector<FNACCEmbeddedKernelBundle> &fnaccGetEmbeddedKernelBundles() {
 
 static FNACCKernelRegistry fnaccRegistry;
 
+static thread_local FNACCContextState *fnaccActiveState = nullptr;
+static thread_local CUcontext fnaccActiveContext = nullptr;
 static FNACCContextState &fnaccActiveContextState() {
-  auto it = fnaccRegistry.contexts.find(fnaccRegistry.activeContext);
-  if (it == fnaccRegistry.contexts.end()) {
+  if (!fnaccActiveState) {
     std::fprintf(stderr, "FNACC error: no active CUDA context state\n");
     std::abort();
   }
-  return it->second;
+  return *fnaccActiveState;
 }
+
+static bool fnaccReadEnvFlag(const char *name) {
+  const char *value = std::getenv(name);
+  return value && value[0] != '\0' && std::strcmp(value, "0") != 0;
+}
+class FNACCOperationGuard;
+static thread_local FNACCOperationGuard *fnaccOperation = nullptr;
+class FNACCOperationGuard {
+public:
+  FNACCOperationGuard() : parent(fnaccOperation) {
+    if (!parent) {
+      lifetime = std::shared_lock<std::shared_mutex>(fnaccGetLifetimeMutex());
+      registry = std::unique_lock<std::recursive_mutex>(fnaccGetRuntimeMutex());
+      debug = fnaccReadEnvFlag("FNACC_DEBUG");
+      asyncResident = fnaccReadEnvFlag("FNACC_ASYNC_RESIDENT");
+      reductionStats = fnaccReadEnvFlag("FNACC_REDUCTION_STATS");
+    } else {
+      debug = parent->debug;
+      asyncResident = parent->asyncResident;
+      reductionStats = parent->reductionStats;
+    }
+    fnaccOperation = this;
+  }
+  ~FNACCOperationGuard() {
+    fnaccOperation = parent;
+    if (!parent) {
+      fnaccActiveState = nullptr;
+      fnaccActiveContext = nullptr;
+    }
+  }
+  FNACCOperationGuard(const FNACCOperationGuard &) = delete;
+  FNACCOperationGuard &operator=(const FNACCOperationGuard &) = delete;
+  void select(FNACCContextState &state) {
+    if (parent) {
+      parent->select(state);
+      return;
+    }
+    if (!context.owns_lock()) {
+      // Release before waiting: another context must remain able to launch.
+      registry.unlock();
+      context = std::unique_lock<std::recursive_mutex>(*state.mutex);
+    }
+    fnaccActiveState = &state;
+    fnaccActiveContext = state.context;
+  }
+  bool debug = false, asyncResident = false, reductionStats = false;
+
+private:
+  FNACCOperationGuard *parent;
+  std::shared_lock<std::shared_mutex> lifetime;
+  std::unique_lock<std::recursive_mutex> registry;
+  std::unique_lock<std::recursive_mutex> context;
+};
 
 struct FNACCDeviceArg {
   CUdeviceptr ptr = 0;
@@ -1158,44 +1304,75 @@ struct FNACCDeviceArg {
   int32_t slot = -1;
 };
 
-static bool fnaccEnvFlagEnabled(const char *name) {
-  const char *value = std::getenv(name);
-  return value && value[0] != '\0' && std::strcmp(value, "0") != 0;
+static FNACCFunctionProperties &fnaccGetFunctionProperties(CUfunction fn) {
+  return fnaccActiveContextState().functionProperties[fn];
 }
 
-static bool fnaccDebugEnabled() { return fnaccEnvFlagEnabled("FNACC_DEBUG"); }
+static bool fnaccEnvFlagEnabled(const char *name) {
+  if (fnaccOperation) {
+    if (std::strcmp(name, "FNACC_DEBUG") == 0)
+      return fnaccOperation->debug;
+    if (std::strcmp(name, "FNACC_ASYNC_RESIDENT") == 0)
+      return fnaccOperation->asyncResident;
+    if (std::strcmp(name, "FNACC_REDUCTION_STATS") == 0)
+      return fnaccOperation->reductionStats;
+  }
+  return fnaccReadEnvFlag(name);
+}
+
+static bool fnaccDebugEnabled() {
+  return fnaccOperation ? fnaccOperation->debug
+                        : fnaccReadEnvFlag("FNACC_DEBUG");
+}
 
 static bool fnaccReductionStatsEnabled() {
   return fnaccEnvFlagEnabled("FNACC_REDUCTION_STATS");
 }
 
+// Reuse context selection only inside a guarded runtime call. Never retain
+// this decision across calls: the caller may change its context or device.
+class FNACCCurrentContextGuard;
+static thread_local FNACCCurrentContextGuard *fnaccContextScope = nullptr;
+
 class FNACCCurrentContextGuard {
 public:
-  FNACCCurrentContextGuard() {
-    CUresult result = cuCtxGetCurrent(&previousContext);
-
-    if (result == CUDA_ERROR_NOT_INITIALIZED) {
-      previousContext = nullptr;
-      return;
+  FNACCCurrentContextGuard() : parent(fnaccContextScope) {
+    if (parent && parent->selectedContext) {
+      previousContext = selectedContext = parent->selectedContext;
+    } else {
+      CUresult result = cuCtxGetCurrent(&previousContext);
+      if (result == CUDA_ERROR_NOT_INITIALIZED)
+        previousContext = nullptr;
+      else
+        FNACC_CUDA_CHECK(result);
     }
-
-    FNACC_CUDA_CHECK(result);
+    fnaccContextScope = this;
   }
+
+  FNACCCurrentContextGuard(const FNACCCurrentContextGuard &) = delete;
+  FNACCCurrentContextGuard &operator=(
+      const FNACCCurrentContextGuard &) = delete;
 
   ~FNACCCurrentContextGuard() {
+    fnaccContextScope = parent;
+    if (selectedContext && selectedContext == previousContext)
+      return;
     CUresult result = cuCtxSetCurrent(previousContext);
-
     if (result == CUDA_ERROR_NOT_INITIALIZED)
       return;
-
-    if (result != CUDA_SUCCESS && fnaccDebugEnabled()) {
+    if (result != CUDA_SUCCESS && fnaccDebugEnabled())
       std::fprintf(stderr,
           "FNACC warning: failed to restore the caller's CUDA context\n");
-    }
   }
 
+  bool isSelected() const { return selectedContext != nullptr; }
+  CUcontext callerContext() const { return previousContext; }
+  void select(CUcontext context) { selectedContext = context; }
+
 private:
+  FNACCCurrentContextGuard *parent;
   CUcontext previousContext{nullptr};
+  CUcontext selectedContext{nullptr};
 };
 
 static FNACCReductionWorkspace fnaccAggregateReductionWorkspaceStats() {
@@ -1582,8 +1759,10 @@ fnaccParseKernelDescsFromJson(const std::string &json) {
           desc.id);
       std::abort();
     }
-    if (desc.launchAbiVersion == 2)
+    if (desc.launchAbiVersion == 2) {
       fnaccValidateVariadicKernelMetadata(desc);
+      fnaccPrepareVariadicMetadata(desc);
+    }
 
     for (const auto &entry : result) {
       if (entry.second.name == desc.name) {
@@ -1604,7 +1783,7 @@ fnaccParseKernelDescsFromJson(const std::string &json) {
 }
 
 static void fnaccCleanup() {
-  FNACC_RUNTIME_GUARD();
+  FNACC_REGISTRY_GUARD();
   if (!fnaccRegistry.initialized)
     return;
 
@@ -1616,19 +1795,22 @@ static void fnaccCleanup() {
     FNACCReductionWorkspace &workspace = state.reductionWorkspace;
     if (state.context)
       cuCtxSetCurrent(state.context);
+    if (state.stream)
+      cuStreamSynchronize(state.stream);
     if (workspace.partials.ptr)
       cuMemFree(workspace.partials.ptr);
     if (workspace.scratch.ptr)
       cuMemFree(workspace.scratch.ptr);
+    if (workspace.results.ptr)
+      cuMemFree(workspace.results.ptr);
 
-    if (state.stream)
-      cuStreamSynchronize(state.stream);
     for (auto &allocation : state.deviceCache)
       if (allocation.second.ptr)
         cuMemFree(allocation.second.ptr);
     state.deviceCache.clear();
     state.dataRegions.clear();
     state.functionCache.clear();
+    state.functionProperties.clear();
     for (CUmodule module : state.modules)
       if (module)
         cuModuleUnload(module);
@@ -1645,7 +1827,7 @@ static void fnaccCleanup() {
 
   fnaccRegistry.contexts.clear();
   fnaccRegistry.primaryContexts.clear();
-  fnaccRegistry.activeContext = nullptr;
+  fnaccActiveContext = nullptr;
   fnaccRegistry.ptxTexts.clear();
   fnaccRegistry.embeddedImageKinds.clear();
   fnaccRegistry.kernels.clear();
@@ -2056,6 +2238,14 @@ static FNACCContextState &fnaccGetOrCreatePrimaryContextState(int ordinal) {
   FNACC_CUDA_CHECK(cuDeviceGet(&device, ordinal));
   FNACC_CUDA_CHECK(cuDevicePrimaryCtxRetain(&context, device));
 
+  // A primary context may already have been registered through caller-owned
+  // mode. Retaining it must not create a duplicate state or a second stream.
+  auto existing = fnaccRegistry.contexts.find(context);
+  if (existing != fnaccRegistry.contexts.end()) {
+    existing->second.retainedPrimaryContext = true;
+    fnaccRegistry.primaryContexts.emplace(ordinal, context);
+    return existing->second;
+  }
   FNACCContextState &state =
       fnaccCreateContextState(device, context, /*retainedPrimaryContext=*/true);
   fnaccRegistry.primaryContexts.emplace(ordinal, context);
@@ -2063,6 +2253,10 @@ static FNACCContextState &fnaccGetOrCreatePrimaryContextState(int ordinal) {
 }
 
 static void fnaccEnsureCurrentContext() {
+  // The outer operation protects registry selection, then transfers ownership
+  // to the selected context lock. Nested delegates reuse that selection.
+  if (fnaccContextScope && fnaccContextScope->isSelected())
+    return;
   fnaccEnsureInitialized();
 
   if (fnaccEnvFlagEnabled("FNACC_USE_CURRENT_CONTEXT")) {
@@ -2081,14 +2275,19 @@ static void fnaccEnsureCurrentContext() {
         ? known->second
         : fnaccCreateContextState(
               device, context, /*retainedPrimaryContext=*/false);
-    fnaccRegistry.activeContext = state.context;
+    fnaccOperation->select(state);
+    if (fnaccContextScope)
+      fnaccContextScope->select(state.context);
     return;
   }
 
   int ordinal = fnaccGetDeviceOrdinal();
   FNACCContextState &state = fnaccGetOrCreatePrimaryContextState(ordinal);
-  FNACC_CUDA_CHECK(cuCtxSetCurrent(state.context));
-  fnaccRegistry.activeContext = state.context;
+  if (!fnaccContextScope || fnaccContextScope->callerContext() != state.context)
+    FNACC_CUDA_CHECK(cuCtxSetCurrent(state.context));
+  fnaccOperation->select(state);
+  if (fnaccContextScope)
+    fnaccContextScope->select(state.context);
 
   if (fnaccDebugEnabled())
     std::fprintf(stderr,
@@ -2108,15 +2307,47 @@ static void fnaccWaitForStream(CUstream stream, CUevent completionEvent) {
 static void fnaccWaitForRuntimeStream() {
   FNACCContextState &state = fnaccActiveContextState();
   fnaccWaitForStream(state.stream, state.completionEvent);
+  state.pendingResidentLaunches = false;
 }
 
 static void fnaccSynchronizeActiveContext() {
-  if (!fnaccRegistry.activeContext)
+  if (!fnaccActiveContext)
     return;
 
   FNACCContextState &state{fnaccActiveContextState()};
-  if (state.stream)
+  if (state.stream) {
     fnaccWaitForStream(state.stream, state.completionEvent);
+    state.pendingResidentLaunches = false;
+  }
+}
+
+// All host transfers must order against the non-default runtime stream. This
+// also covers UPDATE DEVICE overwriting an input of a queued resident launch.
+static void fnaccWaitForPendingResidentLaunches() {
+  if (fnaccActiveContextState().pendingResidentLaunches)
+    fnaccWaitForRuntimeStream();
+}
+
+static CUresult fnaccMemcpyHtoD(
+    CUdeviceptr dst, const void *src, std::size_t bytes) {
+  fnaccWaitForPendingResidentLaunches();
+  return cuMemcpyHtoD(dst, src, bytes);
+}
+
+static CUresult fnaccMemcpyDtoH(void *dst, CUdeviceptr src, std::size_t bytes) {
+  fnaccWaitForPendingResidentLaunches();
+  return cuMemcpyDtoH(dst, src, bytes);
+}
+
+// Opt-in throughput mode. Default launches still complete synchronously.
+// Only allocations retained in the runtime cache may outlive a launch call;
+// host outputs, temporaries, and scalar reductions retain their waits.
+static void fnaccCompleteArrayLaunch(bool allArgumentsCached) {
+  if (allArgumentsCached && fnaccEnvFlagEnabled("FNACC_ASYNC_RESIDENT")) {
+    fnaccActiveContextState().pendingResidentLaunches = true;
+    return;
+  }
+  fnaccWaitForRuntimeStream();
 }
 
 extern "C" void __fnacc_wait() {
@@ -2158,8 +2389,10 @@ static int32_t fnaccTritonHiddenPtrArgCount(int32_t kernelId) {
   return 2;
 }
 
-static void fnaccValidateSupportedHiddenPtrArgCount(int32_t kernelId) {
-  int32_t count = fnaccTritonHiddenPtrArgCount(kernelId);
+static void fnaccValidateSupportedHiddenPtrArgCount(
+    int32_t kernelId, const FNACCKernelDesc *desc = nullptr) {
+  int32_t count =
+      desc ? desc->tritonHiddenPtrArgs : fnaccTritonHiddenPtrArgCount(kernelId);
 
   if (count == 2)
     return;
@@ -2221,30 +2454,13 @@ static int32_t fnaccEffectiveWriteTargetForSlot(
 
 static int32_t fnaccEffectivePackTargetForArray(
     const FNACCKernelDesc *desc, int32_t arrayIndex, void *hostPtr) {
-  std::optional<int32_t> explicitTarget;
-  if (desc) {
-    for (const FNACCKernelParameterDesc &parameter : desc->parameters) {
-      if (parameter.arrayIndex != arrayIndex ||
-          (parameter.role != FNACCKernelParameterRole::Read &&
-              parameter.role != FNACCKernelParameterRole::Write &&
-              parameter.role != FNACCKernelParameterRole::ReadWrite))
-        continue;
-      std::optional<int32_t> candidate =
-          fnaccExplicitPackTargetForSlot(desc, parameter.slot);
-      if (!candidate)
-        continue;
-      if (explicitTarget && *explicitTarget != *candidate) {
-        std::fprintf(stderr,
-            "FNACC error: conflicting PACK targets for v2 array %d in "
-            "kernel id %d\n",
-            arrayIndex, desc->id);
-        std::abort();
-      }
-      explicitTarget = candidate;
-    }
+  if (desc && arrayIndex >= 0 &&
+      static_cast<std::size_t>(arrayIndex) <
+          desc->explicitArrayTargets.size()) {
+    const auto &target = desc->explicitArrayTargets[arrayIndex];
+    if (target)
+      return *target;
   }
-  if (explicitTarget)
-    return *explicitTarget;
   if (fnaccHostPointerIsPresentOnDevice(hostPtr))
     return FNACC_PACK_TARGET_DEVICE;
   return FNACC_PACK_TARGET_HOST;
@@ -2275,7 +2491,7 @@ static FNACCDeviceArg fnaccMakeTemporaryDeviceBuffer(void *hostPtr,
   FNACC_CUDA_CHECK(cuMemAlloc(&arg.ptr, bytes));
 
   if (copyHostToDevice)
-    FNACC_CUDA_CHECK(cuMemcpyHtoD(arg.ptr, hostPtr, bytes));
+    FNACC_CUDA_CHECK(fnaccMemcpyHtoD(arg.ptr, hostPtr, bytes));
 
   if (fnaccDebugEnabled()) {
     std::fprintf(stderr,
@@ -2288,16 +2504,18 @@ static FNACCDeviceArg fnaccMakeTemporaryDeviceBuffer(void *hostPtr,
   return arg;
 }
 
+using FNACCDeviceCache = std::unordered_map<void *, FNACCDeviceAllocation>;
 static FNACCDeviceArg fnaccGetCachedDeviceBuffer(void *hostPtr,
     std::size_t bytes, bool copyHostToDeviceOnMiss, int32_t slot,
-    const char *role) {
+    const char *role,
+    std::optional<FNACCDeviceCache::iterator> known = std::nullopt) {
   FNACCDeviceArg arg;
   arg.cached = true;
   arg.target = FNACC_PACK_TARGET_DEVICE;
   arg.slot = slot;
 
   auto &cache = fnaccActiveContextState().deviceCache;
-  auto it = cache.find(hostPtr);
+  auto it = known ? *known : cache.find(hostPtr);
 
   bool needAllocate = false;
 
@@ -2331,7 +2549,7 @@ static FNACCDeviceArg fnaccGetCachedDeviceBuffer(void *hostPtr,
     FNACC_CUDA_CHECK(cuMemAlloc(&allocation.ptr, bytes));
 
     if (copyHostToDeviceOnMiss)
-      FNACC_CUDA_CHECK(cuMemcpyHtoD(allocation.ptr, hostPtr, bytes));
+      FNACC_CUDA_CHECK(fnaccMemcpyHtoD(allocation.ptr, hostPtr, bytes));
 
     auto inserted = cache.emplace(hostPtr, allocation);
     arg.ptr = inserted.first->second.ptr;
@@ -2381,11 +2599,30 @@ static FNACCDeviceArg fnaccPrepareWriteBuffer(
       /*copyHostToDevice=*/false, slot, "write");
 }
 
+// Resolve explicit policy, live presence, and allocation in one cache lookup.
+static FNACCDeviceArg fnaccPrepareArrayBuffer(const FNACCKernelDesc *desc,
+    int32_t slot, void *host, std::size_t bytes, int32_t flags) {
+  auto &cache = fnaccActiveContextState().deviceCache;
+  auto it = cache.find(host);
+  const auto &explicitTarget = desc->explicitArrayTargets[slot];
+  bool present = it != cache.end() && it->second.ptr && it->second.bytes;
+  int32_t target = explicitTarget ? *explicitTarget
+      : present                   ? FNACC_PACK_TARGET_DEVICE
+                                  : FNACC_PACK_TARGET_HOST;
+  if ((flags & 2) && !desc->copyBackWrites)
+    target = FNACC_PACK_TARGET_DEVICE;
+  bool read = (flags & 1) != 0;
+  if (target == FNACC_PACK_TARGET_DEVICE)
+    return fnaccGetCachedDeviceBuffer(
+        host, bytes, read, slot, read ? "read" : "write", it);
+  return fnaccMakeTemporaryDeviceBuffer(
+      host, bytes, read, slot, read ? "read" : "write");
+}
+
 static void fnaccCopyBackWriteBuffer(
     void *hostPtr, const FNACCDeviceArg &arg, std::size_t bytes) {
-  // Conservative semantics: always copy writes back to host after launch.
-  // Even target=device remains host-visible for now.
-  FNACC_CUDA_CHECK(cuMemcpyDtoH(hostPtr, arg.ptr, bytes));
+  // Callers invoke this only when host visibility is required.
+  FNACC_CUDA_CHECK(fnaccMemcpyDtoH(hostPtr, arg.ptr, bytes));
 
   if (fnaccDebugEnabled()) {
     std::fprintf(stderr,
@@ -2453,9 +2690,10 @@ static CUfunction getKernelFunction(int32_t kernelId) {
   if (cacheIt != state.functionCache.end())
     return cacheIt->second;
 
+  const FNACCKernelDesc *desc = fnaccLookupKernelDesc(kernelId);
   std::string kernelName;
 
-  if (const FNACCKernelDesc *desc = fnaccLookupKernelDesc(kernelId)) {
+  if (desc) {
     kernelName = desc->name;
   } else {
     std::fprintf(
@@ -2467,8 +2705,6 @@ static CUfunction getKernelFunction(int32_t kernelId) {
     std::fprintf(stderr, "FNACC: looking up CUDA kernel id %d as symbol '%s'\n",
         kernelId, kernelName.c_str());
   }
-
-  const FNACCKernelDesc *desc = fnaccLookupKernelDesc(kernelId);
 
   std::size_t moduleIndex = 0;
   if (desc)
@@ -2490,8 +2726,8 @@ static CUfunction getKernelFunction(int32_t kernelId) {
   return fn;
 }
 
-static unsigned fnaccCudaThreadsPerCTA(int32_t kernelId) {
-  if (const FNACCKernelDesc *desc = fnaccLookupKernelDesc(kernelId)) {
+static unsigned fnaccCudaThreadsPerCTA(const FNACCKernelDesc *desc) {
+  if (desc) {
     if (desc->cudaThreadsPerCTA > 0)
       return static_cast<unsigned>(desc->cudaThreadsPerCTA);
 
@@ -2502,9 +2738,13 @@ static unsigned fnaccCudaThreadsPerCTA(int32_t kernelId) {
   return 32;
 }
 
-static void fnaccValidateHostLaunchAgainstDesc(int32_t kernelId, int32_t rank,
-    int32_t blockX, int32_t blockY, int32_t blockZ) {
-  const FNACCKernelDesc *desc = fnaccLookupKernelDesc(kernelId);
+static unsigned fnaccCudaThreadsPerCTA(int32_t kernelId) {
+  return fnaccCudaThreadsPerCTA(fnaccLookupKernelDesc(kernelId));
+}
+
+static void fnaccValidateHostLaunchAgainstDesc(const FNACCKernelDesc *desc,
+    int32_t kernelId, int32_t rank, int32_t blockX, int32_t blockY,
+    int32_t blockZ) {
   if (!desc)
     return;
 
@@ -2524,6 +2764,12 @@ static void fnaccValidateHostLaunchAgainstDesc(int32_t kernelId, int32_t rank,
         kernelId);
     std::abort();
   }
+}
+
+static void fnaccValidateHostLaunchAgainstDesc(int32_t kernelId, int32_t rank,
+    int32_t blockX, int32_t blockY, int32_t blockZ) {
+  fnaccValidateHostLaunchAgainstDesc(
+      fnaccLookupKernelDesc(kernelId), kernelId, rank, blockX, blockY, blockZ);
 }
 
 static unsigned fnaccCdiv(std::int64_t x, std::int64_t y, const char *what) {
@@ -2611,7 +2857,7 @@ static void fnaccValidateCommonLaunchInputs(const char *entryName, int32_t rank,
 extern "C" void __fnacc_validate_contiguous_desc(void *hostPtr,
     int64_t elementBytes, int32_t rank, int64_t extent0, int64_t extent1,
     int64_t extent2, int64_t stride0, int64_t stride1, int64_t stride2) {
-  FNACC_RUNTIME_GUARD();
+  // Pure descriptor validation needs no runtime lock.
   if (!hostPtr && extent0 != 0 && extent1 != 0 && extent2 != 0) {
     std::fprintf(
         stderr, "FNACC error: launch descriptor has a null base pointer\n");
@@ -2626,7 +2872,7 @@ extern "C" void __fnacc_validate_launch_desc(void *hostPtr,
     int64_t lower2, int64_t extent0, int64_t extent1, int64_t extent2,
     int64_t stride0, int64_t stride1, int64_t stride2, int32_t expectedRank,
     int64_t expectedExtent0, int64_t expectedExtent1, int64_t expectedExtent2) {
-  FNACC_RUNTIME_GUARD();
+  // Pure descriptor validation needs no runtime lock.
 
   fnaccValidateContiguousDescriptor("FNACC kernel launch", elementBytes, rank,
       extent0, extent1, extent2, stride0, stride1, stride2);
@@ -2781,7 +3027,7 @@ static FNACCDeviceAllocation &fnaccGetOrCreateCachedAllocation(void *hostPtr,
     FNACC_CUDA_CHECK(cuMemAlloc(&allocation.ptr, bytes));
 
     if (copyHostToDeviceOnCreateOrResize)
-      FNACC_CUDA_CHECK(cuMemcpyHtoD(allocation.ptr, hostPtr, bytes));
+      FNACC_CUDA_CHECK(fnaccMemcpyHtoD(allocation.ptr, hostPtr, bytes));
   }
 
   auto inserted = cache.emplace(hostPtr, allocation);
@@ -2923,7 +3169,7 @@ static void fnaccCopyoutDataRegionAllocation(
   // reference. The host is updated only by the last owning region.
   if (allocation.dataRegionReferences == 1) {
     if (bytes != 0)
-      FNACC_CUDA_CHECK(cuMemcpyDtoH(hostPtr, allocation.ptr, bytes));
+      FNACC_CUDA_CHECK(fnaccMemcpyDtoH(hostPtr, allocation.ptr, bytes));
   } else if (fnaccDebugEnabled()) {
     std::fprintf(stderr,
         "FNACC: %s deferred host copy for host=%p; %zu enclosing data "
@@ -3334,7 +3580,7 @@ extern "C" void __fnacc_update_device_bytes(void *hostPtr, int64_t bytesValue) {
   FNACCDeviceAllocation &allocation = fnaccGetOrCreateCachedAllocation(hostPtr,
       bytes, /*copyHostToDeviceOnCreateOrResize=*/false, "update_device_bytes");
 
-  FNACC_CUDA_CHECK(cuMemcpyHtoD(allocation.ptr, hostPtr, bytes));
+  FNACC_CUDA_CHECK(fnaccMemcpyHtoD(allocation.ptr, hostPtr, bytes));
 
   if (fnaccDebugEnabled()) {
     std::fprintf(stderr,
@@ -3390,7 +3636,7 @@ extern "C" void __fnacc_update_host_bytes(void *hostPtr, int64_t bytesValue) {
     std::abort();
   }
 
-  FNACC_CUDA_CHECK(cuMemcpyDtoH(hostPtr, it->second.ptr, bytes));
+  FNACC_CUDA_CHECK(fnaccMemcpyDtoH(hostPtr, it->second.ptr, bytes));
 
   if (fnaccDebugEnabled()) {
     std::fprintf(stderr,
@@ -3430,7 +3676,7 @@ extern "C" void __fnacc_update_device_desc(void *hostPtr, int64_t elementBytes,
   FNACCDeviceAllocation &allocation = fnaccGetOrCreateCachedAllocation(hostPtr,
       bytes, /*copyHostToDeviceOnCreateOrResize=*/false, "update_device_desc");
 
-  FNACC_CUDA_CHECK(cuMemcpyHtoD(allocation.ptr, hostPtr, bytes));
+  FNACC_CUDA_CHECK(fnaccMemcpyHtoD(allocation.ptr, hostPtr, bytes));
 
   if (fnaccDebugEnabled()) {
     std::fprintf(stderr,
@@ -3489,7 +3735,7 @@ extern "C" void __fnacc_update_host_desc(void *hostPtr, int64_t elementBytes,
     std::abort();
   }
 
-  FNACC_CUDA_CHECK(cuMemcpyDtoH(hostPtr, it->second.ptr, bytes));
+  FNACC_CUDA_CHECK(fnaccMemcpyDtoH(hostPtr, it->second.ptr, bytes));
 
   if (fnaccDebugEnabled()) {
     std::fprintf(stderr,
@@ -3593,8 +3839,8 @@ extern "C" void __fnacc_launch_nd_f32(int32_t kernelId, int32_t rank,
   FNACC_CUDA_CHECK(cuMemAlloc(&dB, numBytes));
   FNACC_CUDA_CHECK(cuMemAlloc(&dC, numBytes));
 
-  FNACC_CUDA_CHECK(cuMemcpyHtoD(dA, a, numBytes));
-  FNACC_CUDA_CHECK(cuMemcpyHtoD(dB, b, numBytes));
+  FNACC_CUDA_CHECK(fnaccMemcpyHtoD(dA, a, numBytes));
+  FNACC_CUDA_CHECK(fnaccMemcpyHtoD(dB, b, numBytes));
 
   if (fnaccDebugEnabled()) {
     std::fprintf(stderr,
@@ -3707,7 +3953,7 @@ extern "C" void __fnacc_launch_nd_f32(int32_t kernelId, int32_t rank,
     std::fflush(stderr);
   }
 
-  FNACC_CUDA_CHECK(cuMemcpyDtoH(c, dC, numBytes));
+  FNACC_CUDA_CHECK(fnaccMemcpyDtoH(c, dC, numBytes));
 
   if (fnaccDebugEnabled()) {
     std::fprintf(stderr, "FNACC: cuMemcpyDtoH returned\n");
@@ -3745,6 +3991,7 @@ struct FNACCPendingReductionResultV2 {
   bool bound = false;
 };
 
+namespace {
 struct FNACCPendingLaunchV2 {
   bool active = false;
   CUcontext context = nullptr;
@@ -3756,18 +4003,42 @@ struct FNACCPendingLaunchV2 {
   std::vector<FNACCPendingArrayV2> arrays;
   std::vector<FNACCPendingScalarV2> scalars;
   std::vector<FNACCPendingReductionResultV2> reductionResults;
+  std::vector<FNACCDeviceArg> deviceArgs;
+  std::vector<CUdeviceptr> devicePointers;
+  std::vector<int32_t> parameterValues;
+  std::vector<void *> arguments;
 };
+
+} // namespace
 
 static thread_local FNACCPendingLaunchV2 fnaccPendingLaunchV2;
 
 static void fnaccClearPendingLaunchV2() {
-  fnaccPendingLaunchV2 = FNACCPendingLaunchV2{};
+  auto &pending = fnaccPendingLaunchV2;
+  pending.active = false;
+  pending.context = nullptr;
+  pending.kernelId = -1;
+  pending.rank = 0;
+  std::fill_n(pending.block, 3, 1);
+  std::fill_n(pending.extent, 3, 1);
+  std::fill_n(pending.loopLower, 3, 1);
+  pending.arrays.clear();
+  pending.scalars.clear();
+  pending.reductionResults.clear();
+  pending.deviceArgs.clear();
+  pending.devicePointers.clear();
+  pending.parameterValues.clear();
+  pending.arguments.clear();
 }
 
 extern "C" void __fnacc_begin_launch_v2(int32_t kernelId, int32_t rank,
     int32_t blockX, int32_t blockY, int32_t blockZ, int32_t extentX,
     int32_t extentY, int32_t extentZ, int32_t loopLowerX, int32_t loopLowerY,
     int32_t loopLowerZ, int32_t arrayCount, int32_t scalarCount) {
+
+  // For profiling
+  FNACC_PROFILE_SCOPE("fnacc.begin");
+
   FNACC_RUNTIME_GUARD();
   FNACCCurrentContextGuard contextGuard;
   fnaccEnsureCurrentContext();
@@ -3793,11 +4064,12 @@ extern "C" void __fnacc_begin_launch_v2(int32_t kernelId, int32_t rank,
         kernelId);
     std::abort();
   }
-  fnaccValidateHostLaunchAgainstDesc(kernelId, rank, blockX, blockY, blockZ);
+  fnaccValidateHostLaunchAgainstDesc(
+      desc, kernelId, rank, blockX, blockY, blockZ);
 
   FNACCPendingLaunchV2 &pending = fnaccPendingLaunchV2;
   pending.active = true;
-  pending.context = fnaccRegistry.activeContext;
+  pending.context = fnaccActiveContext;
   pending.kernelId = kernelId;
   pending.rank = rank;
   pending.block[0] = blockX;
@@ -3817,7 +4089,11 @@ extern "C" void __fnacc_begin_launch_v2(int32_t kernelId, int32_t rank,
 extern "C" void __fnacc_bind_array_v2(int32_t slot, void *host, int64_t bytes,
     int32_t flags, int64_t lowerX, int64_t lowerY, int64_t lowerZ,
     int64_t strideX, int64_t strideY, int64_t strideZ) {
-  FNACC_RUNTIME_GUARD();
+
+  // For profiling
+  FNACC_PROFILE_SCOPE("fnacc.bind_array");
+
+  // Binding state is thread-local; no registry or CUDA state is accessed.
   if (!fnaccPendingLaunchV2.active || slot < 0 ||
       static_cast<std::size_t>(slot) >= fnaccPendingLaunchV2.arrays.size() ||
       !host || bytes <= 0 || (flags & 3) == 0 || (flags & ~3) != 0) {
@@ -3843,7 +4119,11 @@ extern "C" void __fnacc_bind_array_v2(int32_t slot, void *host, int64_t bytes,
 }
 
 template <typename T> static void fnaccBindScalarV2(int32_t slot, T value) {
-  FNACC_RUNTIME_GUARD();
+
+  // For profiling
+  FNACC_PROFILE_SCOPE("fnacc.bind_scalar");
+
+  // Binding state is thread-local; no registry or CUDA state is accessed.
   if (!fnaccPendingLaunchV2.active || slot < 0 ||
       static_cast<std::size_t>(slot) >= fnaccPendingLaunchV2.scalars.size()) {
     std::fprintf(stderr, "FNACC error: invalid v2 scalar binding\n");
@@ -3878,7 +4158,7 @@ FNACC_DEFINE_SCALAR_BINDER(f64, double)
 template <typename T>
 static void fnaccBindReductionResultAtV2(
     int32_t slot, T *host, T initialValue) {
-  FNACC_RUNTIME_GUARD();
+  // Binding state is thread-local; no registry or CUDA state is accessed.
   if (!fnaccPendingLaunchV2.active || slot < 0 ||
       static_cast<std::size_t>(slot) >=
           fnaccPendingLaunchV2.reductionResults.size() ||
@@ -3938,6 +4218,9 @@ static Real fnaccReductionIdentity(FNACCKernelDesc::ReductionOperator);
 template <typename Real>
 static Real fnaccApplyReduction(FNACCKernelDesc::ReductionOperator, Real, Real);
 template <typename Real>
+static bool fnaccEnqueueReductionOnDevice(const FNACCKernelDesc *,
+    FNACCReductionWorkspace &, CUdeviceptr, unsigned, CUdeviceptr *);
+template <typename Real>
 static bool fnaccFinalizeReductionOnDevice(const FNACCKernelDesc *,
     FNACCReductionWorkspace &, CUdeviceptr, unsigned, Real *);
 static int32_t fnaccCheckedI32Layout(int64_t, const char *);
@@ -3971,12 +4254,12 @@ static void fnaccCommitReductionTypedV2(
   CUfunction function = getKernelFunction(pending.kernelId);
   unsigned gridX = fnaccCdiv(
       pending.extent[0], pending.block[0], "v2 reduction grid dimension X");
-  unsigned cudaBlockX = fnaccCudaThreadsPerCTA(pending.kernelId);
+  unsigned cudaBlockX = fnaccCudaThreadsPerCTA(desc);
   fnaccValidateCudaBlockSize(function, pending.kernelId, cudaBlockX);
-  fnaccValidateSupportedHiddenPtrArgCount(pending.kernelId);
+  fnaccValidateSupportedHiddenPtrArgCount(pending.kernelId, desc);
 
-  std::vector<FNACCDeviceArg> deviceArgs;
-  std::vector<CUdeviceptr> devicePointers;
+  auto &deviceArgs = pending.deviceArgs;
+  auto &devicePointers = pending.devicePointers;
   deviceArgs.reserve(pending.arrays.size());
   devicePointers.reserve(pending.arrays.size());
   for (std::size_t slot = 0; slot < pending.arrays.size(); ++slot) {
@@ -3988,10 +4271,9 @@ static void fnaccCommitReductionTypedV2(
           pending.kernelId);
       std::abort();
     }
-    int32_t target = fnaccEffectivePackTargetForArray(
-        desc, static_cast<int32_t>(slot), array.host);
-    FNACCDeviceArg device = fnaccPrepareReadBuffer(
-        array.host, array.bytes, target, static_cast<int32_t>(slot));
+    FNACCDeviceArg device =
+        fnaccPrepareArrayBuffer(desc, static_cast<int32_t>(slot), array.host,
+            array.bytes, /*read-only reduction input=*/1);
     devicePointers.push_back(device.ptr);
     deviceArgs.push_back(device);
   }
@@ -4001,8 +4283,9 @@ static void fnaccCommitReductionTypedV2(
   CUdeviceptr dPartials = fnaccReserveReductionBuffer(
       workspace.partials, partialBytes, workspace.partialStats, "partials");
 
-  std::vector<int32_t> parameterValues(desc->parameters.size(), 0);
-  std::vector<void *> arguments;
+  auto &parameterValues = pending.parameterValues;
+  parameterValues.assign(desc->parameters.size(), 0);
+  auto &arguments = pending.arguments;
   arguments.reserve(desc->parameters.size() + 2);
   for (const FNACCKernelParameterDesc &parameter : desc->parameters) {
     switch (parameter.role) {
@@ -4021,7 +4304,7 @@ static void fnaccCommitReductionTypedV2(
       break;
     case FNACCKernelParameterRole::Scalar: {
       FNACCPendingScalarV2 &scalar = pending.scalars[parameter.scalarIndex];
-      if (scalar.bytes != fnaccScalarParameterBytes(parameter.type)) {
+      if (scalar.bytes != desc->scalarParameterBytes[parameter.slot]) {
         std::fprintf(stderr,
             "FNACC error: reduction scalar type mismatch for kernel id %d "
             "slot %d\n",
@@ -4094,7 +4377,7 @@ static void fnaccCommitReductionTypedV2(
           desc, workspace, dPartials, gridX, &reducedValue)) {
     fnaccWaitForRuntimeStream();
     std::vector<T> partials(gridX);
-    FNACC_CUDA_CHECK(cuMemcpyDtoH(partials.data(), dPartials, partialBytes));
+    FNACC_CUDA_CHECK(fnaccMemcpyDtoH(partials.data(), dPartials, partialBytes));
     for (T value : partials)
       reducedValue =
           fnaccApplyReduction(desc->reductionOp, reducedValue, value);
@@ -4151,12 +4434,12 @@ static void fnaccCommitMultiReductionTypedV2(
   }
   unsigned programCount = static_cast<unsigned>(programCountSize);
 
-  unsigned cudaBlockX = fnaccCudaThreadsPerCTA(pending.kernelId);
+  unsigned cudaBlockX = fnaccCudaThreadsPerCTA(desc);
   fnaccValidateCudaBlockSize(function, pending.kernelId, cudaBlockX);
-  fnaccValidateSupportedHiddenPtrArgCount(pending.kernelId);
+  fnaccValidateSupportedHiddenPtrArgCount(pending.kernelId, desc);
 
-  std::vector<FNACCDeviceArg> deviceArgs;
-  std::vector<CUdeviceptr> devicePointers;
+  auto &deviceArgs = pending.deviceArgs;
+  auto &devicePointers = pending.devicePointers;
   deviceArgs.reserve(pending.arrays.size());
   devicePointers.reserve(pending.arrays.size());
   for (std::size_t slot = 0; slot < pending.arrays.size(); ++slot) {
@@ -4168,10 +4451,9 @@ static void fnaccCommitMultiReductionTypedV2(
           pending.kernelId);
       std::abort();
     }
-    int32_t target = fnaccEffectivePackTargetForArray(
-        desc, static_cast<int32_t>(slot), array.host);
-    FNACCDeviceArg device = fnaccPrepareReadBuffer(
-        array.host, array.bytes, target, static_cast<int32_t>(slot));
+    FNACCDeviceArg device =
+        fnaccPrepareArrayBuffer(desc, static_cast<int32_t>(slot), array.host,
+            array.bytes, /*read-only reduction input=*/1);
     devicePointers.push_back(device.ptr);
     deviceArgs.push_back(device);
   }
@@ -4184,8 +4466,9 @@ static void fnaccCommitMultiReductionTypedV2(
   CUdeviceptr dPartials = fnaccReserveReductionBuffer(
       workspace.partials, partialBytes, workspace.partialStats, "partials");
 
-  std::vector<int32_t> parameterValues(desc->parameters.size(), 0);
-  std::vector<void *> arguments;
+  auto &parameterValues = pending.parameterValues;
+  parameterValues.assign(desc->parameters.size(), 0);
+  auto &arguments = pending.arguments;
   arguments.reserve(desc->parameters.size() + 2);
   for (const FNACCKernelParameterDesc &parameter : desc->parameters) {
     switch (parameter.role) {
@@ -4204,7 +4487,7 @@ static void fnaccCommitMultiReductionTypedV2(
       break;
     case FNACCKernelParameterRole::Scalar: {
       FNACCPendingScalarV2 &scalar = pending.scalars[parameter.scalarIndex];
-      if (scalar.bytes != fnaccScalarParameterBytes(parameter.type)) {
+      if (scalar.bytes != desc->scalarParameterBytes[parameter.slot]) {
         std::fprintf(stderr,
             "FNACC error: multi-reduction scalar type mismatch for kernel "
             "id %d slot %d\n",
@@ -4289,28 +4572,46 @@ static void fnaccCommitMultiReductionTypedV2(
       nullptr));
   ++workspace.primaryLaunches;
 
+  const std::size_t resultCount = pending.reductionResults.size();
   std::size_t resultStrideBytes = fnaccCheckedMul(
       programCountSize, sizeof(T), "multi-reduction result partial stride");
-  for (std::size_t index = 0; index < pending.reductionResults.size();
-      ++index) {
-    FNACCPendingReductionResultV2 &pendingResult =
-        pending.reductionResults[index];
-    T reducedValue = fnaccReductionIdentity<T>(desc->reductionOp);
-    CUdeviceptr segment =
-        dPartials + static_cast<CUdeviceptr>(index * resultStrideBytes);
-    if (!fnaccFinalizeReductionOnDevice<T>(
-            desc, workspace, segment, programCount, &reducedValue)) {
-      fnaccWaitForRuntimeStream();
-      std::vector<T> partials(programCount);
-      FNACC_CUDA_CHECK(
-          cuMemcpyDtoH(partials.data(), segment, resultStrideBytes));
-      for (T value : partials)
-        reducedValue =
-            fnaccApplyReduction(desc->reductionOp, reducedValue, value);
+  std::vector<T> reduced(
+      resultCount, fnaccReductionIdentity<T>(desc->reductionOp));
+  if (desc->reductionStageId >= 0) {
+    std::size_t resultBytes = fnaccCheckedMul(
+        resultCount, sizeof(T), "packed multi-reduction results");
+    CUdeviceptr packed = fnaccReserveReductionBuffer(
+        workspace.results, resultBytes, workspace.resultStats, "results");
+    for (std::size_t index = 0; index < resultCount; ++index) {
+      CUdeviceptr segment = dPartials + index * resultStrideBytes;
+      CUdeviceptr finalValue = 0;
+      if (!fnaccEnqueueReductionOnDevice<T>(
+              desc, workspace, segment, programCount, &finalValue))
+        std::abort(); // A nonnegative stage id must resolve or diagnose.
+      // Capture the value before the next output reuses the scratch buffer.
+      FNACC_CUDA_CHECK(cuMemcpyDtoDAsync(packed + index * sizeof(T), finalValue,
+          sizeof(T), fnaccActiveContextState().stream));
     }
-    T initialValue = fnaccPendingReductionInitial<T>(pendingResult);
-    *static_cast<T *>(pendingResult.host) =
-        fnaccApplyReduction(desc->reductionOp, initialValue, reducedValue);
+    fnaccWaitForRuntimeStream();
+    FNACC_CUDA_CHECK(fnaccMemcpyDtoH(reduced.data(), packed, resultBytes));
+  } else {
+    // Keep the original per-output arithmetic order in the host fallback.
+    std::size_t count = fnaccCheckedMul(
+        resultCount, programCountSize, "multi-reduction host partial count");
+    std::vector<T> partials(count);
+    fnaccWaitForRuntimeStream();
+    FNACC_CUDA_CHECK(fnaccMemcpyDtoH(partials.data(), dPartials,
+        fnaccCheckedMul(
+            count, sizeof(T), "multi-reduction host partial bytes")));
+    for (std::size_t index = 0; index < resultCount; ++index)
+      for (std::size_t i = 0; i < programCountSize; ++i)
+        reduced[index] = fnaccApplyReduction(desc->reductionOp, reduced[index],
+            partials[index * programCountSize + i]);
+  }
+  for (std::size_t index = 0; index < resultCount; ++index) {
+    FNACCPendingReductionResultV2 &binding = pending.reductionResults[index];
+    *static_cast<T *>(binding.host) = fnaccApplyReduction(desc->reductionOp,
+        fnaccPendingReductionInitial<T>(binding), reduced[index]);
   }
 
   for (const FNACCDeviceArg &device : deviceArgs)
@@ -4320,7 +4621,7 @@ static void fnaccCommitMultiReductionTypedV2(
 
 static bool fnaccTryCommitReductionLaunchV2(
     const FNACCKernelDesc *desc, FNACCPendingLaunchV2 &pending) {
-  if (!fnaccIsReductionKernelKind(desc->kind))
+  if (!desc->isReduction)
     return false;
   if (pending.arrays.empty()) {
     std::fprintf(stderr,
@@ -4440,12 +4741,22 @@ static int32_t fnaccCheckedI32Layout(int64_t value, const char *what) {
 }
 
 extern "C" void __fnacc_commit_launch_v2() {
+
+  // For profiling
+  FNACC_PROFILE_SCOPE("fnacc.commit");
+
   FNACC_RUNTIME_GUARD();
   FNACCCurrentContextGuard contextGuard;
+
+  // For profiling
+  FNACC_PROFILE_PUSH("fnacc.context");
   fnaccEnsureCurrentContext();
 
+  // For profiling
+  FNACC_PROFILE_POP();
+
   FNACCPendingLaunchV2 &pending = fnaccPendingLaunchV2;
-  if (!pending.active || pending.context != fnaccRegistry.activeContext) {
+  if (!pending.active || pending.context != fnaccActiveContext) {
     std::fprintf(stderr,
         "FNACC error: v2 launch committed without its original CUDA "
         "context\n");
@@ -4463,7 +4774,7 @@ extern "C" void __fnacc_commit_launch_v2() {
     }
 
   const FNACCKernelDesc *desc = fnaccLookupKernelDesc(pending.kernelId);
-  bool isReduction = fnaccIsReductionKernelKind(desc->kind);
+  bool isReduction = desc->isReduction;
   bool anyReductionResultBound = std::any_of(pending.reductionResults.begin(),
       pending.reductionResults.end(),
       [](const FNACCPendingReductionResultV2 &result) { return result.bound; });
@@ -4485,9 +4796,9 @@ extern "C" void __fnacc_commit_launch_v2() {
         pending.kernelId);
     std::abort();
   }
-  if (fnaccTryCommitReductionLaunchV2(desc, pending))
+  if (desc->isReduction && fnaccTryCommitReductionLaunchV2(desc, pending))
     return;
-  if (fnaccTryCommitMatmulLaunchV2(desc, pending))
+  if (desc->isMatmul && fnaccTryCommitMatmulLaunchV2(desc, pending))
     return;
 
   if (pending.extent[0] <= 0 || (pending.rank >= 2 && pending.extent[1] <= 0)) {
@@ -4496,31 +4807,32 @@ extern "C" void __fnacc_commit_launch_v2() {
   }
 
   CUfunction function = getKernelFunction(pending.kernelId);
-  unsigned cudaBlockX = fnaccCudaThreadsPerCTA(pending.kernelId);
+  unsigned cudaBlockX = fnaccCudaThreadsPerCTA(desc);
   fnaccValidateCudaBlockSize(function, pending.kernelId, cudaBlockX);
-  fnaccValidateSupportedHiddenPtrArgCount(pending.kernelId);
+  fnaccValidateSupportedHiddenPtrArgCount(pending.kernelId, desc);
 
-  std::vector<FNACCDeviceArg> deviceArgs;
-  std::vector<CUdeviceptr> devicePointers;
+  // For profiling
+  FNACC_PROFILE_PUSH("fnacc.buffers");
+
+  auto &deviceArgs = pending.deviceArgs;
+  auto &devicePointers = pending.devicePointers;
   deviceArgs.reserve(pending.arrays.size());
   devicePointers.reserve(pending.arrays.size());
   for (std::size_t slot = 0; slot < pending.arrays.size(); ++slot) {
     FNACCPendingArrayV2 &array = pending.arrays[slot];
-    int32_t target = fnaccEffectivePackTargetForArray(
-        desc, static_cast<int32_t>(slot), array.host);
-    if ((array.flags & 2) && !desc->copyBackWrites)
-      target = FNACC_PACK_TARGET_DEVICE;
-    FNACCDeviceArg device = (array.flags & 1)
-        ? fnaccPrepareReadBuffer(
-              array.host, array.bytes, target, static_cast<int32_t>(slot))
-        : fnaccPrepareWriteBuffer(
-              array.host, array.bytes, target, static_cast<int32_t>(slot));
+    FNACCDeviceArg device = fnaccPrepareArrayBuffer(
+        desc, static_cast<int32_t>(slot), array.host, array.bytes, array.flags);
     devicePointers.push_back(device.ptr);
     deviceArgs.push_back(device);
   }
+  // For profiling
+  FNACC_PROFILE_POP();
 
-  std::vector<int32_t> parameterValues(desc->parameters.size(), 0);
-  std::vector<void *> arguments;
+  // For profiling
+  FNACC_PROFILE_PUSH("fnacc.arguments");
+  auto &parameterValues = pending.parameterValues;
+  parameterValues.assign(desc->parameters.size(), 0);
+  auto &arguments = pending.arguments;
   arguments.reserve(desc->parameters.size() + 2);
   for (const FNACCKernelParameterDesc &parameter : desc->parameters) {
     switch (parameter.role) {
@@ -4544,7 +4856,7 @@ extern "C" void __fnacc_commit_launch_v2() {
     }
     case FNACCKernelParameterRole::Scalar: {
       FNACCPendingScalarV2 &scalar = pending.scalars[parameter.scalarIndex];
-      if (scalar.bytes != fnaccScalarParameterBytes(parameter.type)) {
+      if (scalar.bytes != desc->scalarParameterBytes[parameter.slot]) {
         std::fprintf(stderr,
             "FNACC error: v2 scalar binding type mismatch for kernel id %d "
             "slot %d\n",
@@ -4612,11 +4924,22 @@ extern "C" void __fnacc_commit_launch_v2() {
         pending.scalars.size(), gridX, gridY, pending.extent[0],
         pending.extent[1], pending.loopLower[0], pending.loopLower[1]);
   }
+  // For profiling
+  FNACC_PROFILE_POP();
 
+  // For profiling
+  FNACC_PROFILE_PUSH("fnacc.launch");
   FNACC_CUDA_CHECK(cuLaunchKernel(function, gridX, gridY, 1, cudaBlockX, 1, 1,
       0, fnaccActiveContextState().stream, arguments.data(), nullptr));
-  fnaccWaitForRuntimeStream();
+  fnaccCompleteArrayLaunch(std::all_of(
+      deviceArgs.begin(), deviceArgs.end(), [](const FNACCDeviceArg &arg) {
+        return arg.cached && arg.target == FNACC_PACK_TARGET_DEVICE;
+      }));
+  // For profiling
+  FNACC_PROFILE_POP();
 
+  // For profiling
+  FNACC_PROFILE_PUSH("fnacc.completion");
   for (std::size_t slot = 0; slot < pending.arrays.size(); ++slot) {
     FNACCPendingArrayV2 &array = pending.arrays[slot];
     if ((array.flags & 2) && deviceArgs[slot].target == FNACC_PACK_TARGET_HOST)
@@ -4624,8 +4947,107 @@ extern "C" void __fnacc_commit_launch_v2() {
   }
   for (const FNACCDeviceArg &device : deviceArgs)
     fnaccReleaseDeviceArg(device);
-
+  // For profiling
+  FNACC_PROFILE_POP();
   fnaccClearPendingLaunchV2();
+}
+
+#ifndef FNACC_LAUNCH_V3_H
+#define FNACC_LAUNCH_V3_H
+#include <stddef.h>
+#include <stdint.h>
+#ifdef __cplusplus
+extern "C" {
+#endif
+/* Host ABI: native pointer layout; compiler and runtime must share this header.
+ * This version batches the existing v2 bindings into one public runtime call.
+ * Kernel JSON and the device ABI remain v2. */
+typedef struct {
+  void *host;
+  int64_t bytes;
+  int32_t flags; /* 1 read, 2 write, 3 read/write */
+  int64_t lower[3], stride[3];
+} FNACCArrayBindingV3;
+typedef struct {
+  const void *value; /* address of native scalar bytes, copied during call */
+  uint32_t bytes; /* 1, 2, 4 or 8; checked against kernel metadata */
+} FNACCScalarBindingV3;
+typedef struct {
+  void *host;
+  const void *initialValue;
+  uint32_t bytes;
+} FNACCReductionBindingV3;
+typedef struct {
+  uint32_t version; /* must be 3 */
+  uint32_t structBytes; /* sizeof(FNACCLaunchV3) */
+  int32_t kernelId, rank;
+  int32_t block[3], extent[3], loopLower[3];
+  int32_t arrayCount, scalarCount, resultCount;
+  const FNACCArrayBindingV3 *arrays;
+  const FNACCScalarBindingV3 *scalars;
+  const FNACCReductionBindingV3 *results;
+} FNACCLaunchV3;
+void __fnacc_launch_v3(const FNACCLaunchV3 *launch);
+#ifdef __cplusplus
+}
+#endif
+#endif
+
+extern "C" void __fnacc_launch_v3(const FNACCLaunchV3 *launch) {
+  FNACC_PROFILE_SCOPE("fnacc.launch_v3");
+  if (!launch || launch->version != 3 ||
+      launch->structBytes != sizeof(FNACCLaunchV3) || launch->arrayCount <= 0 ||
+      launch->scalarCount < 0 || launch->resultCount < 0 || !launch->arrays ||
+      (launch->scalarCount && !launch->scalars) ||
+      (launch->resultCount && !launch->results)) {
+    std::fprintf(
+        stderr, "FNACC error: invalid single-call launch v3 descriptor\n");
+    std::abort();
+  }
+  FNACC_RUNTIME_GUARD();
+  FNACCCurrentContextGuard contextGuard;
+  fnaccEnsureCurrentContext();
+  __fnacc_begin_launch_v2(launch->kernelId, launch->rank, launch->block[0],
+      launch->block[1], launch->block[2], launch->extent[0], launch->extent[1],
+      launch->extent[2], launch->loopLower[0], launch->loopLower[1],
+      launch->loopLower[2], launch->arrayCount, launch->scalarCount);
+  for (int32_t i = 0; i < launch->arrayCount; ++i) {
+    const auto &a = launch->arrays[i];
+    __fnacc_bind_array_v2(i, a.host, a.bytes, a.flags, a.lower[0], a.lower[1],
+        a.lower[2], a.stride[0], a.stride[1], a.stride[2]);
+  }
+  for (int32_t i = 0; i < launch->scalarCount; ++i) {
+    const auto &a = launch->scalars[i];
+    if (!a.value ||
+        (a.bytes != 1 && a.bytes != 2 && a.bytes != 4 && a.bytes != 8)) {
+      std::fprintf(stderr, "FNACC error: invalid v3 scalar binding\n");
+      std::abort();
+    }
+    auto &binding = fnaccPendingLaunchV2.scalars[i];
+    std::memcpy(&binding.storage, a.value, a.bytes);
+    binding.bytes = a.bytes;
+    binding.bound = true;
+  }
+  if (launch->resultCount &&
+      static_cast<std::size_t>(launch->resultCount) !=
+          fnaccPendingLaunchV2.reductionResults.size()) {
+    std::fprintf(stderr, "FNACC error: invalid v3 reduction result count\n");
+    std::abort();
+  }
+  for (int32_t i = 0; i < launch->resultCount; ++i) {
+    const auto &a = launch->results[i];
+    if (!a.host || !a.initialValue ||
+        (a.bytes != 1 && a.bytes != 2 && a.bytes != 4 && a.bytes != 8)) {
+      std::fprintf(stderr, "FNACC error: invalid v3 reduction binding\n");
+      std::abort();
+    }
+    auto &binding = fnaccPendingLaunchV2.reductionResults[i];
+    binding.host = a.host;
+    std::memcpy(&binding.initialStorage, a.initialValue, a.bytes);
+    binding.bytes = a.bytes;
+    binding.bound = true;
+  }
+  __fnacc_commit_launch_v2();
 }
 
 // -------------------------------------------------------------------------- //
@@ -4678,8 +5100,8 @@ extern "C" void __fnacc_launch_nd_f32_s1(int32_t kernelId, int32_t rank,
   FNACC_CUDA_CHECK(cuMemAlloc(&dB, numBytes));
   FNACC_CUDA_CHECK(cuMemAlloc(&dC, numBytes));
 
-  FNACC_CUDA_CHECK(cuMemcpyHtoD(dA, a, numBytes));
-  FNACC_CUDA_CHECK(cuMemcpyHtoD(dB, b, numBytes));
+  FNACC_CUDA_CHECK(fnaccMemcpyHtoD(dA, a, numBytes));
+  FNACC_CUDA_CHECK(fnaccMemcpyHtoD(dB, b, numBytes));
 
   FNACCHiddenTritonArgs hidden;
 
@@ -4733,7 +5155,7 @@ extern "C" void __fnacc_launch_nd_f32_s1(int32_t kernelId, int32_t rank,
 
   fnaccWaitForRuntimeStream();
 
-  FNACC_CUDA_CHECK(cuMemcpyDtoH(c, dC, numBytes));
+  FNACC_CUDA_CHECK(fnaccMemcpyDtoH(c, dC, numBytes));
 
   FNACC_CUDA_CHECK(cuMemFree(dA));
   FNACC_CUDA_CHECK(cuMemFree(dB));
@@ -4781,8 +5203,8 @@ extern "C" void __fnacc_launch_nd_f32_s2(int32_t kernelId, int32_t rank,
   FNACC_CUDA_CHECK(cuMemAlloc(&dB, numBytes));
   FNACC_CUDA_CHECK(cuMemAlloc(&dC, numBytes));
 
-  FNACC_CUDA_CHECK(cuMemcpyHtoD(dA, a, numBytes));
-  FNACC_CUDA_CHECK(cuMemcpyHtoD(dB, b, numBytes));
+  FNACC_CUDA_CHECK(fnaccMemcpyHtoD(dA, a, numBytes));
+  FNACC_CUDA_CHECK(fnaccMemcpyHtoD(dB, b, numBytes));
 
   fnaccValidateSupportedHiddenPtrArgCount(kernelId);
 
@@ -4839,7 +5261,7 @@ extern "C" void __fnacc_launch_nd_f32_s2(int32_t kernelId, int32_t rank,
 
   fnaccWaitForRuntimeStream();
 
-  FNACC_CUDA_CHECK(cuMemcpyDtoH(c, dC, numBytes));
+  FNACC_CUDA_CHECK(fnaccMemcpyDtoH(c, dC, numBytes));
 
   FNACC_CUDA_CHECK(cuMemFree(dA));
   FNACC_CUDA_CHECK(cuMemFree(dB));
@@ -5653,7 +6075,10 @@ extern "C" void __fnacc_launch_matmul_f32_v1(int32_t kernelId, int32_t blockX,
   FNACC_CUDA_CHECK(cuLaunchKernel(fn, gridX, gridY, gridZ, cudaBlockX, 1, 1,
       dynamicSharedBytes, fnaccActiveContextState().stream, args, nullptr));
 
-  fnaccWaitForRuntimeStream();
+  fnaccCompleteArrayLaunch(aDev.cached && bDev.cached && cDev.cached &&
+      aDev.target == FNACC_PACK_TARGET_DEVICE &&
+      bDev.target == FNACC_PACK_TARGET_DEVICE &&
+      cDev.target == FNACC_PACK_TARGET_DEVICE);
 
   if (cDev.target == FNACC_PACK_TARGET_HOST) {
     fnaccCopyBackWriteBuffer(c, cDev, bytesC);
@@ -5799,7 +6224,10 @@ extern "C" void __fnacc_launch_matmul_f64_v1(int32_t kernelId, int32_t blockX,
   FNACC_CUDA_CHECK(cuLaunchKernel(fn, gridX, gridY, gridZ, cudaBlockX, 1, 1,
       dynamicSharedBytes, fnaccActiveContextState().stream, args, nullptr));
 
-  fnaccWaitForRuntimeStream();
+  fnaccCompleteArrayLaunch(aDev.cached && bDev.cached && cDev.cached &&
+      aDev.target == FNACC_PACK_TARGET_DEVICE &&
+      bDev.target == FNACC_PACK_TARGET_DEVICE &&
+      cDev.target == FNACC_PACK_TARGET_DEVICE);
 
   if (cDev.target == FNACC_PACK_TARGET_HOST) {
     fnaccCopyBackWriteBuffer(c, cDev, bytesC);
@@ -5909,9 +6337,9 @@ static Real fnaccApplyReduction(
 }
 
 template <typename Real>
-static bool fnaccFinalizeReductionOnDevice(const FNACCKernelDesc *primaryDesc,
+static bool fnaccEnqueueReductionOnDevice(const FNACCKernelDesc *primaryDesc,
     FNACCReductionWorkspace &workspace, CUdeviceptr dPartials,
-    unsigned partialCount, Real *result) {
+    unsigned partialCount, CUdeviceptr *result) {
   if (!primaryDesc || primaryDesc->reductionStageId < 0)
     return false;
 
@@ -5960,6 +6388,14 @@ static bool fnaccFinalizeReductionOnDevice(const FNACCKernelDesc *primaryDesc,
   CUdeviceptr current = dPartials;
   CUdeviceptr next = 0;
 
+  // Validate before the first narrowing conversion (including scratch sizing).
+  if (partialCount == 0 ||
+      partialCount >
+          static_cast<unsigned>(std::numeric_limits<int32_t>::max())) {
+    std::fprintf(
+        stderr, "FNACC error: reduction stage extent exceeds i32 or is zero\n");
+    std::abort();
+  }
   if (partialCount > 1) {
     unsigned scratchElements = fnaccCdiv(
         static_cast<int32_t>(partialCount), stageBlock, "scratch Elements");
@@ -6013,9 +6449,21 @@ static bool fnaccFinalizeReductionOnDevice(const FNACCKernelDesc *primaryDesc,
     partialCount = outputCount;
   }
 
-  fnaccWaitForRuntimeStream();
-  FNACC_CUDA_CHECK(cuMemcpyDtoH(result, current, sizeof(Real)));
+  *result = current;
 
+  return true;
+}
+
+template <typename Real>
+static bool fnaccFinalizeReductionOnDevice(const FNACCKernelDesc *desc,
+    FNACCReductionWorkspace &workspace, CUdeviceptr partials, unsigned count,
+    Real *result) {
+  CUdeviceptr deviceResult = 0;
+  if (!fnaccEnqueueReductionOnDevice<Real>(
+          desc, workspace, partials, count, &deviceResult))
+    return false;
+  fnaccWaitForRuntimeStream();
+  FNACC_CUDA_CHECK(fnaccMemcpyDtoH(result, deviceResult, sizeof(Real)));
   return true;
 }
 
@@ -6112,7 +6560,7 @@ extern "C" void __fnacc_launch_reduce_f32_v2(int32_t kernelId, int32_t blockX,
     fnaccWaitForRuntimeStream();
 
     std::vector<float> partials(gridX);
-    FNACC_CUDA_CHECK(cuMemcpyDtoH(partials.data(), dPartials, partialBytes));
+    FNACC_CUDA_CHECK(fnaccMemcpyDtoH(partials.data(), dPartials, partialBytes));
 
     for (float value : partials)
       reducedValue =
@@ -6220,7 +6668,7 @@ extern "C" void __fnacc_launch_reduce_f64_v2(int32_t kernelId, int32_t blockX,
     fnaccWaitForRuntimeStream();
 
     std::vector<double> partials(gridX);
-    FNACC_CUDA_CHECK(cuMemcpyDtoH(partials.data(), dPartials, partialBytes));
+    FNACC_CUDA_CHECK(fnaccMemcpyDtoH(partials.data(), dPartials, partialBytes));
 
     for (double value : partials)
       reducedValue =
@@ -6320,7 +6768,7 @@ static void fnaccLaunchReduceIntegerV2(const char *abiName,
     fnaccWaitForRuntimeStream();
 
     std::vector<Integer> partials(gridX);
-    FNACC_CUDA_CHECK(cuMemcpyDtoH(partials.data(), dPartials, partialBytes));
+    FNACC_CUDA_CHECK(fnaccMemcpyDtoH(partials.data(), dPartials, partialBytes));
     for (Integer value : partials)
       reducedValue =
           fnaccApplyReduction(desc->reductionOp, reducedValue, value);
@@ -6355,7 +6803,7 @@ extern "C" void __fnacc_get_reduction_workspace_stats_v1(
     uint64_t *partialReuses, uint64_t *partialCapacityBytes,
     uint64_t *scratchAllocations, uint64_t *scratchGrowths,
     uint64_t *scratchReuses, uint64_t *scratchCapacityBytes) {
-  FNACC_RUNTIME_GUARD();
+  FNACC_REGISTRY_GUARD();
   FNACCReductionWorkspace workspace = fnaccAggregateReductionWorkspaceStats();
   if (primaryLaunches)
     *primaryLaunches = workspace.primaryLaunches;
@@ -6401,7 +6849,7 @@ extern "C" void __fnacc_update_host(void *hostPtr) {
     std::abort();
   }
 
-  FNACC_CUDA_CHECK(cuMemcpyDtoH(hostPtr, it->second.ptr, it->second.bytes));
+  FNACC_CUDA_CHECK(fnaccMemcpyDtoH(hostPtr, it->second.ptr, it->second.bytes));
 
   if (fnaccDebugEnabled()) {
     std::fprintf(stderr, "FNACC: update_host host=%p device=0x%llx bytes=%zu\n",
@@ -6431,7 +6879,7 @@ extern "C" void __fnacc_update_device(void *hostPtr) {
     std::abort();
   }
 
-  FNACC_CUDA_CHECK(cuMemcpyHtoD(it->second.ptr, hostPtr, it->second.bytes));
+  FNACC_CUDA_CHECK(fnaccMemcpyHtoD(it->second.ptr, hostPtr, it->second.bytes));
 
   if (fnaccDebugEnabled()) {
     std::fprintf(stderr,
@@ -6503,6 +6951,8 @@ extern "C" void __fnacc_release_all() {
         "FNACC: release_all releasing %zu cached allocations\n", cache.size());
   }
 
+  if (!cache.empty())
+    fnaccSynchronizeActiveContext();
   for (auto &entry : cache) {
     void *hostPtr = entry.first;
     FNACCDeviceAllocation &allocation = entry.second;
@@ -6512,7 +6962,6 @@ extern "C" void __fnacc_release_all() {
           "FNACC: release_all host=%p device=0x%llx bytes=%zu\n", hostPtr,
           static_cast<unsigned long long>(allocation.ptr), allocation.bytes);
     }
-    fnaccSynchronizeActiveContext();
     if (allocation.ptr)
       FNACC_CUDA_CHECK(cuMemFree(allocation.ptr));
   }
@@ -6552,7 +7001,7 @@ extern "C" void __fnacc_register_embedded_device_bundle(
     const void *const *imageData, const std::size_t *imageSizes,
     const int32_t *imageKinds, std::size_t imageCount, const char *jsonData,
     std::size_t jsonSize) {
-  FNACC_RUNTIME_GUARD();
+  FNACC_REGISTRY_GUARD();
   fnaccRegisterEmbeddedDeviceBundle(
       imageData, imageSizes, imageKinds, imageCount, jsonData, jsonSize);
 }
@@ -6560,7 +7009,7 @@ extern "C" void __fnacc_register_embedded_device_bundle(
 extern "C" void __fnacc_register_embedded_kernel_bundle(
     const char *const *ptxData, std::size_t const *ptxSizes,
     std::size_t ptxCount, const char *jsonData, std::size_t jsonSize) {
-  FNACC_RUNTIME_GUARD();
+  FNACC_REGISTRY_GUARD();
   std::vector<const void *> imageData(ptxCount);
   for (std::size_t i = 0; i < ptxCount; ++i)
     imageData[i] = ptxData ? ptxData[i] : nullptr;
@@ -6571,10 +7020,17 @@ extern "C" void __fnacc_register_embedded_kernel_bundle(
 
 extern "C" void __fnacc_register_embedded_kernels(const char *ptxData,
     std::size_t ptxSize, const char *jsonData, std::size_t jsonSize) {
-  FNACC_RUNTIME_GUARD();
+  FNACC_REGISTRY_GUARD();
   const void *imageData[] = {ptxData};
   std::size_t imageSizes[] = {ptxSize};
   int32_t imageKinds[] = {FNACCEmbeddedKernelBundle::PTX};
   fnaccRegisterEmbeddedDeviceBundle(
       imageData, imageSizes, imageKinds, 1, jsonData, jsonSize);
 }
+
+// For profiling
+extern "C" void fnacc_profile_compute_begin() {
+  FNACC_PROFILE_PUSH("fnacc.compute");
+}
+
+extern "C" void fnacc_profile_compute_end() { FNACC_PROFILE_POP(); }
