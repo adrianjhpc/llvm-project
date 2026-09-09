@@ -182,7 +182,8 @@ static constexpr bool isNopConstructStmt{common::HasMember<
 template <typename A>
 static constexpr bool isExecutableDirective{common::HasMember<
     A, std::tuple<parser::CompilerDirective, parser::OpenACCConstruct,
-                  parser::OpenMPConstruct, parser::CUFKernelDoConstruct>>};
+                  parser::OpenMPConstruct, parser::CUFKernelDoConstruct,
+                  parser::FnACCStandaloneConstruct>>};
 
 template <typename A>
 static constexpr bool isOpenMPDirective{
