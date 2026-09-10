@@ -27,6 +27,7 @@ std::unique_ptr<mlir::Pass> createFNACCLowerToTritonPass(
     llvm::StringRef fallbackBackend, bool allowBackendFallback,
     llvm::StringRef acceleratorTarget);
 std::unique_ptr<mlir::Pass> createFNACCLowerToRuntimePass();
+std::unique_ptr<mlir::Pass> createFNACCLowerToRuntimePass(int32_t launchAbi);
 
 void registerFNACCPipelines();
 

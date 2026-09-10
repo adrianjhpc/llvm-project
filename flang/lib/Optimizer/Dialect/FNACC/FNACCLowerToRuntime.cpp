@@ -1258,12 +1258,128 @@ static LogicalResult lowerFNACCDataOpsToRuntime(ModuleOp module,
   return success();
 }
 
+// Host launch ABI v3, matching FNACCLaunchV3 in fnacc_runtime.cpp.
+// FIR tuples lower to native, unpacked LLVM structs. Homogeneous nested tuples
+// represent the C fixed-size arrays without introducing Fortran descriptors.
+// Currently restricted to the supported 64-bit x86/AArch64 host ABIs below.
+class V3LaunchBuilder {
+public:
+  V3LaunchBuilder(ModuleOp module, OpBuilder &builder, Location loc,
+                  fir::fnacc::LaunchOp launch)
+      : module(module), builder(builder), loc(loc),
+        function(launch->getParentOfType<func::FuncOp>()) {}
+
+  void emit(StringRef name, ValueRange values) {
+    if (name == "__fnacc_begin_launch_v2") {
+      begin.assign(values.begin(), values.end());
+    } else if (name == "__fnacc_bind_array_v2") {
+      // Drop the positional binding index. The vectors preserve ABI order.
+      Value lower = aggregate(values.slice(4, 3));
+      Value stride = aggregate(values.slice(7, 3));
+      arrays.push_back(
+          aggregate({values[1], values[2], values[3], lower, stride}));
+    } else if (name.starts_with("__fnacc_bind_scalar_")) {
+      Value value = values[1];
+      scalars.push_back(aggregate({snapshot(value), width(value)}));
+    } else if (name.contains("reduction") && name.contains("result")) {
+      // Indexed and legacy single-result bind calls both end in host, value.
+      Value value = values.back();
+      Value host =
+          convertToOpaqueRuntimePtr(builder, loc, values[values.size() - 2]);
+      results.push_back(aggregate({host, snapshot(value), width(value)}));
+    } else if (name == "__fnacc_commit_launch_v2") {
+      Value arrayPtr = bindings(arrays);
+      Value scalarPtr = bindings(scalars);
+      Value resultPtr = bindings(results);
+      Value request = aggregate(
+          {constantI32(builder, loc, 3), constantI32(builder, loc, 88),
+           begin[0], begin[1], aggregate(ValueRange(begin).slice(2, 3)),
+           aggregate(ValueRange(begin).slice(5, 3)),
+           aggregate(ValueRange(begin).slice(8, 3)), begin[11], begin[12],
+           constantI32(builder, loc, results.size()), arrayPtr, scalarPtr,
+           resultPtr});
+      Value ptr = snapshot(request);
+      createRuntimeCall(module, builder, loc, "__fnacc_launch_v3", {ptr});
+    } else {
+      llvm_unreachable("unexpected FNACC launch binding");
+    }
+  }
+
+private:
+  Value aggregate(ValueRange fields) {
+    llvm::SmallVector<Type> types;
+    for (Value field : fields)
+      types.push_back(field.getType());
+    Type type = TupleType::get(builder.getContext(), types);
+    Value result = fir::UndefOp::create(builder, loc, type);
+    for (auto [i, field] : llvm::enumerate(fields))
+      result = fir::InsertValueOp::create(
+          builder, loc, type, result, field,
+          builder.getArrayAttr(
+              {builder.getIntegerAttr(builder.getIndexType(), i)}));
+    return result;
+  }
+
+  Value snapshot(Value value) {
+    Value slot;
+    {
+      OpBuilder::InsertionGuard guard(builder);
+      builder.setInsertionPointToStart(&function.getBody().front());
+      slot = fir::AllocaOp::create(builder, loc, value.getType());
+    }
+    fir::StoreOp::create(builder, loc, value, slot);
+    return convertToOpaqueRuntimePtr(builder, loc, slot);
+  }
+
+  Value width(Value value) {
+    return constantI32(builder, loc,
+                       value.getType().getIntOrFloatBitWidth() / 8);
+  }
+
+  Value bindings(llvm::ArrayRef<Value> records) {
+    if (records.empty())
+      return fir::ZeroOp::create(builder, loc, getI8RefType(builder));
+    return snapshot(aggregate(records));
+  }
+
+  ModuleOp module;
+  OpBuilder &builder;
+  Location loc;
+  func::FuncOp function;
+  llvm::SmallVector<Value> begin, arrays, scalars, results;
+};
+
 struct FNACCLowerToRuntimePass
     : public fir::fnacc::impl::FNACCLowerToRuntimeBase<
           FNACCLowerToRuntimePass> {
+  FNACCLowerToRuntimePass() = default;
+  explicit FNACCLowerToRuntimePass(int32_t abi) { launchAbi = abi; }
+  FNACCLowerToRuntimePass(const FNACCLowerToRuntimePass &other)
+      : fir::fnacc::impl::FNACCLowerToRuntimeBase<FNACCLowerToRuntimePass>(
+            other) {}
   void runOnOperation() override {
     ModuleOp module = getOperation();
     OpBuilder builder(module.getContext());
+    if (launchAbi != 2 && launchAbi != 3) {
+      module.emitError("FNACC launch-abi must be 2 or 3");
+      signalPassFailure();
+      return;
+    }
+    if (launchAbi == 3) {
+      auto triple = module->getAttrOfType<StringAttr>("llvm.target_triple");
+      // V3's public C layout is an LP64 ABI (88-byte launch descriptor).
+      if (!triple ||
+          !(triple.getValue().starts_with("x86_64-") ||
+            triple.getValue().starts_with("aarch64-")) ||
+          triple.getValue().contains("gnux32") ||
+          triple.getValue().contains("ilp32")) {
+        module.emitError(
+            "FNACC launch ABI v3 requires an explicit 64-bit "
+            "x86_64 or aarch64 host target triple; use v2 otherwise");
+        signalPassFailure();
+        return;
+      }
+    }
 
     llvm::SmallVector<fir::fnacc::LaunchOp> launches;
     module.walk(
@@ -1384,6 +1500,13 @@ struct FNACCLowerToRuntimePass
       }
 
       if (usesVariadicABI) {
+        V3LaunchBuilder v3(module, builder, loc, launchOp);
+        auto emitLaunchCall = [&](StringRef name, ValueRange operands) {
+          if (launchAbi == 3)
+            v3.emit(name, operands);
+          else
+            createRuntimeCall(module, builder, loc, name, operands);
+        };
         llvm::SmallVector<Value> beginOperands{
             kernelIdValue,
             rankValue,
@@ -1399,8 +1522,7 @@ struct FNACCLowerToRuntimePass
             constantI32(builder, loc, k.arrayArguments.size()),
             constantI32(builder, loc,
                         k.scalarRefs.size() + k.indexRefs.size())};
-        createRuntimeCall(module, builder, loc, "__fnacc_begin_launch_v2",
-                          beginOperands);
+        emitLaunchCall("__fnacc_begin_launch_v2", beginOperands);
 
         for (auto [index, array] : llvm::enumerate(k.arrayArguments)) {
           auto layout = tryCreateLaunchArrayArgs(
@@ -1438,8 +1560,7 @@ struct FNACCLowerToRuntimePass
               stride(0),
               stride(1),
               stride(2)};
-          createRuntimeCall(module, builder, loc, "__fnacc_bind_array_v2",
-                            bindOperands);
+          emitLaunchCall("__fnacc_bind_array_v2", bindOperands);
         }
 
         if (fir::fnacc::isReductionKernelKind(k.kind)) {
@@ -1449,8 +1570,7 @@ struct FNACCLowerToRuntimePass
                   builder, loc, output.scalarRef, k.elementType);
               Value initialValue =
                   fir::LoadOp::create(builder, loc, output.scalarRef);
-              createRuntimeCall(
-                  module, builder, loc,
+              emitLaunchCall(
                   getIndexedReductionResultBindRuntimeName(k.elementType),
                   ValueRange{constantI32(builder, loc, index), resultPtr,
                              initialValue});
@@ -1465,33 +1585,31 @@ struct FNACCLowerToRuntimePass
                 builder, loc, k.reductionScalarRef, k.elementType);
             Value initialValue =
                 fir::LoadOp::create(builder, loc, k.reductionScalarRef);
-            createRuntimeCall(module, builder, loc,
-                              getReductionResultBindRuntimeName(k.elementType),
-                              ValueRange{resultPtr, initialValue});
+            emitLaunchCall(getReductionResultBindRuntimeName(k.elementType),
+                           ValueRange{resultPtr, initialValue});
           }
         }
 
         StringRef scalarBindName = getScalarBindRuntimeName(k.elementType);
         for (auto [index, scalarRef] : llvm::enumerate(k.scalarRefs)) {
           Value scalarValue = fir::LoadOp::create(builder, loc, scalarRef);
-          createRuntimeCall(
-              module, builder, loc, scalarBindName,
+          emitLaunchCall(
+              scalarBindName,
               ValueRange{constantI32(builder, loc, index), scalarValue});
         }
 
         for (auto [index, indexRef] : llvm::enumerate(k.indexRefs)) {
           Value indexValue = fir::LoadOp::create(builder, loc, indexRef);
           indexValue = convertToI32(builder, loc, indexValue);
-          createRuntimeCall(
-              module, builder, loc, "__fnacc_bind_scalar_i32_v2",
+          emitLaunchCall(
+              "__fnacc_bind_scalar_i32_v2",
               ValueRange{constantI32(
                              builder, loc,
                              static_cast<int32_t>(k.scalarRefs.size() + index)),
                          indexValue});
         }
 
-        createRuntimeCall(module, builder, loc, "__fnacc_commit_launch_v2",
-                          ValueRange{});
+        emitLaunchCall("__fnacc_commit_launch_v2", ValueRange{});
         launchOp.erase();
         ++fallbackKernelId;
         continue;
@@ -1510,6 +1628,11 @@ struct FNACCLowerToRuntimePass
 
 } // namespace
 
+std::unique_ptr<mlir::Pass>
+fir::fnacc::createFNACCLowerToRuntimePass(int32_t launchAbi) {
+  return std::make_unique<FNACCLowerToRuntimePass>(launchAbi);
+}
+
 std::unique_ptr<mlir::Pass> fir::fnacc::createFNACCLowerToRuntimePass() {
-  return std::make_unique<FNACCLowerToRuntimePass>();
+  return createFNACCLowerToRuntimePass(2);
 }

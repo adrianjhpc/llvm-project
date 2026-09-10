@@ -23,6 +23,10 @@ struct FNACCPipelineOptions
       llvm::cl::desc("Emit external Fortran ABI aliases for transformed "
                      "top-level procedures"),
       llvm::cl::init(false)};
+  Option<int32_t> launchAbi{*this, "launch-abi",
+                            llvm::cl::desc("Host launch ABI: 2 or 3"),
+                            llvm::cl::init(2)};
+
   Option<int32_t> numWarps{*this, "num-warps",
                            llvm::cl::desc("Number of Triton warps per CTA"),
                            llvm::cl::init(1)};
@@ -72,7 +76,7 @@ void buildFNACCPipeline(mlir::OpPassManager &pm,
       options.backend, options.fallbackBackend, options.allowBackendFallback,
       options.acceleratorTarget));
 
-  pm.addPass(createFNACCLowerToRuntimePass());
+  pm.addPass(createFNACCLowerToRuntimePass(options.launchAbi));
 
   if (options.emitFortranAliases)
     pm.addPass(createFNACCEmitFortranAliasesPass());
