@@ -1,7 +1,7 @@
 ! RUN: %flang_fc1 -triple x86_64-unknown-linux-gnu -emit-fir %s -o %t.fir
-! RUN: fir-opt --fnacc-pipeline="launch-abi=3 ttir-output=%t.v3.ttir json-output=%t.v3.json" %t.fir -o %t.v3.fir
+! RUN: fir-opt --fnacc-pipeline="ttir-output=%t.v3.ttir json-output=%t.v3.json" %t.fir -o %t.v3.fir
 ! RUN: FileCheck %s --check-prefix=V3 --implicit-check-not=__fnacc_begin_launch_v2 --implicit-check-not=__fnacc_bind_ --implicit-check-not=__fnacc_commit_launch_v2 --input-file=%t.v3.fir
-! RUN: fir-opt --fnacc-pipeline="ttir-output=%t.v2.ttir json-output=%t.v2.json" %t.fir -o %t.v2.fir
+! RUN: fir-opt --fnacc-pipeline="launch-abi=2 ttir-output=%t.v2.ttir json-output=%t.v2.json" %t.fir -o %t.v2.fir
 ! RUN: FileCheck %s --check-prefix=V2 --implicit-check-not=__fnacc_launch_v3 --input-file=%t.v2.fir
 ! RUN: diff %t.v2.ttir %t.v3.ttir
 ! RUN: diff %t.v2.json %t.v3.json

@@ -98,7 +98,7 @@ def FNACCLowerToRuntime : Pass<"fnacc-lower-to-runtime", "mlir::ModuleOp"> {
   }];
   let constructor = "fir::fnacc::createFNACCLowerToRuntimePass()";
   let options = [
-    Option<"launchAbi", "launch-abi", "int32_t", "2",
+    Option<"launchAbi", "launch-abi", "int32_t", "3",
            "Host launch ABI: 2 (binding calls) or 3 (single request)">
   ];
   let dependentDialects = [

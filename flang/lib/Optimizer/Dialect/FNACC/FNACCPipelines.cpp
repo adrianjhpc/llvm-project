@@ -25,7 +25,7 @@ struct FNACCPipelineOptions
       llvm::cl::init(false)};
   Option<int32_t> launchAbi{*this, "launch-abi",
                             llvm::cl::desc("Host launch ABI: 2 or 3"),
-                            llvm::cl::init(2)};
+                            llvm::cl::init(3)};
 
   Option<int32_t> numWarps{*this, "num-warps",
                            llvm::cl::desc("Number of Triton warps per CTA"),

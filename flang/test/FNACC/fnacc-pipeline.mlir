@@ -1,5 +1,5 @@
 // RUN: fir-opt \
-// RUN:   --fnacc-pipeline="ttir-output=%t.ttir json-output=%t.json" \
+// RUN:   --fnacc-pipeline="launch-abi=2 ttir-output=%t.ttir json-output=%t.json" \
 // RUN:   %s -o %t.host.mlir
 // RUN: FileCheck %s --check-prefix=HOST --input-file=%t.host.mlir
 // RUN: FileCheck %s --check-prefix=TTIR --input-file=%t.ttir
