@@ -421,7 +421,10 @@ static void populateVariadicArrayArguments(ElementwiseKernel &kernel) {
   for (Value array : kernel.readArrays)
     addArray(array, true, false);
   if (kernel.writeArray)
-    addArray(kernel.writeArray, false, true);
+    // Matmul can write a subrectangle. Preserve untouched C elements on
+    // temporary allocations and full-array copyback.
+    addArray(kernel.writeArray, kernel.kind == ElementwiseKernelKind::MatMul2D,
+             true);
 }
 
 static ElementwiseRecognitionResult
@@ -4375,11 +4378,6 @@ recognizeMatMul2D(fir::fnacc::LaunchOp launchOp) {
 
   if (!verifyLoopLowerBoundAndStep(pLoop, "matmul p", loopReason))
     return fail(pLoop.getOperation(), loopReason);
-  if (!isConstantIntegerValue(jLoop.getLowerBound(), 1) ||
-      !isConstantIntegerValue(iLoop.getLowerBound(), 1) ||
-      !isConstantIntegerValue(pLoop.getLowerBound(), 1))
-    return fail(iLoop.getOperation(),
-                "matmul loop lower bounds must be constant 1");
 
   Value jMemref = findInductionMemref(jLoop);
   Value iMemref = findInductionMemref(iLoop);
@@ -4433,6 +4431,9 @@ recognizeMatMul2D(fir::fnacc::LaunchOp launchOp) {
   k.extentY = getLoopExtentSource(jLoop); // m
   k.extentX = getLoopExtentSource(iLoop); // n
   k.extentZ = getLoopExtentSource(pLoop); // k
+  k.loopLowerX = getLoopLowerSource(iLoop);
+  k.loopLowerY = getLoopLowerSource(jLoop);
+  k.loopLowerZ = getLoopLowerSource(pLoop);
 
   k.readArrays.push_back(aArray);
   k.readArrays.push_back(bArray);
@@ -4863,15 +4864,29 @@ static FNACCKernelABI buildKernelABI(fir::fnacc::LaunchOp launchOp,
                            0);
       }
     } else if (kernel.kind == ElementwiseKernelKind::Stencil2D ||
-               kernel.kind == ElementwiseKernelKind::MultiReduction2D) {
+               kernel.kind == ElementwiseKernelKind::MultiReduction2D ||
+               kernel.kind == ElementwiseKernelKind::MatMul2D) {
       appendABIParameter(abi, FNACCKernelParameterRole::LoopLowerX,
                          FNACCKernelParameterPassing::Value, ElementType::I32,
                          "loop_lower_x");
       appendABIParameter(abi, FNACCKernelParameterRole::LoopLowerY,
                          FNACCKernelParameterPassing::Value, ElementType::I32,
                          "loop_lower_y");
+      if (kernel.kind == ElementwiseKernelKind::MatMul2D)
+        appendABIParameter(abi, FNACCKernelParameterRole::LoopLowerZ,
+                           FNACCKernelParameterPassing::Value, ElementType::I32,
+                           "loop_lower_z");
 
-      for (unsigned array = 0; array < kernel.arrayArguments.size(); ++array) {
+      llvm::SmallVector<unsigned> layoutArrays;
+      if (kernel.kind == ElementwiseKernelKind::MatMul2D) {
+        for (Value array : kernel.readArrays)
+          layoutArrays.push_back(findArrayIndex(array));
+        layoutArrays.push_back(findArrayIndex(kernel.writeArray));
+      } else {
+        for (unsigned array = 0; array < kernel.arrayArguments.size(); ++array)
+          layoutArrays.push_back(array);
+      }
+      for (unsigned array : layoutArrays) {
         for (unsigned dim = 0; dim < 2; ++dim)
           appendABIParameter(
               abi, FNACCKernelParameterRole::ArrayLowerBound,

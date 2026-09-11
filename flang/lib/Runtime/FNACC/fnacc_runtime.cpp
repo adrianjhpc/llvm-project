@@ -1091,7 +1091,9 @@ static void fnaccValidateVariadicKernelMetadata(const FNACCKernelDesc &desc) {
       unsigned dim = parameter.role == FNACCKernelParameterRole::LoopLowerX ? 0
           : parameter.role == FNACCKernelParameterRole::LoopLowerY          ? 1
                                                                             : 2;
-      if (dim >= static_cast<unsigned>(desc.rank) || parameter.type != "i32") {
+      if ((dim >= static_cast<unsigned>(desc.rank) &&
+              !(desc.kind == "matmul2d" && dim == 2)) ||
+          parameter.type != "i32") {
         std::fprintf(stderr,
             "FNACC error: invalid v2 loop-lower metadata for kernel id %d "
             "slot %d\n",
@@ -4682,6 +4684,14 @@ static bool fnaccTryCommitMatmulLaunchV2(
     const FNACCKernelDesc *desc, const FNACCPendingLaunchV2 &pending) {
   if (desc->kind != "matmul2d")
     return false;
+  // New kernels carry bounds/strides and use the generic checked argument path.
+  // Keep the six-argument legacy launcher for previously embedded images.
+  if (std::any_of(desc->parameters.begin(), desc->parameters.end(),
+          [](const FNACCKernelParameterDesc &p) {
+            return p.role == FNACCKernelParameterRole::LoopLowerZ;
+          }))
+    return false;
+
   if (pending.arrays.size() != 3 || (pending.arrays[0].flags & 1) == 0 ||
       (pending.arrays[1].flags & 1) == 0 ||
       (pending.arrays[2].flags & 2) == 0) {
@@ -4804,6 +4814,38 @@ extern "C" void __fnacc_commit_launch_v2() {
   if (pending.extent[0] <= 0 || (pending.rank >= 2 && pending.extent[1] <= 0)) {
     fnaccClearPendingLaunchV2();
     return;
+  }
+
+  if (desc->isMatmul) {
+    // Each operand's selected rectangle must fit its full bound allocation.
+    // K=0 still writes the zero accumulator to C, but does not read A or B.
+    const int rows[] = {0, 2, 0};
+    const int cols[] = {2, 1, 1};
+    for (int operand = 0; operand < 3; ++operand) {
+      const auto &parameter = desc->parameters.at(operand);
+      const auto &array = pending.arrays.at(parameter.arrayIndex);
+      int r = rows[operand], c = cols[operand];
+      if (pending.extent[r] <= 0 || pending.extent[c] <= 0)
+        continue;
+      int64_t dr = int64_t(pending.loopLower[r]) -
+          fnaccCheckedI32Layout(array.lower[0], "matmul row lower bound");
+      int64_t dc = int64_t(pending.loopLower[c]) -
+          fnaccCheckedI32Layout(array.lower[1], "matmul column lower bound");
+      int64_t lastRow = dr + pending.extent[r] - 1;
+      int64_t lastCol = dc + pending.extent[c] - 1;
+      int64_t elemBytes = parameter.type == "ptr<f64>" ? 8 : 4;
+      // Current data ABI requires contiguous column-major storage.
+      bool valid = array.stride[0] == 1 && array.stride[1] > 0 && dr >= 0 &&
+          dc >= 0 && lastRow < array.stride[1] &&
+          lastCol < array.bytes / elemBytes / array.stride[1];
+      if (!valid) {
+        std::fprintf(stderr,
+            "FNACC error: matmul operand rectangle is outside "
+            "its contiguous allocation (kernel %d, operand %d)\n",
+            pending.kernelId, operand);
+        std::abort();
+      }
+    }
   }
 
   CUfunction function = getKernelFunction(pending.kernelId);
@@ -4929,8 +4971,18 @@ extern "C" void __fnacc_commit_launch_v2() {
 
   // For profiling
   FNACC_PROFILE_PUSH("fnacc.launch");
-  FNACC_CUDA_CHECK(cuLaunchKernel(function, gridX, gridY, 1, cudaBlockX, 1, 1,
-      0, fnaccActiveContextState().stream, arguments.data(), nullptr));
+  unsigned sharedBytes = 0;
+  if (desc->isMatmul) {
+    bool f64 = desc->parameters.front().type == "ptr<f64>";
+    sharedBytes = f64 ? fnaccMatmulF64DynamicSharedBytes(desc, pending.block[0],
+                            pending.block[1], pending.block[2])
+                      : fnaccMatmulDynamicSharedBytes(desc, pending.block[0],
+                            pending.block[1], pending.block[2]);
+  }
+  fnaccConfigureDynamicSharedMemory(function, pending.kernelId, sharedBytes);
+  FNACC_CUDA_CHECK(
+      cuLaunchKernel(function, gridX, gridY, 1, cudaBlockX, 1, 1, sharedBytes,
+          fnaccActiveContextState().stream, arguments.data(), nullptr));
   fnaccCompleteArrayLaunch(std::all_of(
       deviceArgs.begin(), deviceArgs.end(), [](const FNACCDeviceArg &arg) {
         return arg.cached && arg.target == FNACC_PACK_TARGET_DEVICE;

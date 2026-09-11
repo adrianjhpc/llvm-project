@@ -1892,6 +1892,55 @@ static void emitTritonMultiReduction2D(const fir::fnacc::ElementwiseKernel &k,
   os << "}\n\n";
 }
 
+// Matmul layout parameters follow the public ABI parameter order.
+static void emitMatmulLayoutParameters(llvm::raw_ostream &os) {
+  os << ", %lx: i32, %ly: i32, %lz: i32";
+  for (StringRef name : {"a", "b", "c"})
+    os << ", %" << name << "_l0: i32, %" << name << "_l1: i32, %" << name
+       << "_s0: i32, %" << name << "_s1: i32";
+  os << ") attributes {noinline = false} {\n";
+}
+
+// Coordinates are tensors of the same shape, including the FMA vector path.
+static void emitMatmulOffsets(llvm::raw_ostream &os, StringRef array,
+                              StringRef suffix, StringRef row, StringRef col,
+                              StringRef shape, StringRef lowerRow,
+                              StringRef lowerCol) {
+  std::string stem = array.str() + "_addr" + suffix.str();
+  std::string ty = "tensor<" + shape.str() + "xi64>";
+  auto splat = [&](StringRef label, StringRef value) {
+    os << "    %" << stem << "_" << label << "64 = arith.extsi %" << value
+       << " : i32 to i64\n";
+    os << "    %" << stem << "_" << label << " = tt.splat %" << stem << "_"
+       << label << "64"
+       << " : i64 -> " << ty << "\n";
+  };
+  splat("lr", lowerRow);
+  splat("lc", lowerCol);
+  splat("ar", array.str() + "_l0");
+  splat("ac", array.str() + "_l1");
+  splat("sr", array.str() + "_s0");
+  splat("sc", array.str() + "_s1");
+  os << "    %" << stem << "_row64 = arith.extsi %" << row << " : tensor<"
+     << shape << "xi32> to " << ty << "\n";
+  os << "    %" << stem << "_col64 = arith.extsi %" << col << " : tensor<"
+     << shape << "xi32> to " << ty << "\n";
+  os << "    %" << stem << "_r = arith.addi %" << stem << "_row64, %" << stem
+     << "_lr : " << ty << "\n";
+  os << "    %" << stem << "_c = arith.addi %" << stem << "_col64, %" << stem
+     << "_lc : " << ty << "\n";
+  os << "    %" << stem << "_dr = arith.subi %" << stem << "_r, %" << stem
+     << "_ar : " << ty << "\n";
+  os << "    %" << stem << "_dc = arith.subi %" << stem << "_c, %" << stem
+     << "_ac : " << ty << "\n";
+  os << "    %" << stem << "_pr = arith.muli %" << stem << "_dr, %" << stem
+     << "_sr : " << ty << "\n";
+  os << "    %" << stem << "_pc = arith.muli %" << stem << "_dc, %" << stem
+     << "_sc : " << ty << "\n";
+  os << "    %" << array << "_offsets" << suffix << " = arith.addi %" << stem
+     << "_pr, %" << stem << "_pc : " << ty << "\n";
+}
+
 static void emitTritonMatMul2DDot(const fir::fnacc::ElementwiseKernel &k,
                                   int64_t blockM, int64_t blockN,
                                   int64_t blockK, StringRef kernelName,
@@ -1903,7 +1952,8 @@ static void emitTritonMatMul2DDot(const fir::fnacc::ElementwiseKernel &k,
   os << "tt.func @" << kernelName << "(%a: " << ptrTy << ", %b: " << ptrTy
      << ", %c: " << ptrTy
      << ", "
-        "%n: i32, %m: i32, %k: i32) attributes {noinline = false} {\n";
+        "%n: i32, %m: i32, %k: i32";
+  emitMatmulLayoutParameters(os);
 
   os << "  %pid_m = tt.get_program_id x : i32\n";
   os << "  %pid_n = tt.get_program_id y : i32\n";
@@ -1965,8 +2015,9 @@ static void emitTritonMatMul2DDot(const fir::fnacc::ElementwiseKernel &k,
      << "xi32>\n";
   os << "    %a_k_n = arith.muli %offs_k_b_a, %n_s_a : tensor<" << blockM << "x"
      << blockK << "xi32>\n";
-  os << "    %a_offsets = arith.addi %offs_m_b, %a_k_n : tensor<" << blockM
-     << "x" << blockK << "xi32>\n";
+  emitMatmulOffsets(os, "a", "", "offs_m_b", "offs_k_b_a",
+                    std::to_string(blockM) + "x" + std::to_string(blockK), "lx",
+                    "lz");
 
   os << "    %offs_k_e_b = tt.expand_dims %offs_k {axis = 1 : i32} : tensor<"
      << blockK << "xi32> -> tensor<" << blockK << "x1xi32>\n";
@@ -1980,8 +2031,9 @@ static void emitTritonMatMul2DDot(const fir::fnacc::ElementwiseKernel &k,
      << "xi32>\n";
   os << "    %b_n_k = arith.muli %offs_n_b, %k_s_b : tensor<" << blockK << "x"
      << blockN << "xi32>\n";
-  os << "    %b_offsets = arith.addi %offs_k_b_b, %b_n_k : tensor<" << blockK
-     << "x" << blockN << "xi32>\n";
+  emitMatmulOffsets(os, "b", "", "offs_k_b_b", "offs_n_b",
+                    std::to_string(blockK) + "x" + std::to_string(blockN), "lz",
+                    "ly");
 
   os << "    %k_s_k = tt.splat %k : i32 -> tensor<" << blockK << "xi32>\n";
   os << "    %mask_k = arith.cmpi slt, %offs_k, %k_s_k : tensor<" << blockK
@@ -2015,10 +2067,10 @@ static void emitTritonMatMul2DDot(const fir::fnacc::ElementwiseKernel &k,
      << "x" << blockN << "x" << ptrTy << ">\n";
   os << "    %a_ptrs = tt.addptr %a_base, %a_offsets : tensor<" << blockM << "x"
      << blockK << "x" << ptrTy << ">, tensor<" << blockM << "x" << blockK
-     << "xi32>\n";
+     << "xi64>\n";
   os << "    %b_ptrs = tt.addptr %b_base, %b_offsets : tensor<" << blockK << "x"
      << blockN << "x" << ptrTy << ">, tensor<" << blockK << "x" << blockN
-     << "xi32>\n";
+     << "xi64>\n";
   // Masked-off K lanes still participate in the dot product. A masked load
   // without an explicit other value is undefined, not a zero-padding operation.
   os << "    %a_zero = tt.splat %zero : " << elemTy << " -> tensor<" << blockM
@@ -2055,8 +2107,9 @@ static void emitTritonMatMul2DDot(const fir::fnacc::ElementwiseKernel &k,
      << "xi32>\n";
   os << "  %c_j_n = arith.muli %offs_n_b_c, %n_s_c : tensor<" << blockM << "x"
      << blockN << "xi32>\n";
-  os << "  %c_offsets = arith.addi %offs_m_b_c, %c_j_n : tensor<" << blockM
-     << "x" << blockN << "xi32>\n";
+  emitMatmulOffsets(os, "c", "", "offs_m_b_c", "offs_n_b_c",
+                    std::to_string(blockM) + "x" + std::to_string(blockN), "lx",
+                    "ly");
 
   os << "  %mask_m_e_c = tt.expand_dims %mask_m {axis = 1 : i32} : tensor<"
      << blockM << "xi1> -> tensor<" << blockM << "x1xi1>\n";
@@ -2073,7 +2126,7 @@ static void emitTritonMatMul2DDot(const fir::fnacc::ElementwiseKernel &k,
      << blockN << "x" << ptrTy << ">\n";
   os << "  %c_ptrs = tt.addptr %c_base, %c_offsets : tensor<" << blockM << "x"
      << blockN << "x" << ptrTy << ">, tensor<" << blockM << "x" << blockN
-     << "xi32>\n";
+     << "xi64>\n";
   os << "  tt.store %c_ptrs, %acc, %mask_c : tensor<" << blockM << "x" << blockN
      << "x" << ptrTy << ">\n";
 
@@ -2108,8 +2161,8 @@ static void emitTritonMatMul2DF64Reduce(const fir::fnacc::ElementwiseKernel &k,
   std::string elemTy = ttElementType(k.elementType).str();
 
   os << "tt.func @" << kernelName << "(%a: " << ptrTy << ", %b: " << ptrTy
-     << ", %c: " << ptrTy
-     << ", %n: i32, %m: i32, %k: i32) attributes {noinline = false} {\n";
+     << ", %c: " << ptrTy << ", %n: i32, %m: i32, %k: i32";
+  emitMatmulLayoutParameters(os);
 
   os << "  %pid_m = tt.get_program_id x : i32\n";
   os << "  %pid_n = tt.get_program_id y : i32\n";
@@ -2182,8 +2235,9 @@ static void emitTritonMatMul2DF64Reduce(const fir::fnacc::ElementwiseKernel &k,
      << "xi32>\n";
   os << "    %a_col = arith.muli %offs_k_b_a, %n_s_a : tensor<" << blockM << "x"
      << blockK << "xi32>\n";
-  os << "    %a_offsets = arith.addi %offs_m_b_a, %a_col : tensor<" << blockM
-     << "x" << blockK << "xi32>\n";
+  emitMatmulOffsets(os, "a", "", "offs_m_b_a", "offs_k_b_a",
+                    std::to_string(blockM) + "x" + std::to_string(blockK), "lx",
+                    "lz");
 
   // B offsets emitted as B(j, p) logical tensor N x K:
   // B(p,j), column-major offset = p + j * k.
@@ -2201,8 +2255,9 @@ static void emitTritonMatMul2DF64Reduce(const fir::fnacc::ElementwiseKernel &k,
      << "xi32>\n";
   os << "    %b_col = arith.muli %offs_n_b_b, %k_s_b : tensor<" << blockN << "x"
      << blockK << "xi32>\n";
-  os << "    %b_offsets = arith.addi %offs_k_b_b, %b_col : tensor<" << blockN
-     << "x" << blockK << "xi32>\n";
+  emitMatmulOffsets(os, "b", "", "offs_k_b_b", "offs_n_b_b",
+                    std::to_string(blockN) + "x" + std::to_string(blockK), "lz",
+                    "ly");
 
   // Masks.
   os << "    %mask_m_e_a = tt.expand_dims %mask_m {axis = 1 : i32} "
@@ -2239,10 +2294,10 @@ static void emitTritonMatMul2DF64Reduce(const fir::fnacc::ElementwiseKernel &k,
 
   os << "    %a_ptrs = tt.addptr %a_base, %a_offsets : tensor<" << blockM << "x"
      << blockK << "x" << ptrTy << ">, tensor<" << blockM << "x" << blockK
-     << "xi32>\n";
+     << "xi64>\n";
   os << "    %b_ptrs = tt.addptr %b_base, %b_offsets : tensor<" << blockN << "x"
      << blockK << "x" << ptrTy << ">, tensor<" << blockN << "x" << blockK
-     << "xi32>\n";
+     << "xi64>\n";
 
   os << "    %a_tile = tt.load %a_ptrs, %mask_a : tensor<" << blockM << "x"
      << blockK << "x" << ptrTy << ">\n";
@@ -2303,8 +2358,9 @@ static void emitTritonMatMul2DF64Reduce(const fir::fnacc::ElementwiseKernel &k,
   os << "  %c_j_n = arith.muli %offs_n_b_c, %n_s_c : tensor<" << blockM << "x"
      << blockN << "xi32>\n";
 
-  os << "  %c_offsets = arith.addi %offs_m_b_c, %c_j_n : tensor<" << blockM
-     << "x" << blockN << "xi32>\n";
+  emitMatmulOffsets(os, "c", "", "offs_m_b_c", "offs_n_b_c",
+                    std::to_string(blockM) + "x" + std::to_string(blockN), "lx",
+                    "ly");
 
   os << "  %mask_m_e_c = tt.expand_dims %mask_m {axis = 1 : i32} : tensor<"
      << blockM << "xi1> -> tensor<" << blockM << "x1xi1>\n";
@@ -2326,7 +2382,7 @@ static void emitTritonMatMul2DF64Reduce(const fir::fnacc::ElementwiseKernel &k,
 
   os << "  %c_ptrs = tt.addptr %c_base, %c_offsets : tensor<" << blockM << "x"
      << blockN << "x" << ptrTy << ">, tensor<" << blockM << "x" << blockN
-     << "xi32>\n";
+     << "xi64>\n";
 
   os << "  tt.store %c_ptrs, %acc, %mask_c : tensor<" << blockM << "x" << blockN
      << "x" << ptrTy << ">\n";
@@ -2346,8 +2402,8 @@ static void emitTritonMatMul2DF64FMA(const fir::fnacc::ElementwiseKernel &k,
   std::string elemTy = ttElementType(k.elementType).str();
 
   os << "tt.func @" << kernelName << "(%a: " << ptrTy << ", %b: " << ptrTy
-     << ", %c: " << ptrTy
-     << ", %n: i32, %m: i32, %k: i32) attributes {noinline = false} {\n";
+     << ", %c: " << ptrTy << ", %n: i32, %m: i32, %k: i32";
+  emitMatmulLayoutParameters(os);
 
   os << "  %pid_m = tt.get_program_id x : i32\n";
   os << "  %pid_n = tt.get_program_id y : i32\n";
@@ -2431,8 +2487,8 @@ static void emitTritonMatMul2DF64FMA(const fir::fnacc::ElementwiseKernel &k,
        << blockM << "xi32>\n";
     os << "    %a_col" << suffix << " = arith.muli %kk_m" << suffix
        << ", %n_s_m_body" << suffix << " : tensor<" << blockM << "xi32>\n";
-    os << "    %a_offsets" << suffix << " = arith.addi %offs_m, %a_col"
-       << suffix << " : tensor<" << blockM << "xi32>\n";
+    emitMatmulOffsets(os, "a", suffix, "offs_m", "kk_m" + suffix,
+                      std::to_string(blockM), "lx", "lz");
 
     // B(kk+q, j), column-major offset:
     //
@@ -2443,8 +2499,8 @@ static void emitTritonMatMul2DF64FMA(const fir::fnacc::ElementwiseKernel &k,
        << blockN << "xi32>\n";
     os << "    %b_col" << suffix << " = arith.muli %offs_n, %k_s_n_body"
        << suffix << " : tensor<" << blockN << "xi32>\n";
-    os << "    %b_offsets" << suffix << " = arith.addi %kk_n" << suffix
-       << ", %b_col" << suffix << " : tensor<" << blockN << "xi32>\n";
+    emitMatmulOffsets(os, "b", suffix, "kk_n" + suffix, "offs_n",
+                      std::to_string(blockN), "lz", "ly");
 
     os << "    %a_base" << suffix << " = tt.splat %a : " << ptrTy
        << " -> tensor<" << blockM << "x" << ptrTy << ">\n";
@@ -2453,10 +2509,10 @@ static void emitTritonMatMul2DF64FMA(const fir::fnacc::ElementwiseKernel &k,
 
     os << "    %a_ptrs" << suffix << " = tt.addptr %a_base" << suffix
        << ", %a_offsets" << suffix << " : tensor<" << blockM << "x" << ptrTy
-       << ">, tensor<" << blockM << "xi32>\n";
+       << ">, tensor<" << blockM << "xi64>\n";
     os << "    %b_ptrs" << suffix << " = tt.addptr %b_base" << suffix
        << ", %b_offsets" << suffix << " : tensor<" << blockN << "x" << ptrTy
-       << ">, tensor<" << blockN << "xi32>\n";
+       << ">, tensor<" << blockN << "xi64>\n";
 
     os << "    %a_vec" << suffix << " = tt.load %a_ptrs" << suffix
        << ", %mask_a" << suffix << " : tensor<" << blockM << "x" << ptrTy
@@ -2520,8 +2576,9 @@ static void emitTritonMatMul2DF64FMA(const fir::fnacc::ElementwiseKernel &k,
   os << "  %c_j_n = arith.muli %offs_n_b_c, %n_s_c : tensor<" << blockM << "x"
      << blockN << "xi32>\n";
 
-  os << "  %c_offsets = arith.addi %offs_m_b_c, %c_j_n : tensor<" << blockM
-     << "x" << blockN << "xi32>\n";
+  emitMatmulOffsets(os, "c", "", "offs_m_b_c", "offs_n_b_c",
+                    std::to_string(blockM) + "x" + std::to_string(blockN), "lx",
+                    "ly");
 
   os << "  %mask_m_e_c = tt.expand_dims %mask_m {axis = 1 : i32} : tensor<"
      << blockM << "xi1> -> tensor<" << blockM << "x1xi1>\n";
@@ -2543,7 +2600,7 @@ static void emitTritonMatMul2DF64FMA(const fir::fnacc::ElementwiseKernel &k,
 
   os << "  %c_ptrs = tt.addptr %c_base, %c_offsets : tensor<" << blockM << "x"
      << blockN << "x" << ptrTy << ">, tensor<" << blockM << "x" << blockN
-     << "xi32>\n";
+     << "xi64>\n";
 
   os << "  tt.store %c_ptrs, %acc, %mask_c : tensor<" << blockM << "x" << blockN
      << "x" << ptrTy << ">\n";

@@ -490,6 +490,27 @@ materializeTripExtent(OpBuilder &builder, Location loc,
                                 constantI32(builder, loc, 0));
 }
 
+// Compute in i64 so negative origins and empty ranges cannot overflow the
+// subtraction. Bounds and nonempty trip counts retain the existing i32 ABI.
+static Value
+materializeMatmulTripExtent(OpBuilder &builder, Location loc,
+                            fir::fnacc::LaunchOp launchOp,
+                            const fir::fnacc::ElementwiseExtentSource &upper,
+                            const fir::fnacc::ElementwiseExtentSource &lower) {
+  Value u = materializeExtentValue(builder, loc, launchOp, upper);
+  Value l = materializeExtentValue(builder, loc, launchOp, lower);
+  if (!u || !l)
+    return {};
+  Value difference =
+      arith::SubIOp::create(builder, loc, convertToI64(builder, loc, u),
+                            convertToI64(builder, loc, l));
+  Value count = arith::AddIOp::create(builder, loc, difference,
+                                      constantI64(builder, loc, 1));
+  Value nonnegative =
+      arith::MaxSIOp::create(builder, loc, count, constantI64(builder, loc, 0));
+  return convertToI32(builder, loc, nonnegative);
+}
+
 static std::optional<int64_t> getElementByteSize(Type elementType) {
   if (elementType.isF32())
     return 4;
@@ -1450,22 +1471,29 @@ struct FNACCLowerToRuntimePass
 
       bool hasLogicalBounds2D =
           k.kind == fir::fnacc::ElementwiseKernelKind::Stencil2D ||
-          k.kind == fir::fnacc::ElementwiseKernelKind::MultiReduction2D;
+          k.kind == fir::fnacc::ElementwiseKernelKind::MultiReduction2D ||
+          k.kind == fir::fnacc::ElementwiseKernelKind::MatMul2D;
       bool hasLogicalBounds1D =
           k.kind == fir::fnacc::ElementwiseKernelKind::MultiExpr1D ||
           (fir::fnacc::isReductionKernelKind(k.kind) && k.rank == 1);
+      auto tripExtent = [&](const fir::fnacc::ElementwiseExtentSource &upper,
+                            const fir::fnacc::ElementwiseExtentSource &lower) {
+        return k.kind == fir::fnacc::ElementwiseKernelKind::MatMul2D
+                   ? materializeMatmulTripExtent(builder, loc, launchOp, upper,
+                                                 lower)
+                   : materializeTripExtent(builder, loc, launchOp, upper,
+                                           lower);
+      };
       Value extentXValue =
           hasLogicalBounds2D || hasLogicalBounds1D
-              ? materializeTripExtent(builder, loc, launchOp, k.extentX,
-                                      k.loopLowerX)
+              ? tripExtent(k.extentX, k.loopLowerX)
               : materializeExtentValue(builder, loc, launchOp, k.extentX);
 
       Value extentYValue;
       if (k.rank == 2) {
         extentYValue =
             hasLogicalBounds2D
-                ? materializeTripExtent(builder, loc, launchOp, k.extentY,
-                                        k.loopLowerY)
+                ? tripExtent(k.extentY, k.loopLowerY)
                 : materializeExtentValue(builder, loc, launchOp, k.extentY);
       } else {
         extentYValue = arith::ConstantIntOp::create(builder, loc, 1, 32);
@@ -1473,8 +1501,7 @@ struct FNACCLowerToRuntimePass
 
       Value extentZValue;
       if (k.kind == fir::fnacc::ElementwiseKernelKind::MatMul2D) {
-        extentZValue =
-            materializeExtentValue(builder, loc, launchOp, k.extentZ);
+        extentZValue = tripExtent(k.extentZ, k.loopLowerZ);
       } else {
         extentZValue = arith::ConstantIntOp::create(builder, loc, 1, 32);
       }
@@ -1492,9 +1519,12 @@ struct FNACCLowerToRuntimePass
           hasLogicalBounds2D
               ? materializeExtentValue(builder, loc, launchOp, k.loopLowerY)
               : constantI32(builder, loc, 1);
-      Value loopLowerZValue = constantI32(builder, loc, 1);
+      Value loopLowerZValue =
+          k.kind == fir::fnacc::ElementwiseKernelKind::MatMul2D
+              ? materializeExtentValue(builder, loc, launchOp, k.loopLowerZ)
+              : constantI32(builder, loc, 1);
 
-      if (!loopLowerXValue || !loopLowerYValue) {
+      if (!loopLowerXValue || !loopLowerYValue || !loopLowerZValue) {
         signalPassFailure();
         return;
       }
