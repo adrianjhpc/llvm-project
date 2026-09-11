@@ -447,6 +447,16 @@ validateRecognizedKernel(fir::fnacc::LaunchOp launchOp,
       kernel.matmulPrecision = MatmulInputPrecision::TF32x3;
   }
   populateVariadicArrayArguments(kernel);
+  // General indexing can leave elements untouched even with unit DO steps:
+  // subregions, shifted stores and predicates do not cover the allocation.
+  // Until full coverage is proven, initialize temporary outputs before their
+  // allocation-wide copyback. Existing resident buffers already retain them.
+  if (kernel.kind == ElementwiseKernelKind::MultiExpr1D ||
+      kernel.kind == ElementwiseKernelKind::Stencil2D ||
+      kernel.loopStepX != 1 || kernel.loopStepY != 1 || kernel.loopStepZ != 1)
+    for (auto &argument : kernel.arrayArguments)
+      if (argument.write)
+        argument.read = true;
 
   if (Operation *unsupported = findDiscardedSideEffect(launchOp, kernel)) {
     std::string reason = "unsupported operation would be discarded: ";
@@ -479,13 +489,21 @@ static bool isConstantIntegerValue(Value v, int64_t expected) {
   return intValue.getSExtValue() == expected;
 }
 
+static std::optional<int64_t> getConstantLoopStep(fir::DoLoopOp loop) {
+  llvm::APInt value;
+  if (!matchPattern(stripFirConvert(loop.getStep()), m_ConstantInt(&value)) ||
+      !value.isSignedIntN(32) || value.isZero())
+    return std::nullopt;
+  return value.getSExtValue();
+}
+
 static bool verifyLoopLowerBoundAndStep(fir::DoLoopOp loop, StringRef loopName,
                                         std::string &reason) {
-  if (!isConstantIntegerValue(loop.getStep(), 1)) {
-    reason = loopName.str() + " loop step must be constant 1";
+  if (!getConstantLoopStep(loop)) {
+    reason = loopName.str() +
+             " loop step must be a nonzero constant signed 32-bit integer";
     return false;
   }
-
   return true;
 }
 
@@ -3108,7 +3126,8 @@ static bool collectArrayAccesses1D(ElementwiseKernel &k, fir::DoLoopOp loop,
     return false;
   }
 
-  bool canonicalPointwise = isConstantIntegerValue(loop.getLowerBound(), 1) &&
+  bool canonicalPointwise = isConstantIntegerValue(loop.getStep(), 1) &&
+                            isConstantIntegerValue(loop.getLowerBound(), 1) &&
                             !info.hasNonIdentitySubscript() &&
                             !info.readArrays.empty() &&
                             info.storedValues.size() == 1;
@@ -3189,6 +3208,8 @@ static bool collectArrayAccesses2D(ElementwiseKernel &k,
     return false;
 
   bool canonicalPointwise =
+      isConstantIntegerValue(innerLoop.getStep(), 1) &&
+      isConstantIntegerValue(k.outerLoop.getStep(), 1) &&
       isConstantIntegerValue(innerLoop.getLowerBound(), 1) &&
       isConstantIntegerValue(k.outerLoop.getLowerBound(), 1) &&
       !info.hasNonIdentitySubscript() && info.storedValues.size() == 1;
@@ -3814,7 +3835,9 @@ recognizeMultiReduction2D(fir::fnacc::LaunchOp launchOp) {
   kernel.extentX = extentX;
   kernel.extentY = extentY;
   kernel.loopLowerX = getLoopLowerSource(innerLoop);
+  kernel.loopStepX = *getConstantLoopStep(innerLoop);
   kernel.loopLowerY = getLoopLowerSource(outerLoop);
+  kernel.loopStepY = *getConstantLoopStep(outerLoop);
   kernel.innerIndMemref = innerIndMemref;
   kernel.outerIndMemref = outerIndMemref;
   kernel.elementType = elementType;
@@ -3989,6 +4012,7 @@ recognizeReduction1D(fir::fnacc::LaunchOp launchOp) {
   k.loop1D = loop;
   k.extentX = extentX;
   k.loopLowerX = getLoopLowerSource(loop);
+  k.loopStepX = *getConstantLoopStep(loop);
   k.innerIndMemref = indMemref;
   k.reductionScalarRef = *reductionScalar;
   k.reductionOperator = *reductionOp;
@@ -4432,8 +4456,11 @@ recognizeMatMul2D(fir::fnacc::LaunchOp launchOp) {
   k.extentX = getLoopExtentSource(iLoop); // n
   k.extentZ = getLoopExtentSource(pLoop); // k
   k.loopLowerX = getLoopLowerSource(iLoop);
+  k.loopStepX = *getConstantLoopStep(iLoop);
   k.loopLowerY = getLoopLowerSource(jLoop);
+  k.loopStepY = *getConstantLoopStep(jLoop);
   k.loopLowerZ = getLoopLowerSource(pLoop);
+  k.loopStepZ = *getConstantLoopStep(pLoop);
 
   k.readArrays.push_back(aArray);
   k.readArrays.push_back(bArray);
@@ -4496,6 +4523,7 @@ static ElementwiseRecognitionResult recognize1D(fir::fnacc::LaunchOp launchOp) {
   k.loop1D = loop;
   k.extentX = extentX;
   k.loopLowerX = getLoopLowerSource(loop);
+  k.loopStepX = *getConstantLoopStep(loop);
   k.innerIndMemref = indMemref;
 
   markLoopBounds(k, launchOp, loop);
@@ -4578,7 +4606,9 @@ static ElementwiseRecognitionResult recognize2D(fir::fnacc::LaunchOp launchOp) {
   k.extentY = extentY;
   k.extentX = extentX;
   k.loopLowerY = getLoopLowerSource(outer);
+  k.loopStepY = *getConstantLoopStep(outer);
   k.loopLowerX = getLoopLowerSource(inner);
+  k.loopStepX = *getConstantLoopStep(inner);
   k.outerIndMemref = outerIndMemref;
   k.innerIndMemref = innerIndMemref;
 

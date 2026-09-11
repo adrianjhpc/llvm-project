@@ -12,17 +12,17 @@ subroutine bad_lower_bound(n, a, b, c)
   end do
 end subroutine
 
-subroutine bad_step(n, a, b, c)
-  integer :: n
+subroutine bad_step(n, a, b, c, step)
+  integer :: n, step
   real :: a(n), b(n), c(n)
   integer :: i
 
   !$fnacc parallel tile(128)
-  do i = 1, n, 2
+  do i = 1, n, step
     c(i) = a(i) + b(i)
   end do
 end subroutine
 
 ! CHECK: error: FNACC cannot plan launch:
-! CHECK-SAME: 1-D loop step must be constant 1
+! CHECK-SAME: 1-D loop step must be a nonzero constant signed 32-bit integer
 

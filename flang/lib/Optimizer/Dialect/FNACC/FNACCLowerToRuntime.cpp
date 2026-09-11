@@ -9,7 +9,9 @@
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/BuiltinOps.h"
+#include "mlir/IR/IRMapping.h"
 #include "mlir/IR/SymbolTable.h"
+#include "mlir/Interfaces/SideEffectInterfaces.h"
 
 #include "llvm/ADT/APFloat.h"
 #include "llvm/ADT/ArrayRef.h"
@@ -325,6 +327,38 @@ getRuntimeVisibleArrayLike(fir::fnacc::LaunchOp launchOp, Value arrayLike) {
   return descriptorRef;
 }
 
+// Rebuild pure address calculations for captured bounds such as lo(1).
+// This also handles invariant addresses formed inside an outer loop. Every
+// operand must ultimately be external to the launch: loads, local allocation,
+// region-bearing operations and induction block arguments are not cloned.
+static Value rematerializeBoundReference(OpBuilder &builder,
+                                         fir::fnacc::LaunchOp launchOp,
+                                         Value value, IRMapping &mapping) {
+  if (!isDefinedInsideLaunch(launchOp, value))
+    return value;
+  if (mapping.contains(value))
+    return mapping.lookup(value);
+  Operation *def = value.getDefiningOp();
+  if (!def || def->getNumRegions() != 0 || !isMemoryEffectFree(def))
+    return {};
+  for (Value operand : def->getOperands()) {
+    Value captured =
+        rematerializeBoundReference(builder, launchOp, operand, mapping);
+    if (!captured)
+      return {};
+    mapping.map(operand, captured);
+  }
+  builder.clone(*def, mapping);
+  return mapping.lookup(value);
+}
+
+static Value rematerializeBoundReference(OpBuilder &builder,
+                                         fir::fnacc::LaunchOp launchOp,
+                                         Value value) {
+  IRMapping mapping;
+  return rematerializeBoundReference(builder, launchOp, value, mapping);
+}
+
 /// Rebuild a side-effect-free integer expression immediately before the
 /// launch. Flang commonly materializes source bounds such as `x_max + 1`
 /// inside fnacc.launch even though every leaf of the expression is
@@ -348,7 +382,7 @@ rematerializeIntegerValueOutsideLaunch(OpBuilder &builder, Location loc,
   if (auto load = value.getDefiningOp<fir::LoadOp>()) {
     Value memref = stripLaunchLocalFirConverts(launchOp, load.getMemref());
     auto refTy = dyn_cast<fir::ReferenceType>(memref.getType());
-    if (!refTy || isDefinedInsideLaunch(launchOp, memref))
+    if (!refTy)
       return {};
 
     Type elementType = refTy.getEleTy();
@@ -356,6 +390,9 @@ rematerializeIntegerValueOutsideLaunch(OpBuilder &builder, Location loc,
         elementType.isInteger(8) || elementType.isInteger(16) ||
         elementType.isInteger(32) || elementType.isInteger(64);
     if (!supportedInteger)
+      return {};
+    memref = rematerializeBoundReference(builder, launchOp, memref);
+    if (!memref)
       return {};
     return fir::LoadOp::create(builder, loc, memref);
   }
@@ -418,12 +455,15 @@ materializeExtentValue(OpBuilder &builder, Location loc,
                        static_cast<int32_t>(source.constantValue));
 
   case Kind::LoadIntegerRef: {
-    if (isDefinedInsideLaunch(launchOp, source.value)) {
+    Value reference =
+        rematerializeBoundReference(builder, launchOp, source.value);
+    if (!reference) {
       launchOp.emitError(
-          "FNACC loop extent reference is defined inside fnacc.launch");
+          "FNACC loop extent reference cannot be rematerialized from "
+          "pure address calculations and external captures");
       return {};
     }
-    Value loaded = fir::LoadOp::create(builder, loc, source.value);
+    Value loaded = fir::LoadOp::create(builder, loc, reference);
     return convertToI32(builder, loc, loaded);
   }
 
@@ -472,43 +512,31 @@ materializeExtentValue(OpBuilder &builder, Location loc,
   llvm_unreachable("unhandled FNACC extent source");
 }
 
-static Value
-materializeTripExtent(OpBuilder &builder, Location loc,
-                      fir::fnacc::LaunchOp launchOp,
-                      const fir::fnacc::ElementwiseExtentSource &upper,
-                      const fir::fnacc::ElementwiseExtentSource &lower) {
-  Value upperValue = materializeExtentValue(builder, loc, launchOp, upper);
-  Value lowerValue = materializeExtentValue(builder, loc, launchOp, lower);
-  if (!upperValue || !lowerValue)
-    return {};
-
-  Value difference =
-      arith::SubIOp::create(builder, loc, upperValue, lowerValue);
-  Value tripCount = arith::AddIOp::create(builder, loc, difference,
-                                          constantI32(builder, loc, 1));
-  return arith::MaxSIOp::create(builder, loc, tripCount,
-                                constantI32(builder, loc, 0));
-}
-
-// Compute in i64 so negative origins and empty ranges cannot overflow the
-// subtraction. Bounds and nonempty trip counts retain the existing i32 ABI.
-static Value
-materializeMatmulTripExtent(OpBuilder &builder, Location loc,
-                            fir::fnacc::LaunchOp launchOp,
-                            const fir::fnacc::ElementwiseExtentSource &upper,
-                            const fir::fnacc::ElementwiseExtentSource &lower) {
+// Bounds and counts use the existing i32 ABI; widen before subtraction.
+// The direction test must precede division: truncation toward zero would
+// otherwise manufacture one iteration for a short empty range.
+static Value materializeTripExtent(
+    OpBuilder &builder, Location loc, fir::fnacc::LaunchOp launchOp,
+    const fir::fnacc::ElementwiseExtentSource &upper,
+    const fir::fnacc::ElementwiseExtentSource &lower, int64_t step) {
   Value u = materializeExtentValue(builder, loc, launchOp, upper);
   Value l = materializeExtentValue(builder, loc, launchOp, lower);
   if (!u || !l)
     return {};
-  Value difference =
-      arith::SubIOp::create(builder, loc, convertToI64(builder, loc, u),
-                            convertToI64(builder, loc, l));
-  Value count = arith::AddIOp::create(builder, loc, difference,
+  u = convertToI64(builder, loc, u);
+  l = convertToI64(builder, loc, l);
+  Value distance =
+      arith::SubIOp::create(builder, loc, step > 0 ? u : l, step > 0 ? l : u);
+  Value zero = constantI64(builder, loc, 0);
+  Value nonempty = arith::CmpIOp::create(
+      builder, loc, arith::CmpIPredicate::sge, distance, zero);
+  Value quotient = arith::DivSIOp::create(
+      builder, loc, distance,
+      constantI64(builder, loc, step > 0 ? step : -step));
+  Value count = arith::AddIOp::create(builder, loc, quotient,
                                       constantI64(builder, loc, 1));
-  Value nonnegative =
-      arith::MaxSIOp::create(builder, loc, count, constantI64(builder, loc, 0));
-  return convertToI32(builder, loc, nonnegative);
+  Value selected = arith::SelectOp::create(builder, loc, nonempty, count, zero);
+  return convertToI32(builder, loc, selected);
 }
 
 static std::optional<int64_t> getElementByteSize(Type elementType) {
@@ -1477,23 +1505,21 @@ struct FNACCLowerToRuntimePass
           k.kind == fir::fnacc::ElementwiseKernelKind::MultiExpr1D ||
           (fir::fnacc::isReductionKernelKind(k.kind) && k.rank == 1);
       auto tripExtent = [&](const fir::fnacc::ElementwiseExtentSource &upper,
-                            const fir::fnacc::ElementwiseExtentSource &lower) {
-        return k.kind == fir::fnacc::ElementwiseKernelKind::MatMul2D
-                   ? materializeMatmulTripExtent(builder, loc, launchOp, upper,
-                                                 lower)
-                   : materializeTripExtent(builder, loc, launchOp, upper,
-                                           lower);
+                            const fir::fnacc::ElementwiseExtentSource &lower,
+                            int64_t step) {
+        return materializeTripExtent(builder, loc, launchOp, upper, lower,
+                                     step);
       };
       Value extentXValue =
           hasLogicalBounds2D || hasLogicalBounds1D
-              ? tripExtent(k.extentX, k.loopLowerX)
+              ? tripExtent(k.extentX, k.loopLowerX, k.loopStepX)
               : materializeExtentValue(builder, loc, launchOp, k.extentX);
 
       Value extentYValue;
       if (k.rank == 2) {
         extentYValue =
             hasLogicalBounds2D
-                ? tripExtent(k.extentY, k.loopLowerY)
+                ? tripExtent(k.extentY, k.loopLowerY, k.loopStepY)
                 : materializeExtentValue(builder, loc, launchOp, k.extentY);
       } else {
         extentYValue = arith::ConstantIntOp::create(builder, loc, 1, 32);
@@ -1501,7 +1527,7 @@ struct FNACCLowerToRuntimePass
 
       Value extentZValue;
       if (k.kind == fir::fnacc::ElementwiseKernelKind::MatMul2D) {
-        extentZValue = tripExtent(k.extentZ, k.loopLowerZ);
+        extentZValue = tripExtent(k.extentZ, k.loopLowerZ, k.loopStepZ);
       } else {
         extentZValue = arith::ConstantIntOp::create(builder, loc, 1, 32);
       }

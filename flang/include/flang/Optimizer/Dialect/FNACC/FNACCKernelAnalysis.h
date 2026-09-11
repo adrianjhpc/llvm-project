@@ -310,6 +310,8 @@ struct ElementwiseKernel {
   ElementwiseExtentSource loopLowerX;
   ElementwiseExtentSource loopLowerY;
   ElementwiseExtentSource loopLowerZ;
+  // Source DO steps; device kernels specialize these constants.
+  int64_t loopStepX = 1, loopStepY = 1, loopStepZ = 1;
 
   mlir::Value innerIndMemref;
   mlir::Value outerIndMemref;

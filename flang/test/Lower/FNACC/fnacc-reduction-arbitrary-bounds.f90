@@ -38,10 +38,10 @@ end subroutine
 ! HOST-DAG: func.func private @__fnacc_bind_reduction_result_f64_v2
 ! HOST-DAG: func.func private @__fnacc_bind_reduction_result_f64_at_v2
 ! HOST-LABEL: func.func @_QPreduction_min_1d_bounds
-! HOST: arith.maxsi
+! HOST: arith.select
 ! HOST: call @__fnacc_commit_launch_v2
 ! HOST-LABEL: func.func @_QPreduction_min_2d_bounds
-! HOST-COUNT-2: arith.maxsi
+! HOST-COUNT-2: arith.select
 ! HOST: call @__fnacc_commit_launch_v2
 ! HOST-NOT: fnacc.launch
 
@@ -52,7 +52,7 @@ end subroutine
 ! TTIR-SAME: %loop_lower_x: i32
 ! TTIR-SAME: %array0_lower0: i32
 ! TTIR-SAME: %array0_stride0: i32
-! TTIR: %source_x = arith.addi %offs, %loop_lower_x_s
+! TTIR: %source_x = arith.addi %scaled_x, %loop_lower_x_s
 ! TTIR: %vals_index = arith.subi %source_x, %vals_lower_s
 ! TTIR: %vals_offset = arith.muli %vals_index, %vals_stride_s
 ! TTIR: arith.minimumf %lhs, %rhs : f64
@@ -66,8 +66,8 @@ end subroutine
 ! TTIR-SAME: %loop_lower_y: i32
 ! TTIR-SAME: %array0_lower0: i32
 ! TTIR-SAME: %array0_lower1: i32
-! TTIR: %source_x = arith.addi %ix0, %loop_lower_x_s
-! TTIR: %source_y = arith.addi %iy0, %loop_lower_y_s
+! TTIR: %source_x = arith.addi %scaled_x, %loop_lower_x_s
+! TTIR: %source_y = arith.addi %scaled_y, %loop_lower_y_s
 ! TTIR: %access0_x = arith.subi %source_x, %access0_lower0_s
 ! TTIR: %access0_y = arith.subi %source_y, %access0_lower1_s
 ! TTIR-COUNT-1: "tt.reduce"

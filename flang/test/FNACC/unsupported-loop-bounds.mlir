@@ -26,7 +26,7 @@ module {
       %nref: !fir.ref<i32>,
       %i: !fir.ref<i32>) {
     %c1_i32 = arith.constant 1 : i32
-    %c2_i32 = arith.constant 2 : i32
+    %c2_i32 = arith.constant 0 : i32
     %n = fir.load %nref : !fir.ref<i32>
 
     fnacc.launch tile_sizes = [128] {
@@ -42,4 +42,4 @@ module {
 }
 
 // CHECK: error: FNACC runtime cannot lower launch:
-// CHECK: 1-D loop step must be constant 1
+// CHECK: 1-D loop step must be a nonzero constant signed 32-bit integer

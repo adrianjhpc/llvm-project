@@ -895,6 +895,7 @@ struct FNACCKernelDesc {
 
   int32_t rank = 1;
 
+  int32_t loopStep[3] = {1, 1, 1};
   int32_t tileX = 1024;
   int32_t tileY = 1;
   int32_t tileZ = 1;
@@ -1659,6 +1660,13 @@ fnaccParseKernelDescsFromJson(const std::string &json) {
     jsonFindInt(objectText, "rank", desc.rank);
 
     jsonFindIntArray3(objectText, "tile", desc.tileX, desc.tileY, desc.tileZ);
+    if (jsonFindKey(objectText, "loop_steps") != std::string::npos &&
+        (!jsonFindIntArray3(objectText, "loop_steps", desc.loopStep[0],
+             desc.loopStep[1], desc.loopStep[2]) ||
+            !desc.loopStep[0] || !desc.loopStep[1] || !desc.loopStep[2])) {
+      std::fprintf(stderr, "FNACC error: invalid loop_steps metadata\n");
+      std::abort();
+    }
 
     jsonFindInt(objectText, "num_warps", desc.numWarps);
     jsonFindInt(objectText, "threads_per_warp", desc.threadsPerWarp);
@@ -4831,13 +4839,15 @@ extern "C" void __fnacc_commit_launch_v2() {
           fnaccCheckedI32Layout(array.lower[0], "matmul row lower bound");
       int64_t dc = int64_t(pending.loopLower[c]) -
           fnaccCheckedI32Layout(array.lower[1], "matmul column lower bound");
-      int64_t lastRow = dr + pending.extent[r] - 1;
-      int64_t lastCol = dc + pending.extent[c] - 1;
+      int64_t lastRow = dr + int64_t(pending.extent[r] - 1) * desc->loopStep[r];
+      int64_t lastCol = dc + int64_t(pending.extent[c] - 1) * desc->loopStep[c];
       int64_t elemBytes = parameter.type == "ptr<f64>" ? 8 : 4;
       // Current data ABI requires contiguous column-major storage.
-      bool valid = array.stride[0] == 1 && array.stride[1] > 0 && dr >= 0 &&
-          dc >= 0 && lastRow < array.stride[1] &&
-          lastCol < array.bytes / elemBytes / array.stride[1];
+      bool valid = array.stride[0] == 1 && array.stride[1] > 0 &&
+          std::min(dr, lastRow) >= 0 && std::min(dc, lastCol) >= 0 &&
+          std::max(dr, lastRow) < array.stride[1] &&
+          std::max(dc, lastCol) <
+              int64_t(array.bytes / elemBytes / array.stride[1]);
       if (!valid) {
         std::fprintf(stderr,
             "FNACC error: matmul operand rectangle is outside "
