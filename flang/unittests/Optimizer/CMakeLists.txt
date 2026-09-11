@@ -42,6 +42,7 @@ add_flang_unittest(FlangOptimizerTests
   OpenACC/FIROpenACCPointerLikeTypeInterfaceTest.cpp
   OpenACC/FIROpenACCSupportAnalysisTest.cpp
   AliasAnalysisCacheTest.cpp
+  AliasAnalysisRecursiveEffectsCacheTest.cpp
   FIRCallInterfaceTest.cpp
   FIRContextTest.cpp
   FIRTypesTest.cpp

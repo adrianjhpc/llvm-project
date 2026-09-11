@@ -31,6 +31,7 @@
 #include "llvm/Frontend/OpenACC/ACC.h.inc"
 #include "llvm/Frontend/OpenMP/OMP.h"
 #include "llvm/Frontend/OpenMP/OMPConstants.h"
+#include "llvm/Frontend/OpenMP/OMPDescriptors.h"
 #include <cinttypes>
 #include <list>
 #include <optional>
@@ -3680,6 +3681,7 @@ struct OmpStylizedExpression {
 //    + | * | .AND. | .OR. | .EQV. | .NEQV. |       // since 4.5
 //    MIN | MAX | IAND | IOR | IEOR                 // since 4.5
 struct OmpReductionIdentifier {
+  static constexpr auto Id = llvm::omp::Modifier::ReductionIdentifier;
   UNION_CLASS_BOILERPLATE(OmpReductionIdentifier);
   std::variant<DefinedOperator, ProcedureDesignator> u;
 };
@@ -3886,6 +3888,7 @@ struct OmpTraitSetSelector {
 // context-selector-specification ->
 //    trait-set-selector, ...
 struct OmpContextSelectorSpecification { // Modifier
+  static constexpr auto Id = llvm::omp::Modifier::ContextSelector;
   CharBlock source;
   WRAPPER_CLASS_BOILERPLATE(
       OmpContextSelectorSpecification, std::list<OmpTraitSetSelector>);
@@ -3910,8 +3913,20 @@ inline namespace modifier {
 // };
 
 struct OmpAccessGroup {
+  static constexpr auto Id = llvm::omp::Modifier::AccessGroup;
   ENUM_CLASS(Value, Cgroup);
   WRAPPER_CLASS_BOILERPLATE(OmpAccessGroup, Value);
+};
+
+// Ref: [5.1:63-68], [5.2:195-196], [6.0:331-333]
+//
+// adjust-op ->
+//    NOTHING |                                     // since 5.1
+//    NEED_DEVICE_PTR                               // since 5.1
+struct OmpAdjustOp {
+  static constexpr auto Id = llvm::omp::Modifier::AdjustOp;
+  ENUM_CLASS(Value, Nothing, Need_Device_Ptr)
+  WRAPPER_CLASS_BOILERPLATE(OmpAdjustOp, Value);
 };
 
 // Ref: [4.5:72-81], [5.0:110-119], [5.1:134-143], [5.2:169-170]
@@ -3919,6 +3934,7 @@ struct OmpAccessGroup {
 // alignment ->
 //    scalar-integer-expression                     // since 4.5
 struct OmpAlignment {
+  static constexpr auto Id = llvm::omp::Modifier::Alignment;
   WRAPPER_CLASS_BOILERPLATE(OmpAlignment, ScalarIntExpr);
 };
 
@@ -3927,6 +3943,7 @@ struct OmpAlignment {
 // align-modifier ->
 //    ALIGN(alignment)                              // since 5.1
 struct OmpAlignModifier {
+  static constexpr auto Id = llvm::omp::Modifier::AlignModifier;
   WRAPPER_CLASS_BOILERPLATE(OmpAlignModifier, ScalarIntExpr);
 };
 
@@ -3935,6 +3952,7 @@ struct OmpAlignModifier {
 // allocator-simple-modifier ->
 //    allocator                                     // since 5.0
 struct OmpAllocatorSimpleModifier {
+  static constexpr auto Id = llvm::omp::Modifier::AllocatorSimpleModifier;
   WRAPPER_CLASS_BOILERPLATE(OmpAllocatorSimpleModifier, ScalarIntExpr);
 };
 
@@ -3943,6 +3961,7 @@ struct OmpAllocatorSimpleModifier {
 // allocator-complex-modifier ->
 //    ALLOCATOR(allocator)                          // since 5.1
 struct OmpAllocatorComplexModifier {
+  static constexpr auto Id = llvm::omp::Modifier::AllocatorComplexModifier;
   WRAPPER_CLASS_BOILERPLATE(OmpAllocatorComplexModifier, ScalarIntExpr);
 };
 
@@ -3955,6 +3974,7 @@ struct OmpAllocatorComplexModifier {
 // Until 5.2, it was a part of map-type-modifier. Since 6.0 the
 // map-type-modifier has been split into individual modifiers.
 struct OmpAlwaysModifier {
+  static constexpr auto Id = llvm::omp::Modifier::AlwaysModifier;
   ENUM_CLASS(Value, Always)
   WRAPPER_CLASS_BOILERPLATE(OmpAlwaysModifier, Value);
 };
@@ -3967,6 +3987,7 @@ struct OmpAlwaysModifier {
 // attachment-mode ->
 //    ALWAYS | AUTO | NEVER
 struct OmpAttachModifier {
+  static constexpr auto Id = llvm::omp::Modifier::AttachModifier;
   ENUM_CLASS(Value, Always, Never, Auto)
   WRAPPER_CLASS_BOILERPLATE(OmpAttachModifier, Value);
 };
@@ -3977,6 +3998,7 @@ struct OmpAttachModifier {
 //    automap                                       // since 6.0
 //
 struct OmpAutomapModifier {
+  static constexpr auto Id = llvm::omp::Modifier::AutomapModifier;
   ENUM_CLASS(Value, Automap);
   WRAPPER_CLASS_BOILERPLATE(OmpAutomapModifier, Value);
 };
@@ -3988,6 +4010,7 @@ struct OmpAutomapModifier {
 //
 // Prior to 5.2 "chunk-modifier" was a part of "modifier" on SCHEDULE clause.
 struct OmpChunkModifier {
+  static constexpr auto Id = llvm::omp::Modifier::ChunkModifier;
   ENUM_CLASS(Value, Simd)
   WRAPPER_CLASS_BOILERPLATE(OmpChunkModifier, Value);
 };
@@ -4001,6 +4024,7 @@ struct OmpChunkModifier {
 // Until 5.2, it was a part of map-type-modifier. Since 6.0 the
 // map-type-modifier has been split into individual modifiers.
 struct OmpCloseModifier {
+  static constexpr auto Id = llvm::omp::Modifier::CloseModifier;
   ENUM_CLASS(Value, Close)
   WRAPPER_CLASS_BOILERPLATE(OmpCloseModifier, Value);
 };
@@ -4013,6 +4037,7 @@ struct OmpCloseModifier {
 //
 // Until 5.2, it was a part of map-type.
 struct OmpDeleteModifier {
+  static constexpr auto Id = llvm::omp::Modifier::DeleteModifier;
   ENUM_CLASS(Value, Delete)
   WRAPPER_CLASS_BOILERPLATE(OmpDeleteModifier, Value);
 };
@@ -4034,6 +4059,7 @@ struct OmpDeleteModifier {
 // vector). This would accept the vector "i, j, k" (although interpreted
 // incorrectly), while flagging a syntax error for "i+1, j, k".
 struct OmpDependenceType {
+  static constexpr auto Id = llvm::omp::Modifier::DependenceType;
   ENUM_CLASS(Value, Sink, Source);
   WRAPPER_CLASS_BOILERPLATE(OmpDependenceType, Value);
 };
@@ -4045,6 +4071,7 @@ struct OmpDependenceType {
 // keyword ->
 //    IN | INOUT | INOUTSET | MUTEXINOUTSET | OUT   // since 6.0
 struct OmpDepinfoModifier {
+  static constexpr auto Id = llvm::omp::Modifier::DepinfoModifier;
   using Value = common::OmpDependenceKind;
   TUPLE_CLASS_BOILERPLATE(OmpDepinfoModifier);
   std::tuple<Value, OmpObject> t;
@@ -4055,6 +4082,7 @@ struct OmpDepinfoModifier {
 // device-modifier ->
 //    ANCESTOR | DEVICE_NUM                         // since 5.0
 struct OmpDeviceModifier {
+  static constexpr auto Id = llvm::omp::Modifier::DeviceModifier;
   ENUM_CLASS(Value, Ancestor, Device_Num)
   WRAPPER_CLASS_BOILERPLATE(OmpDeviceModifier, Value);
 };
@@ -4064,6 +4092,7 @@ struct OmpDeviceModifier {
 // dims-modifier ->
 //   constant integer expression                    // since 6.1
 struct OmpDimsModifier {
+  static constexpr auto Id = llvm::omp::Modifier::DimsModifier;
   WRAPPER_CLASS_BOILERPLATE(OmpDimsModifier, ScalarIntConstantExpr);
 };
 
@@ -4081,21 +4110,19 @@ struct OmpDimsModifier {
 // the directive-name-modifier. For the sake of uniformity CANCEL can be
 // considered a valid value in 4.5 as well.
 struct OmpDirectiveNameModifier : public OmpDirectiveName {
+  static constexpr auto Id = llvm::omp::Modifier::DirectiveNameModifier;
   INHERITED_WRAPPER_CLASS_BOILERPLATE(
       OmpDirectiveNameModifier, OmpDirectiveName);
 };
 
-// Ref: [5.1:205-209], [5.2:166-168]
+// Ref: [5.2:166-168]
 //
-// motion-modifier ->
-//    PRESENT |                                     // since 5.0, until 5.0
-//    mapper | iterator
 // expectation ->
-//    PRESENT                                       // since 5.1
-//
+//    PRESENT                                       // since 5.2, until 5.2
 // The PRESENT value was a part of motion-modifier in 5.1, and became a
 // value of expectation in 5.2.
 struct OmpExpectation {
+  static constexpr auto Id = llvm::omp::Modifier::Expectation;
   ENUM_CLASS(Value, Present);
   WRAPPER_CLASS_BOILERPLATE(OmpExpectation, Value);
 };
@@ -4107,6 +4134,7 @@ struct OmpExpectation {
 // fallback-mode ->
 //    ABORT | DEFAULT_MEM | NULL                    // since 6.1
 struct OmpFallbackModifier {
+  static constexpr auto Id = llvm::omp::Modifier::FallbackModifier;
   ENUM_CLASS(Value, Abort, Default_Mem, Null);
   WRAPPER_CLASS_BOILERPLATE(OmpFallbackModifier, Value);
 };
@@ -4118,6 +4146,7 @@ struct OmpFallbackModifier {
 //    TARGETSYNC
 // There can be at most only two interop-type.
 struct OmpInteropType {
+  static constexpr auto Id = llvm::omp::Modifier::InteropType;
   ENUM_CLASS(Value, Target, Targetsync)
   WRAPPER_CLASS_BOILERPLATE(OmpInteropType, Value);
 };
@@ -4140,6 +4169,7 @@ struct OmpIteratorSpecifier {
 // iterator-modifier ->
 //    ITERATOR(iterator-specifier [, ...])          // since 5.0
 struct OmpIterator {
+  static constexpr auto Id = llvm::omp::Modifier::Iterator;
   WRAPPER_CLASS_BOILERPLATE(OmpIterator, std::list<OmpIteratorSpecifier>);
 };
 
@@ -4148,6 +4178,7 @@ struct OmpIterator {
 // lastprivate-modifier ->
 //    CONDITIONAL                                   // since 5.0
 struct OmpLastprivateModifier {
+  static constexpr auto Id = llvm::omp::Modifier::LastprivateModifier;
   ENUM_CLASS(Value, Conditional)
   WRAPPER_CLASS_BOILERPLATE(OmpLastprivateModifier, Value);
 };
@@ -4157,6 +4188,7 @@ struct OmpLastprivateModifier {
 // linear-modifier ->
 //    REF | UVAL | VAL                              // since 4.5
 struct OmpLinearModifier {
+  static constexpr auto Id = llvm::omp::Modifier::LinearModifier;
   ENUM_CLASS(Value, Ref, Uval, Val);
   WRAPPER_CLASS_BOILERPLATE(OmpLinearModifier, Value);
 };
@@ -4166,6 +4198,7 @@ struct OmpLinearModifier {
 // linear-stepr ->
 //    integer-expresion                             // since 4.5, until 5.1
 struct OmpLinearStep {
+  static constexpr auto Id = llvm::omp::Modifier::LinearStep;
   WRAPPER_CLASS_BOILERPLATE(OmpLinearStep, ScalarIntExpr);
 };
 
@@ -4180,6 +4213,7 @@ struct OmpLinearStep {
 //    UNROLLED
 //    [( ScalarIntConstantExpr-list )]
 struct OmpLoopModifier {
+  static constexpr auto Id = llvm::omp::Modifier::LoopModifier;
   TUPLE_CLASS_BOILERPLATE(OmpLoopModifier);
   std::tuple<llvm::omp::LoopModifier,
       std::optional<std::list<ScalarIntConstantExpr>>>
@@ -4192,6 +4226,7 @@ struct OmpLoopModifier {
 // lower-bound ->
 //    scalar-integer-expression                     // since 5.1
 struct OmpLowerBound {
+  static constexpr auto Id = llvm::omp::Modifier::LowerBound;
   WRAPPER_CLASS_BOILERPLATE(OmpLowerBound, ScalarIntExpr);
 };
 
@@ -4200,6 +4235,7 @@ struct OmpLowerBound {
 // mapper ->
 //    identifier                                    // since 4.5
 struct OmpMapper {
+  static constexpr auto Id = llvm::omp::Modifier::Mapper;
   WRAPPER_CLASS_BOILERPLATE(OmpMapper, Name);
 };
 
@@ -4213,6 +4249,7 @@ struct OmpMapper {
 //
 // Since 6.0 DELETE is a separate delete-modifier.
 struct OmpMapType {
+  static constexpr auto Id = llvm::omp::Modifier::MapType;
   ENUM_CLASS(Value, Alloc, Delete, From, Release, Storage, To, Tofrom);
   WRAPPER_CLASS_BOILERPLATE(OmpMapType, Value);
 };
@@ -4225,6 +4262,7 @@ struct OmpMapType {
 //    PRESENT                                       // since 5.1, until 5.2
 // Since 6.0 the map-type-modifier has been split into individual modifiers.
 struct OmpMapTypeModifier {
+  static constexpr auto Id = llvm::omp::Modifier::MapTypeModifier;
   ENUM_CLASS(Value, Always, Close, Present)
   WRAPPER_CLASS_BOILERPLATE(OmpMapTypeModifier, Value);
 };
@@ -4234,7 +4272,22 @@ struct OmpMapTypeModifier {
 // mem-space ->
 //    MEMSPACE(memspace-handle)                     // since 5.2
 struct OmpMemSpace {
+  static constexpr auto Id = llvm::omp::Modifier::MemSpace;
   WRAPPER_CLASS_BOILERPLATE(OmpMemSpace, ScalarIntExpr);
+};
+
+// Ref: [5.1:205-210]
+//
+// motion-modifier ->
+//    PRESENT                                       // since 5.1, until 5.1
+//
+// The actual motion-modifier in 5.1 also included iterator and mapper,
+// so it should be a modifier group rather than a modifier. Both iterator
+// and mapper are separate modifiers.
+struct OmpMotionModifier {
+  static constexpr auto Id = llvm::omp::Modifier::MotionModifier;
+  ENUM_CLASS(Value, Present)
+  WRAPPER_CLASS_BOILERPLATE(OmpMotionModifier, Value);
 };
 
 // Ref: [4.5:56-63], [5.0:101-109], [5.1:126-133], [5.2:252-254]
@@ -4248,6 +4301,7 @@ struct OmpMemSpace {
 // Since 5.2 "modifier" was replaced with "ordering-modifier" and "chunk-
 // modifier".
 struct OmpOrderingModifier {
+  static constexpr auto Id = llvm::omp::Modifier::OrderingModifier;
   ENUM_CLASS(Value, Monotonic, Nonmonotonic, Simd)
   WRAPPER_CLASS_BOILERPLATE(OmpOrderingModifier, Value);
 };
@@ -4257,6 +4311,7 @@ struct OmpOrderingModifier {
 // order-modifier ->
 //    REPRODUCIBLE | UNCONSTRAINED                  // since 5.1
 struct OmpOrderModifier {
+  static constexpr auto Id = llvm::omp::Modifier::OrderModifier;
   ENUM_CLASS(Value, Reproducible, Unconstrained)
   WRAPPER_CLASS_BOILERPLATE(OmpOrderModifier, Value);
 };
@@ -4291,6 +4346,7 @@ struct OmpPreferenceSpecification {
 // prefer-type ->                                   // since 5.1
 //    PREFER_TYPE(preference-specification...)
 struct OmpPreferType {
+  static constexpr auto Id = llvm::omp::Modifier::PreferType;
   WRAPPER_CLASS_BOILERPLATE(
       OmpPreferType, std::list<OmpPreferenceSpecification>);
 };
@@ -4300,21 +4356,17 @@ struct OmpPreferType {
 // prescriptiveness ->
 //    STRICT                                        // since 5.1
 struct OmpPrescriptiveness {
+  static constexpr auto Id = llvm::omp::Modifier::Prescriptiveness;
   ENUM_CLASS(Value, Strict)
   WRAPPER_CLASS_BOILERPLATE(OmpPrescriptiveness, Value);
 };
 
-// Ref: [5.1:205-210], [6.0:279-288]
+// Ref: [6.0:279-288]
 //
 // present-modifier ->
-//    PRESENT                                       // since 5.1, until 5.1
-//                                                  // since 6.0
-//
-// In 5.1 it was a part of "motion-modifier" (on FROM and TO clauses), which
-// should really be modeled as a modifier-group. In 5.2 it was replaced by
-// "expectation". It was restored in 6.0 when map-type-modifier was broken up
-// into individual modifiers.
+//    PRESENT                                       // since 6.0
 struct OmpPresentModifier {
+  static constexpr auto Id = llvm::omp::Modifier::PresentModifier;
   ENUM_CLASS(Value, Present)
   WRAPPER_CLASS_BOILERPLATE(OmpPresentModifier, Value);
 };
@@ -4324,6 +4376,7 @@ struct OmpPresentModifier {
 // reduction-modifier ->
 //    DEFAULT | INSCAN | TASK                       // since 5.0
 struct OmpReductionModifier {
+  static constexpr auto Id = llvm::omp::Modifier::ReductionModifier;
   ENUM_CLASS(Value, Default, Inscan, Task);
   WRAPPER_CLASS_BOILERPLATE(OmpReductionModifier, Value);
 };
@@ -4334,6 +4387,7 @@ struct OmpReductionModifier {
 //    REF_PTEE | REF_PTR | REF_PTR_PTEE             // since 6.0
 //
 struct OmpRefModifier {
+  static constexpr auto Id = llvm::omp::Modifier::RefModifier;
   ENUM_CLASS(Value, Ref_Ptee, Ref_Ptr, Ref_Ptr_Ptee)
   WRAPPER_CLASS_BOILERPLATE(OmpRefModifier, Value);
 };
@@ -4344,6 +4398,7 @@ struct OmpRefModifier {
 //    SELF                                          // since 6.0
 //
 struct OmpSelfModifier {
+  static constexpr auto Id = llvm::omp::Modifier::SelfModifier;
   ENUM_CLASS(Value, Self)
   WRAPPER_CLASS_BOILERPLATE(OmpSelfModifier, Value);
 };
@@ -4353,6 +4408,7 @@ struct OmpSelfModifier {
 // step-complex-modifier ->
 //    STEP(integer-expression)                      // since 5.2
 struct OmpStepComplexModifier {
+  static constexpr auto Id = llvm::omp::Modifier::StepComplexModifier;
   WRAPPER_CLASS_BOILERPLATE(OmpStepComplexModifier, ScalarIntExpr);
 };
 
@@ -4361,6 +4417,7 @@ struct OmpStepComplexModifier {
 // step-simple-modifier ->
 //    integer-expresion                             // since 5.2
 struct OmpStepSimpleModifier {
+  static constexpr auto Id = llvm::omp::Modifier::StepSimpleModifier;
   WRAPPER_CLASS_BOILERPLATE(OmpStepSimpleModifier, ScalarIntExpr);
 };
 
@@ -4371,6 +4428,7 @@ struct OmpStepSimpleModifier {
 //    MUTEXINOUTSET | DEPOBJ |                      // since 5.0
 //    INOUTSET                                      // since 5.2
 struct OmpTaskDependenceType {
+  static constexpr auto Id = llvm::omp::Modifier::TaskDependenceType;
   using Value = common::OmpDependenceKind;
   WRAPPER_CLASS_BOILERPLATE(OmpTaskDependenceType, Value);
 };
@@ -4380,6 +4438,7 @@ struct OmpTaskDependenceType {
 // traits-array ->
 //    TRAITS(traits-array)                          // since 5.2
 struct OmpTraitsArray {
+  static constexpr auto Id = llvm::omp::Modifier::TraitsArray;
   WRAPPER_CLASS_BOILERPLATE(OmpTraitsArray, common::Indirection<Expr>);
 };
 
@@ -4390,6 +4449,7 @@ struct OmpTraitsArray {
 //    AGGREGATE | ALLOCATABLE | POINTER |           // since 5.0
 //    ALL                                           // since 5.2
 struct OmpVariableCategory {
+  static constexpr auto Id = llvm::omp::Modifier::VariableCategory;
   ENUM_CLASS(Value, Aggregate, All, Allocatable, Pointer, Scalar)
   WRAPPER_CLASS_BOILERPLATE(OmpVariableCategory, Value);
 };
@@ -4399,10 +4459,8 @@ struct OmpVariableCategory {
 //
 // ompx-hold-modifier ->
 //    OMPX_HOLD                                     // since 4.5
-//
-// Until 5.2, it was a part of map-type-modifier. Since 6.0 the
-// map-type-modifier has been split into individual modifiers.
 struct OmpxHoldModifier {
+  static constexpr auto Id = llvm::omp::Modifier::OmpxHoldModifier;
   ENUM_CLASS(Value, Ompx_Hold)
   WRAPPER_CLASS_BOILERPLATE(OmpxHoldModifier, Value);
 };
@@ -4425,11 +4483,8 @@ struct OmpAbsentClause {
 
 struct OmpAdjustArgsClause {
   TUPLE_CLASS_BOILERPLATE(OmpAdjustArgsClause);
-  struct OmpAdjustOp {
-    ENUM_CLASS(Value, Nothing, Need_Device_Ptr)
-    WRAPPER_CLASS_BOILERPLATE(OmpAdjustOp, Value);
-  };
-  std::tuple<OmpAdjustOp, OmpObjectList> t;
+  MODIFIER_BOILERPLATE(OmpAdjustOp);
+  std::tuple<MODIFIERS(), OmpObjectList> t;
 };
 
 // Ref: [5.0:135-140], [5.1:161-166], [5.2:264-265]
@@ -4618,11 +4673,9 @@ struct OmpIterationVector {
 // See: depend-clause, doacross-clause
 struct OmpDoacross {
   OmpDependenceType::Value GetDepType() const;
-
-  WRAPPER_CLASS(Sink, OmpIterationVector);
-  EMPTY_CLASS(Source);
-  UNION_CLASS_BOILERPLATE(OmpDoacross);
-  std::variant<Sink, Source> u;
+  MODIFIER_BOILERPLATE(OmpDependenceType);
+  TUPLE_CLASS_BOILERPLATE(OmpDoacross);
+  std::tuple<MODIFIERS(), std::optional<OmpIterationVector>> t;
 };
 
 // Ref: [4.5:169-172], [5.0:255-259], [5.1:288-292], [5.2:323-326]
@@ -4749,8 +4802,8 @@ struct OmpFailClause {
 //    PRESENT | mapper-modifier | iterator-modifier
 struct OmpFromClause {
   TUPLE_CLASS_BOILERPLATE(OmpFromClause);
-  MODIFIER_BOILERPLATE(
-      OmpExpectation, OmpPresentModifier, OmpIterator, OmpMapper);
+  MODIFIER_BOILERPLATE(OmpExpectation, OmpMotionModifier, OmpPresentModifier,
+      OmpIterator, OmpMapper);
   std::tuple<MODIFIERS(), OmpObjectList, /*CommaSeparated=*/bool> t;
 };
 
@@ -5116,8 +5169,8 @@ struct OmpThreadsetClause {
 //    PRESENT | mapper-modifier | iterator-modifier
 struct OmpToClause {
   TUPLE_CLASS_BOILERPLATE(OmpToClause);
-  MODIFIER_BOILERPLATE(
-      OmpExpectation, OmpPresentModifier, OmpIterator, OmpMapper);
+  MODIFIER_BOILERPLATE(OmpExpectation, OmpMotionModifier, OmpPresentModifier,
+      OmpIterator, OmpMapper);
   std::tuple<MODIFIERS(), OmpObjectList, /*CommaSeparated=*/bool> t;
 };
 
@@ -5635,9 +5688,19 @@ struct OpenMPMisplacedEndDirective : public OmpEndDirective {
       OpenMPMisplacedEndDirective, OmpEndDirective);
 };
 
-// Unrecognized string after the !$OMP sentinel.
+// Unrecognized string after an OpenMP sentinel.  isExtensionSentinel is true
+// when the sentinel was an implementation-defined extension sentinel (!$omx in
+// fixed source form or !$ompx in free source form, OpenMP 5.2 section 3.1); in
+// that case an unrecognized directive is ignored with a warning instead of
+// being reported as an error.  The bool constructor is explicit so that the
+// node is not implicitly constructible from a bool: such a conversion would
+// make parse-tree visitors that provide a catch-all handler ambiguous.
 struct OpenMPInvalidDirective {
   using EmptyTrait = std::true_type;
+  OpenMPInvalidDirective() = default;
+  explicit OpenMPInvalidDirective(bool isExtension)
+      : isExtensionSentinel{isExtension} {}
+  bool isExtensionSentinel{false};
   CharBlock source;
 };
 

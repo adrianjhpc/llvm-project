@@ -90,6 +90,10 @@ const SourceFile *Parsing::Prescan(const std::string &path, Options options) {
   if (options.features.IsEnabled(LanguageFeature::OpenMP) ||
       (options.prescanAndReformat && noneOfTheAbove)) {
     prescanner.AddCompilerDirectiveSentinel("$omp");
+    // Implementation-defined extension sentinels (OpenMP 5.2, section 3.1):
+    // "$omx" in fixed form (!$omx, c$omx, *$omx) and "$ompx" in free form.
+    prescanner.AddCompilerDirectiveSentinel("$omx");
+    prescanner.AddCompilerDirectiveSentinel("$ompx");
     prescanner.AddCompilerDirectiveSentinel("$"); // OMP conditional line
   }
   if (options.features.IsEnabled(LanguageFeature::CUDA) ||
@@ -141,8 +145,12 @@ void Parsing::EmitPreprocessedSource(
   constexpr std::size_t maxSentinelLength{8};
   bool sentinelComplete{false};
   // We need to know the current directive in order to provide correct
-  // continuation for the directive
+  // continuation for the directive.  The sentinel is accumulated until the
+  // blank that follows it, so sentinels of any length are handled: the
+  // 4-character sentinels (e.g. "$omp", "$omx", "$acc") as well as the
+  // 5-character implementation-defined extension sentinel "$ompx".
   std::string directive;
+  bool inDirectiveSentinelRegion{false};
   for (const char &atChar : cooked().AsCharBlock()) {
     char ch{atChar};
     if (ch == '\n') {
@@ -155,6 +163,7 @@ void Parsing::EmitPreprocessedSource(
       sentinelComplete = false;
       ++sourceLine;
       directive.clear();
+      inDirectiveSentinelRegion = false;
     } else {
       auto provenance{cooked().GetProvenanceRange(CharBlock{&atChar, 1})};
 
@@ -194,6 +203,18 @@ void Parsing::EmitPreprocessedSource(
           // First non-sentinel character terminates the sentinel, so we
           // don't swallow the directive body into `directive`.
           sentinelComplete = true;
+        inDirectiveSentinelRegion = true;
+      } else if (inDirective && !ompConditionalLine &&
+          inDirectiveSentinelRegion) {
+        if (IsLetter(ch) || ch == '$' || ch == '@') {
+          directive += getOriginalChar(ch);
+          inDirectiveSentinel = true;
+        } else {
+          // The blank that terminates the sentinel has been reached.
+          inDirectiveSentinelRegion = false;
+          if (directive == "$"s) {
+            ompConditionalLine = true;
+          }
         }
       }
 

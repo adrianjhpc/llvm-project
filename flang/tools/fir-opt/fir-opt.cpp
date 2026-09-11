@@ -26,6 +26,7 @@ namespace fir {
 namespace test {
 void registerTestFIRAliasAnalysisPass();
 void registerTestFIROpenACCInterfacesPass();
+void registerTestFIROpenACCSupportPass();
 } // namespace test
 } // namespace fir
 
@@ -49,6 +50,7 @@ int main(int argc, char **argv) {
 #ifdef FLANG_INCLUDE_TESTS
   fir::test::registerTestFIRAliasAnalysisPass();
   fir::test::registerTestFIROpenACCInterfacesPass();
+  fir::test::registerTestFIROpenACCSupportPass();
   mlir::registerSideEffectTestPasses();
   mlir::test::registerTestOpenACC();
 #endif
