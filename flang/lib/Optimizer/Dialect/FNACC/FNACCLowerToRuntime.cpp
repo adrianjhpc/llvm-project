@@ -1504,22 +1504,47 @@ struct FNACCLowerToRuntimePass
       bool hasLogicalBounds1D =
           k.kind == fir::fnacc::ElementwiseKernelKind::MultiExpr1D ||
           (fir::fnacc::isReductionKernelKind(k.kind) && k.rank == 1);
+      Value runtimeSteps[3];
+      const int64_t steps[] = {k.loopStepX, k.loopStepY, k.loopStepZ};
+      const fir::fnacc::ElementwiseExtentSource stepSources[] = {
+          k.loopStepSourceX, k.loopStepSourceY, k.loopStepSourceZ};
+      bool validSteps = true;
+      for (unsigned dim = 0; dim < 3; ++dim) {
+        if (steps[dim] != 0)
+          continue;
+        runtimeSteps[dim] =
+            materializeExtentValue(builder, loc, launchOp, stepSources[dim]);
+        validSteps &= bool(runtimeSteps[dim]);
+      }
+      if (!validSteps) {
+        signalPassFailure();
+        return;
+      }
       auto tripExtent = [&](const fir::fnacc::ElementwiseExtentSource &upper,
                             const fir::fnacc::ElementwiseExtentSource &lower,
-                            int64_t step) {
-        return materializeTripExtent(builder, loc, launchOp, upper, lower,
-                                     step);
+                            unsigned dim) -> Value {
+        if (steps[dim] != 0)
+          return materializeTripExtent(builder, loc, launchOp, upper, lower,
+                                       steps[dim]);
+        Value u = materializeExtentValue(builder, loc, launchOp, upper);
+        Value l = materializeExtentValue(builder, loc, launchOp, lower);
+        if (!u || !l)
+          return {};
+        Value count = fir::AllocaOp::create(builder, loc, builder.getI32Type());
+        createRuntimeCall(module, builder, loc, "__fnacc_trip_count_i32",
+                          ValueRange{l, u, runtimeSteps[dim], count});
+        return fir::LoadOp::create(builder, loc, count);
       };
       Value extentXValue =
           hasLogicalBounds2D || hasLogicalBounds1D
-              ? tripExtent(k.extentX, k.loopLowerX, k.loopStepX)
+              ? tripExtent(k.extentX, k.loopLowerX, 0)
               : materializeExtentValue(builder, loc, launchOp, k.extentX);
 
       Value extentYValue;
       if (k.rank == 2) {
         extentYValue =
             hasLogicalBounds2D
-                ? tripExtent(k.extentY, k.loopLowerY, k.loopStepY)
+                ? tripExtent(k.extentY, k.loopLowerY, 1)
                 : materializeExtentValue(builder, loc, launchOp, k.extentY);
       } else {
         extentYValue = arith::ConstantIntOp::create(builder, loc, 1, 32);
@@ -1527,7 +1552,7 @@ struct FNACCLowerToRuntimePass
 
       Value extentZValue;
       if (k.kind == fir::fnacc::ElementwiseKernelKind::MatMul2D) {
-        extentZValue = tripExtent(k.extentZ, k.loopLowerZ, k.loopStepZ);
+        extentZValue = tripExtent(k.extentZ, k.loopLowerZ, 2);
       } else {
         extentZValue = arith::ConstantIntOp::create(builder, loc, 1, 32);
       }
@@ -1577,7 +1602,8 @@ struct FNACCLowerToRuntimePass
             loopLowerZValue,
             constantI32(builder, loc, k.arrayArguments.size()),
             constantI32(builder, loc,
-                        k.scalarRefs.size() + k.indexRefs.size())};
+                        k.scalarRefs.size() + k.indexRefs.size() +
+                            k.runtimeStepCount())};
         emitLaunchCall("__fnacc_begin_launch_v2", beginOperands);
 
         for (auto [index, array] : llvm::enumerate(k.arrayArguments)) {
@@ -1665,6 +1691,13 @@ struct FNACCLowerToRuntimePass
                          indexValue});
         }
 
+        for (unsigned dim = 0; dim < 3; ++dim) {
+          int index = k.runtimeStepScalarIndex(dim);
+          if (index >= 0)
+            emitLaunchCall("__fnacc_bind_scalar_i32_v2",
+                           ValueRange{constantI32(builder, loc, index),
+                                      runtimeSteps[dim]});
+        }
         emitLaunchCall("__fnacc_commit_launch_v2", ValueRange{});
         launchOp.erase();
         ++fallbackKernelId;

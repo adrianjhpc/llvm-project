@@ -13,7 +13,8 @@ subroutine bad_lower_bound(n, a, b, c)
 end subroutine
 
 subroutine bad_step(n, a, b, c, step)
-  integer :: n, step
+  integer :: n
+  integer(8) :: step
   real :: a(n), b(n), c(n)
   integer :: i
 
@@ -24,5 +25,5 @@ subroutine bad_step(n, a, b, c, step)
 end subroutine
 
 ! CHECK: error: FNACC cannot plan launch:
-! CHECK-SAME: 1-D loop step must be a nonzero constant signed 32-bit integer
+! CHECK-SAME: 1-D runtime loop step must have signed 32-bit integer type
 

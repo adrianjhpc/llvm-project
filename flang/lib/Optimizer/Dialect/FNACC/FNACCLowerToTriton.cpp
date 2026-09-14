@@ -816,6 +816,14 @@ static void emitTritonExpr1D(const fir::fnacc::ElementwiseKernel &k,
   os << "}\n\n";
 }
 
+static void emitRuntimeStepParameters(const fir::fnacc::ElementwiseKernel &k,
+                                      llvm::raw_ostream &os) {
+  const int64_t steps[] = {k.loopStepX, k.loopStepY, k.loopStepZ};
+  for (unsigned dim = 0; dim < 3; ++dim)
+    if (steps[dim] == 0)
+      os << ", %loop_step_" << dim << ": i32";
+}
+
 static void emitTritonMultiExpr1D(const fir::fnacc::ElementwiseKernel &k,
                                   int64_t block, StringRef kernelName,
                                   llvm::raw_ostream &os) {
@@ -844,6 +852,7 @@ static void emitTritonMultiExpr1D(const fir::fnacc::ElementwiseKernel &k,
     parameter("array" + std::to_string(array) + "_lower0", "i32");
     parameter("array" + std::to_string(array) + "_stride0", "i32");
   }
+  emitRuntimeStepParameters(k, os);
   os << ") attributes {noinline = false} {\n";
 
   os << "  %pid  = tt.get_program_id x : i32\n";
@@ -859,8 +868,12 @@ static void emitTritonMultiExpr1D(const fir::fnacc::ElementwiseKernel &k,
      << "xi32>\n";
   os << "  %loop_lower_x_s = tt.splat %loop_lower_x : i32 -> tensor<" << block
      << "xi32>\n";
-  os << "  %step_x_s = arith.constant dense<" << k.loopStepX << "> : tensor<"
-     << block << "xi32>\n";
+  if (k.loopStepX == 0)
+    os << "  %step_x_s = tt.splat %loop_step_0 : i32 -> tensor<" << block
+       << "xi32>\n";
+  else
+    os << "  %step_x_s = arith.constant dense<" << k.loopStepX << "> : tensor<"
+       << block << "xi32>\n";
   os << "  %scaled_x = arith.muli %offs, %step_x_s : tensor<" << block
      << "xi32>\n";
   os << "  %source_x = arith.addi %scaled_x, %loop_lower_x_s : tensor<" << block
@@ -1065,6 +1078,7 @@ static void emitTritonReduction1D(const fir::fnacc::ElementwiseKernel &k,
   for (unsigned index = 0; index < k.arrayArguments.size(); ++index)
     os << ", %array" << index << "_lower0: i32, %array" << index
        << "_stride0: i32";
+  emitRuntimeStepParameters(k, os);
   os << ") attributes {noinline = false} {\n";
 
   os << "  %pid  = tt.get_program_id x : i32\n";
@@ -1078,8 +1092,12 @@ static void emitTritonReduction1D(const fir::fnacc::ElementwiseKernel &k,
   os << "  %mask = arith.cmpi slt, %offs, %n_s : tensor<" << block << "xi32>\n";
   os << "  %loop_lower_x_s = tt.splat %loop_lower_x : i32 -> tensor<" << block
      << "xi32>\n";
-  os << "  %step_x_s = arith.constant dense<" << k.loopStepX << "> : tensor<"
-     << block << "xi32>\n";
+  if (k.loopStepX == 0)
+    os << "  %step_x_s = tt.splat %loop_step_0 : i32 -> tensor<" << block
+       << "xi32>\n";
+  else
+    os << "  %step_x_s = arith.constant dense<" << k.loopStepX << "> : tensor<"
+       << block << "xi32>\n";
   os << "  %scaled_x = arith.muli %offs, %step_x_s : tensor<" << block
      << "xi32>\n";
   os << "  %source_x = arith.addi %scaled_x, %loop_lower_x_s : tensor<" << block
@@ -1260,8 +1278,9 @@ static void emitTritonReductionDot1D(const fir::fnacc::ElementwiseKernel &k,
   os << "tt.func @" << kernelName << "(%a: " << ptrTy << ", %b: " << ptrTy
      << ", %partials: " << ptrTy << ", %n: i32, %loop_lower_x: i32"
      << ", %array0_lower0: i32, %array0_stride0: i32"
-     << ", %array1_lower0: i32, %array1_stride0: i32"
-     << ") attributes {noinline = false} {\n";
+     << ", %array1_lower0: i32, %array1_stride0: i32";
+  emitRuntimeStepParameters(k, os);
+  os << ") attributes {noinline = false} {\n";
 
   os << "  %pid  = tt.get_program_id x : i32\n";
   os << "  %blk  = arith.constant " << block << " : i32\n";
@@ -1277,8 +1296,12 @@ static void emitTritonReductionDot1D(const fir::fnacc::ElementwiseKernel &k,
   os << "  %mask = arith.cmpi slt, %offs, %n_s : tensor<" << block << "xi32>\n";
   os << "  %loop_lower_x_s = tt.splat %loop_lower_x : i32 -> tensor<" << block
      << "xi32>\n";
-  os << "  %step_x_s = arith.constant dense<" << k.loopStepX << "> : tensor<"
-     << block << "xi32>\n";
+  if (k.loopStepX == 0)
+    os << "  %step_x_s = tt.splat %loop_step_0 : i32 -> tensor<" << block
+       << "xi32>\n";
+  else
+    os << "  %step_x_s = arith.constant dense<" << k.loopStepX << "> : tensor<"
+       << block << "xi32>\n";
   os << "  %scaled_x = arith.muli %offs, %step_x_s : tensor<" << block
      << "xi32>\n";
   os << "  %source_x = arith.addi %scaled_x, %loop_lower_x_s : tensor<" << block
@@ -1423,6 +1446,7 @@ static void emitTritonStencil2D(const fir::fnacc::ElementwiseKernel &k,
     parameter("array" + std::to_string(array) + "_stride0", "i32");
     parameter("array" + std::to_string(array) + "_stride1", "i32");
   }
+  emitRuntimeStepParameters(k, os);
   os << ") attributes {noinline = false} {\n";
 
   os << "  %pid_x = tt.get_program_id x : i32\n";
@@ -1457,14 +1481,22 @@ static void emitTritonStencil2D(const fir::fnacc::ElementwiseKernel &k,
      << "xi32>\n";
   os << "  %loop_lower_y_s = tt.splat %loop_lower_y : i32 -> tensor<" << block
      << "xi32>\n";
-  os << "  %step_x_s = arith.constant dense<" << k.loopStepX << "> : tensor<"
-     << block << "xi32>\n";
+  if (k.loopStepX == 0)
+    os << "  %step_x_s = tt.splat %loop_step_0 : i32 -> tensor<" << block
+       << "xi32>\n";
+  else
+    os << "  %step_x_s = arith.constant dense<" << k.loopStepX << "> : tensor<"
+       << block << "xi32>\n";
   os << "  %scaled_x = arith.muli %ix0, %step_x_s : tensor<" << block
      << "xi32>\n";
   os << "  %source_x = arith.addi %scaled_x, %loop_lower_x_s : tensor<" << block
      << "xi32>\n";
-  os << "  %step_y_s = arith.constant dense<" << k.loopStepY << "> : tensor<"
-     << block << "xi32>\n";
+  if (k.loopStepY == 0)
+    os << "  %step_y_s = tt.splat %loop_step_1 : i32 -> tensor<" << block
+       << "xi32>\n";
+  else
+    os << "  %step_y_s = arith.constant dense<" << k.loopStepY << "> : tensor<"
+       << block << "xi32>\n";
   os << "  %scaled_y = arith.muli %iy0, %step_y_s : tensor<" << block
      << "xi32>\n";
   os << "  %source_y = arith.addi %scaled_y, %loop_lower_y_s : tensor<" << block
@@ -1725,6 +1757,7 @@ static void emitTritonMultiReduction2D(const fir::fnacc::ElementwiseKernel &k,
     parameter("array" + std::to_string(array) + "_stride0", "i32");
     parameter("array" + std::to_string(array) + "_stride1", "i32");
   }
+  emitRuntimeStepParameters(k, os);
   os << ") attributes {noinline = false} {\n";
 
   os << "  %pid_x = tt.get_program_id x : i32\n";
@@ -1759,14 +1792,22 @@ static void emitTritonMultiReduction2D(const fir::fnacc::ElementwiseKernel &k,
      << "xi32>\n";
   os << "  %loop_lower_y_s = tt.splat %loop_lower_y : i32 -> tensor<" << block
      << "xi32>\n";
-  os << "  %step_x_s = arith.constant dense<" << k.loopStepX << "> : tensor<"
-     << block << "xi32>\n";
+  if (k.loopStepX == 0)
+    os << "  %step_x_s = tt.splat %loop_step_0 : i32 -> tensor<" << block
+       << "xi32>\n";
+  else
+    os << "  %step_x_s = arith.constant dense<" << k.loopStepX << "> : tensor<"
+       << block << "xi32>\n";
   os << "  %scaled_x = arith.muli %ix0, %step_x_s : tensor<" << block
      << "xi32>\n";
   os << "  %source_x = arith.addi %scaled_x, %loop_lower_x_s : tensor<" << block
      << "xi32>\n";
-  os << "  %step_y_s = arith.constant dense<" << k.loopStepY << "> : tensor<"
-     << block << "xi32>\n";
+  if (k.loopStepY == 0)
+    os << "  %step_y_s = tt.splat %loop_step_1 : i32 -> tensor<" << block
+       << "xi32>\n";
+  else
+    os << "  %step_y_s = arith.constant dense<" << k.loopStepY << "> : tensor<"
+       << block << "xi32>\n";
   os << "  %scaled_y = arith.muli %iy0, %step_y_s : tensor<" << block
      << "xi32>\n";
   os << "  %source_y = arith.addi %scaled_y, %loop_lower_y_s : tensor<" << block
@@ -1921,11 +1962,13 @@ static void emitTritonMultiReduction2D(const fir::fnacc::ElementwiseKernel &k,
 }
 
 // Matmul layout parameters follow the public ABI parameter order.
-static void emitMatmulLayoutParameters(llvm::raw_ostream &os) {
+static void emitMatmulLayoutParameters(const fir::fnacc::ElementwiseKernel &k,
+                                       llvm::raw_ostream &os) {
   os << ", %lx: i32, %ly: i32, %lz: i32";
   for (StringRef name : {"a", "b", "c"})
     os << ", %" << name << "_l0: i32, %" << name << "_l1: i32, %" << name
        << "_s0: i32, %" << name << "_s1: i32";
+  emitRuntimeStepParameters(k, os);
   os << ") attributes {noinline = false} {\n";
 }
 
@@ -1954,10 +1997,26 @@ static void emitMatmulOffsets(llvm::raw_ostream &os, StringRef array,
      << shape << "xi32> to " << ty << "\n";
   os << "    %" << stem << "_col64 = arith.extsi %" << col << " : tensor<"
      << shape << "xi32> to " << ty << "\n";
-  os << "    %" << stem << "_step_r = arith.constant dense<" << stepRow
-     << "> : " << ty << "\n";
-  os << "    %" << stem << "_step_c = arith.constant dense<" << stepCol
-     << "> : " << ty << "\n";
+  if (stepRow == 0) {
+    unsigned dim = lowerRow == "lx" ? 0 : lowerRow == "ly" ? 1 : 2;
+    os << "    %" << stem << "_step_r64 = arith.extsi %loop_step_" << dim
+       << " : i32 to i64\n";
+    os << "    %" << stem << "_step_r = tt.splat %" << stem
+       << "_step_r64 : i64 -> " << ty << "\n";
+  } else {
+    os << "    %" << stem << "_step_r = arith.constant dense<" << stepRow
+       << "> : " << ty << "\n";
+  }
+  if (stepCol == 0) {
+    unsigned dim = lowerCol == "lx" ? 0 : lowerCol == "ly" ? 1 : 2;
+    os << "    %" << stem << "_step_c64 = arith.extsi %loop_step_" << dim
+       << " : i32 to i64\n";
+    os << "    %" << stem << "_step_c = tt.splat %" << stem
+       << "_step_c64 : i64 -> " << ty << "\n";
+  } else {
+    os << "    %" << stem << "_step_c = arith.constant dense<" << stepCol
+       << "> : " << ty << "\n";
+  }
   os << "    %" << stem << "_scaled_r = arith.muli %" << stem << "_row64, %"
      << stem << "_step_r : " << ty << "\n";
   os << "    %" << stem << "_scaled_c = arith.muli %" << stem << "_col64, %"
@@ -1990,7 +2049,7 @@ static void emitTritonMatMul2DDot(const fir::fnacc::ElementwiseKernel &k,
      << ", %c: " << ptrTy
      << ", "
         "%n: i32, %m: i32, %k: i32";
-  emitMatmulLayoutParameters(os);
+  emitMatmulLayoutParameters(k, os);
 
   os << "  %pid_m = tt.get_program_id x : i32\n";
   os << "  %pid_n = tt.get_program_id y : i32\n";
@@ -2199,7 +2258,7 @@ static void emitTritonMatMul2DF64Reduce(const fir::fnacc::ElementwiseKernel &k,
 
   os << "tt.func @" << kernelName << "(%a: " << ptrTy << ", %b: " << ptrTy
      << ", %c: " << ptrTy << ", %n: i32, %m: i32, %k: i32";
-  emitMatmulLayoutParameters(os);
+  emitMatmulLayoutParameters(k, os);
 
   os << "  %pid_m = tt.get_program_id x : i32\n";
   os << "  %pid_n = tt.get_program_id y : i32\n";
@@ -2440,7 +2499,7 @@ static void emitTritonMatMul2DF64FMA(const fir::fnacc::ElementwiseKernel &k,
 
   os << "tt.func @" << kernelName << "(%a: " << ptrTy << ", %b: " << ptrTy
      << ", %c: " << ptrTy << ", %n: i32, %m: i32, %k: i32";
-  emitMatmulLayoutParameters(os);
+  emitMatmulLayoutParameters(k, os);
 
   os << "  %pid_m = tt.get_program_id x : i32\n";
   os << "  %pid_n = tt.get_program_id y : i32\n";
@@ -2760,6 +2819,10 @@ static void emitJsonDescriptor(const fir::fnacc::FNACCKernelPlan &plan,
   os << "      \"rank\": " << k.rank << ",\n";
   os << "      \"loop_steps\": [" << k.loopStepX << ", " << k.loopStepY << ", "
      << k.loopStepZ << "],\n";
+  if (k.runtimeStepCount())
+    os << "      \"loop_step_scalar_indices\": [" << k.runtimeStepScalarIndex(0)
+       << ", " << k.runtimeStepScalarIndex(1) << ", "
+       << k.runtimeStepScalarIndex(2) << "],\n";
   os << "      \"tile\": [" << schedule.tile.x << ", " << schedule.tile.y
      << ", " << schedule.tile.z << "],\n";
   os << "      \"num_warps\": " << schedule.parallelSubgroups << ",\n";
@@ -2779,7 +2842,8 @@ static void emitJsonDescriptor(const fir::fnacc::FNACCKernelPlan &plan,
   if (plan.usesVariadicABI) {
     os << "      \"launch_abi_version\": 2,\n";
     os << "      \"array_count\": " << k.arrayArguments.size() << ",\n";
-    os << "      \"scalar_count\": " << k.scalarRefs.size() + k.indexRefs.size()
+    os << "      \"scalar_count\": "
+       << k.scalarRefs.size() + k.indexRefs.size() + k.runtimeStepCount()
        << ",\n";
     os << "      \"output_count\": ";
     if (!k.reductionOutputs.empty())

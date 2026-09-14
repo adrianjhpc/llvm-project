@@ -427,10 +427,71 @@ static void populateVariadicArrayArguments(ElementwiseKernel &kernel) {
              true);
 }
 
+// Runtime steps must be uniform for the whole rectangular launch. In
+// particular, a step loaded from an induction variable or a kernel output
+// cannot be evaluated once on the host.
+static bool runtimeStepIsInvariant(fir::fnacc::LaunchOp launchOp,
+                                   const ElementwiseExtentSource &source) {
+  auto storageRoot = [](Value value) {
+    while (value) {
+      value = getScalarStorageRoot(value);
+      if (auto coor = value.getDefiningOp<fir::ArrayCoorOp>())
+        value = coor.getMemref();
+      else if (auto *op = value.getDefiningOp();
+               op && op->getName().getStringRef() == "fir.coordinate_of")
+        value = op->getOperand(0);
+      else
+        break;
+    }
+    return value;
+  };
+  llvm::SmallVector<Value> references, pending{source.value}, visited;
+  if (source.kind == ElementwiseExtentSourceKind::LoadIntegerRef)
+    references.push_back(source.value);
+  while (!pending.empty()) {
+    Value value = pending.pop_back_val();
+    if (!value || llvm::is_contained(visited, value))
+      continue;
+    visited.push_back(value);
+    Operation *op = value.getDefiningOp();
+    if (!op) {
+      if (auto arg = dyn_cast<BlockArgument>(value)) {
+        Operation *parent = arg.getOwner()->getParentOp();
+        if (parent && (parent == launchOp.getOperation() ||
+                       launchOp->isProperAncestor(parent)))
+          return false;
+      }
+      continue;
+    }
+    if (!launchOp->isProperAncestor(op))
+      continue;
+    if (auto load = dyn_cast<fir::LoadOp>(op))
+      references.push_back(load.getMemref());
+    for (Value operand : op->getOperands())
+      pending.push_back(operand);
+  }
+  bool invariant = true;
+  launchOp.walk([&](fir::StoreOp store) {
+    for (Value reference : references)
+      if (sameArrayBase(storageRoot(reference), storageRoot(store.getMemref())))
+        invariant = false;
+  });
+  return invariant;
+}
+
 static ElementwiseRecognitionResult
 validateRecognizedKernel(fir::fnacc::LaunchOp launchOp,
                          ElementwiseRecognitionResult result) {
   ElementwiseKernel kernel = std::move(result.getKernel());
+  const int64_t steps[] = {kernel.loopStepX, kernel.loopStepY,
+                           kernel.loopStepZ};
+  const ElementwiseExtentSource stepSources[] = {
+      kernel.loopStepSourceX, kernel.loopStepSourceY, kernel.loopStepSourceZ};
+  for (unsigned dim = 0; dim < 3; ++dim)
+    if (steps[dim] == 0 && !runtimeStepIsInvariant(launchOp, stepSources[dim]))
+      return fail(launchOp,
+                  "runtime loop step must be invariant across the launch");
+
   if (Attribute attr = launchOp->getAttr("fnacc.matmul_precision")) {
     auto precision = dyn_cast<StringAttr>(attr);
     if (!precision ||
@@ -499,9 +560,18 @@ static std::optional<int64_t> getConstantLoopStep(fir::DoLoopOp loop) {
 
 static bool verifyLoopLowerBoundAndStep(fir::DoLoopOp loop, StringRef loopName,
                                         std::string &reason) {
-  if (!getConstantLoopStep(loop)) {
+  Value step = stripFirConvert(loop.getStep());
+  llvm::APInt constant;
+  if (matchPattern(step, m_ConstantInt(&constant))) {
+    if (constant.isSignedIntN(32) && !constant.isZero())
+      return true;
+    reason =
+        loopName.str() + " loop step must be nonzero and fit signed 32 bits";
+    return false;
+  }
+  if (!step.getType().isInteger(32)) {
     reason = loopName.str() +
-             " loop step must be a nonzero constant signed 32-bit integer";
+             " runtime loop step must have signed 32-bit integer type";
     return false;
   }
   return true;
@@ -3835,9 +3905,11 @@ recognizeMultiReduction2D(fir::fnacc::LaunchOp launchOp) {
   kernel.extentX = extentX;
   kernel.extentY = extentY;
   kernel.loopLowerX = getLoopLowerSource(innerLoop);
-  kernel.loopStepX = *getConstantLoopStep(innerLoop);
+  kernel.loopStepX = getConstantLoopStep(innerLoop).value_or(0);
+  kernel.loopStepSourceX = getIntegerSource(innerLoop.getStep());
   kernel.loopLowerY = getLoopLowerSource(outerLoop);
-  kernel.loopStepY = *getConstantLoopStep(outerLoop);
+  kernel.loopStepY = getConstantLoopStep(outerLoop).value_or(0);
+  kernel.loopStepSourceY = getIntegerSource(outerLoop.getStep());
   kernel.innerIndMemref = innerIndMemref;
   kernel.outerIndMemref = outerIndMemref;
   kernel.elementType = elementType;
@@ -4012,7 +4084,8 @@ recognizeReduction1D(fir::fnacc::LaunchOp launchOp) {
   k.loop1D = loop;
   k.extentX = extentX;
   k.loopLowerX = getLoopLowerSource(loop);
-  k.loopStepX = *getConstantLoopStep(loop);
+  k.loopStepX = getConstantLoopStep(loop).value_or(0);
+  k.loopStepSourceX = getIntegerSource(loop.getStep());
   k.innerIndMemref = indMemref;
   k.reductionScalarRef = *reductionScalar;
   k.reductionOperator = *reductionOp;
@@ -4456,11 +4529,14 @@ recognizeMatMul2D(fir::fnacc::LaunchOp launchOp) {
   k.extentX = getLoopExtentSource(iLoop); // n
   k.extentZ = getLoopExtentSource(pLoop); // k
   k.loopLowerX = getLoopLowerSource(iLoop);
-  k.loopStepX = *getConstantLoopStep(iLoop);
+  k.loopStepX = getConstantLoopStep(iLoop).value_or(0);
+  k.loopStepSourceX = getIntegerSource(iLoop.getStep());
   k.loopLowerY = getLoopLowerSource(jLoop);
-  k.loopStepY = *getConstantLoopStep(jLoop);
+  k.loopStepY = getConstantLoopStep(jLoop).value_or(0);
+  k.loopStepSourceY = getIntegerSource(jLoop.getStep());
   k.loopLowerZ = getLoopLowerSource(pLoop);
-  k.loopStepZ = *getConstantLoopStep(pLoop);
+  k.loopStepZ = getConstantLoopStep(pLoop).value_or(0);
+  k.loopStepSourceZ = getIntegerSource(pLoop.getStep());
 
   k.readArrays.push_back(aArray);
   k.readArrays.push_back(bArray);
@@ -4523,7 +4599,8 @@ static ElementwiseRecognitionResult recognize1D(fir::fnacc::LaunchOp launchOp) {
   k.loop1D = loop;
   k.extentX = extentX;
   k.loopLowerX = getLoopLowerSource(loop);
-  k.loopStepX = *getConstantLoopStep(loop);
+  k.loopStepX = getConstantLoopStep(loop).value_or(0);
+  k.loopStepSourceX = getIntegerSource(loop.getStep());
   k.innerIndMemref = indMemref;
 
   markLoopBounds(k, launchOp, loop);
@@ -4606,9 +4683,11 @@ static ElementwiseRecognitionResult recognize2D(fir::fnacc::LaunchOp launchOp) {
   k.extentY = extentY;
   k.extentX = extentX;
   k.loopLowerY = getLoopLowerSource(outer);
-  k.loopStepY = *getConstantLoopStep(outer);
+  k.loopStepY = getConstantLoopStep(outer).value_or(0);
+  k.loopStepSourceY = getIntegerSource(outer.getStep());
   k.loopLowerX = getLoopLowerSource(inner);
-  k.loopStepX = *getConstantLoopStep(inner);
+  k.loopStepX = getConstantLoopStep(inner).value_or(0);
+  k.loopStepSourceX = getIntegerSource(inner.getStep());
   k.outerIndMemref = outerIndMemref;
   k.innerIndMemref = innerIndMemref;
 
@@ -4931,6 +5010,14 @@ static FNACCKernelABI buildKernelABI(fir::fnacc::LaunchOp launchOp,
               array, dim);
       }
     }
+    for (unsigned dim = 0; dim < 3; ++dim) {
+      int index = kernel.runtimeStepScalarIndex(dim);
+      if (index >= 0)
+        appendABIParameter(abi, FNACCKernelParameterRole::Scalar,
+                           FNACCKernelParameterPassing::Value, ElementType::I32,
+                           "loop_step_" + std::to_string(dim), -1, -1, index);
+    }
+
   } else {
     for (unsigned i = 0; i < kernel.readArrays.size(); ++i)
       appendABIParameter(abi, FNACCKernelParameterRole::Read,

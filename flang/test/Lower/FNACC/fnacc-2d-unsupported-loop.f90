@@ -2,7 +2,8 @@
 ! RUN: not fir-opt --fnacc-pipeline="ttir-output=%t.ttir json-output=%t.json" %t.fir -o /dev/null 2>&1 | FileCheck %s
 
 subroutine bad_2d_step(n, m, a, b, c, step)
-  integer :: n, m, step
+  integer :: n, m
+  integer(8) :: step
   real :: a(n, m), b(n, m), c(n, m)
   integer :: i, j
 
@@ -15,4 +16,4 @@ subroutine bad_2d_step(n, m, a, b, c, step)
 end subroutine
 
 ! CHECK: error: FNACC cannot plan launch:
-! CHECK-SAME: loop step must be a nonzero constant signed 32-bit integer
+! CHECK-SAME: runtime loop step must have signed 32-bit integer type

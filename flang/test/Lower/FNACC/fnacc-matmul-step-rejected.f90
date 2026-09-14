@@ -2,7 +2,8 @@
 ! RUN: not fir-opt --fnacc-pipeline="launch-abi=2 ttir-output=%t.ttir json-output=%t.json" %t.fir 2>&1 | FileCheck %s
 subroutine matmul_step(a,b,c,step)
   real :: a(32,32),b(32,32),c(32,32),acc
-  integer :: i,j,p,step
+  integer :: i,j,p
+  integer(8) :: step
   !$fnacc parallel tile(16,16,8)
   do j=1,32
     do i=1,32
@@ -14,4 +15,4 @@ subroutine matmul_step(a,b,c,step)
     enddo
   enddo
 end subroutine
-! CHECK: matmul p loop step must be a nonzero constant signed 32-bit integer
+! CHECK: matmul p runtime loop step must have signed 32-bit integer type

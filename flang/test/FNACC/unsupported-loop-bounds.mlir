@@ -42,4 +42,4 @@ module {
 }
 
 // CHECK: error: FNACC runtime cannot lower launch:
-// CHECK: 1-D loop step must be a nonzero constant signed 32-bit integer
+// CHECK: 1-D loop step must be nonzero and fit signed 32 bits

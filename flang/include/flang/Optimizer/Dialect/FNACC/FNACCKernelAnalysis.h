@@ -310,8 +310,22 @@ struct ElementwiseKernel {
   ElementwiseExtentSource loopLowerX;
   ElementwiseExtentSource loopLowerY;
   ElementwiseExtentSource loopLowerZ;
-  // Source DO steps; device kernels specialize these constants.
+  // Source DO steps: specialize constants, bind runtime values per launch.
   int64_t loopStepX = 1, loopStepY = 1, loopStepZ = 1;
+  // Zero denotes a runtime step, carried in an additional scalar binding.
+  ElementwiseExtentSource loopStepSourceX, loopStepSourceY, loopStepSourceZ;
+  unsigned runtimeStepCount() const {
+    return (loopStepX == 0) + (loopStepY == 0) + (loopStepZ == 0);
+  }
+  int runtimeStepScalarIndex(unsigned dim) const {
+    const int64_t steps[] = {loopStepX, loopStepY, loopStepZ};
+    if (steps[dim] != 0)
+      return -1;
+    unsigned index = scalarRefs.size() + indexRefs.size();
+    for (unsigned i = 0; i < dim; ++i)
+      index += steps[i] == 0;
+    return index;
+  }
 
   mlir::Value innerIndMemref;
   mlir::Value outerIndMemref;

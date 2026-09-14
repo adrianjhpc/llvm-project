@@ -32,6 +32,7 @@ using CUdeviceptr = std::uintptr_t;
 using CUfunction_attribute = hipFunction_attribute;
 
 static constexpr CUresult CUDA_SUCCESS = hipSuccess;
+static constexpr CUresult CUDA_ERROR_NO_DEVICE = hipErrorNoDevice;
 static constexpr CUresult CUDA_ERROR_NOT_INITIALIZED = hipErrorNotInitialized;
 static constexpr CUresult CUDA_ERROR_ILLEGAL_ADDRESS = hipErrorIllegalAddress;
 static constexpr unsigned CU_STREAM_DEFAULT = hipStreamDefault;
@@ -59,6 +60,9 @@ static CUresult cuGetErrorString(CUresult error, const char **description) {
   return hipSuccess;
 }
 static CUresult cuInit(unsigned flags) { return hipInit(flags); }
+static CUresult cuDeviceGetCount(int *count) {
+  return hipGetDeviceCount(count);
+}
 static CUresult cuDeviceGet(CUdevice *device, int ordinal) {
   return hipDeviceGet(device, ordinal);
 }
@@ -335,7 +339,13 @@ static void fnaccValidateCudaBlockSize(
   }
 }
 
+// Explicit API selection is per host thread and takes precedence over env
+// settings.
+static thread_local int fnaccSelectedDeviceOrdinal = -1;
+
 static int fnaccGetDeviceOrdinal() {
+  if (fnaccSelectedDeviceOrdinal >= 0)
+    return fnaccSelectedDeviceOrdinal;
   const char *variable = "FNACC_DEVICE";
   const char *value = std::getenv(variable);
   if (!value || value[0] == '\0') {
@@ -351,7 +361,8 @@ static int fnaccGetDeviceOrdinal() {
 
   char *end = nullptr;
   long parsed = std::strtol(value, &end, 10);
-  if (end == value || *end != '\0' || parsed < 0) {
+  if (end == value || *end != '\0' || parsed < 0 ||
+      parsed > std::numeric_limits<int>::max()) {
     std::fprintf(
         stderr, "FNACC error: invalid %s value '%s'\n", variable, value);
     std::abort();
@@ -896,6 +907,7 @@ struct FNACCKernelDesc {
   int32_t rank = 1;
 
   int32_t loopStep[3] = {1, 1, 1};
+  int32_t loopStepScalarIndex[3] = {-1, -1, -1};
   int32_t tileX = 1024;
   int32_t tileY = 1;
   int32_t tileZ = 1;
@@ -995,6 +1007,25 @@ static void fnaccPrepareVariadicMetadata(FNACCKernelDesc &desc) {
 }
 
 static void fnaccValidateVariadicKernelMetadata(const FNACCKernelDesc &desc) {
+  for (int dim = 0; dim < 3; ++dim) {
+    int slot = desc.loopStepScalarIndex[dim];
+    bool valid = slot == -1
+        ? desc.loopStep[dim] != 0
+        : (slot >= 0 && slot < desc.scalarCount && desc.loopStep[dim] == 0 &&
+              dim < (desc.kind == "matmul2d" ? 3 : desc.rank));
+    if (slot >= 0) {
+      valid &= std::any_of(desc.parameters.begin(), desc.parameters.end(),
+          [&](const FNACCKernelParameterDesc &p) {
+            return p.role == FNACCKernelParameterRole::Scalar &&
+                p.scalarIndex == slot && p.type == "i32";
+          });
+    }
+    if (!valid) {
+      std::fprintf(
+          stderr, "FNACC error: invalid loop step scalar binding metadata\n");
+      std::abort();
+    }
+  }
   if (desc.rank < 1 || desc.rank > 2 || desc.arrayCount <= 0 ||
       desc.scalarCount < 0 || desc.outputCount <= 0 ||
       desc.parameters.empty()) {
@@ -1662,9 +1693,17 @@ fnaccParseKernelDescsFromJson(const std::string &json) {
     jsonFindIntArray3(objectText, "tile", desc.tileX, desc.tileY, desc.tileZ);
     if (jsonFindKey(objectText, "loop_steps") != std::string::npos &&
         (!jsonFindIntArray3(objectText, "loop_steps", desc.loopStep[0],
-             desc.loopStep[1], desc.loopStep[2]) ||
-            !desc.loopStep[0] || !desc.loopStep[1] || !desc.loopStep[2])) {
+            desc.loopStep[1], desc.loopStep[2]))) {
       std::fprintf(stderr, "FNACC error: invalid loop_steps metadata\n");
+      std::abort();
+    }
+
+    if (jsonFindKey(objectText, "loop_step_scalar_indices") !=
+            std::string::npos &&
+        !jsonFindIntArray3(objectText, "loop_step_scalar_indices",
+            desc.loopStepScalarIndex[0], desc.loopStepScalarIndex[1],
+            desc.loopStepScalarIndex[2])) {
+      std::fprintf(stderr, "FNACC error: invalid loop step scalar metadata\n");
       std::abort();
     }
 
@@ -2269,7 +2308,8 @@ static void fnaccEnsureCurrentContext() {
     return;
   fnaccEnsureInitialized();
 
-  if (fnaccEnvFlagEnabled("FNACC_USE_CURRENT_CONTEXT")) {
+  if (fnaccSelectedDeviceOrdinal < 0 &&
+      fnaccEnvFlagEnabled("FNACC_USE_CURRENT_CONTEXT")) {
     CUcontext context = nullptr;
     CUdevice device = 0;
     FNACC_CUDA_CHECK(cuCtxGetCurrent(&context));
@@ -2303,6 +2343,71 @@ static void fnaccEnsureCurrentContext() {
     std::fprintf(stderr,
         "FNACC: active CUDA device ordinal=%d device=%d context=%p\n", ordinal,
         static_cast<int>(state.device), static_cast<void *>(state.context));
+}
+
+// Queries initialize only the device driver: no kernel metadata, streams or
+// primary contexts are loaded until the first FnACC data operation or launch.
+static int fnaccVisibleDeviceCount() {
+  CUresult status = cuInit(0);
+  if (status == CUDA_ERROR_NO_DEVICE)
+    return 0;
+  FNACC_CUDA_CHECK(status);
+  int count = 0;
+  status = cuDeviceGetCount(&count);
+  if (status == CUDA_ERROR_NO_DEVICE)
+    return 0;
+  FNACC_CUDA_CHECK(status);
+  return count;
+}
+
+static void fnaccValidateDeviceOrdinal(int ordinal, int count) {
+  if (ordinal < 0 || ordinal >= count) {
+    std::fprintf(stderr,
+        "FNACC error: device number %d is outside the visible range [0,%d)\n",
+        ordinal, count);
+    std::abort();
+  }
+}
+
+extern "C" int32_t fnacc_get_num_devices() {
+  FNACC_RUNTIME_GUARD();
+  return fnaccVisibleDeviceCount();
+}
+
+extern "C" void fnacc_set_device_num(int32_t device) {
+  FNACC_RUNTIME_GUARD();
+  fnaccValidateDeviceOrdinal(device, fnaccVisibleDeviceCount());
+  fnaccSelectedDeviceOrdinal = device;
+}
+
+extern "C" int32_t fnacc_get_device_num() {
+  FNACC_RUNTIME_GUARD();
+  int count = fnaccVisibleDeviceCount();
+  if (fnaccSelectedDeviceOrdinal < 0 &&
+      fnaccEnvFlagEnabled("FNACC_USE_CURRENT_CONTEXT")) {
+    CUcontext context = nullptr;
+    FNACC_CUDA_CHECK(cuCtxGetCurrent(&context));
+    if (!context) {
+      std::fprintf(stderr,
+          "FNACC error: FNACC_USE_CURRENT_CONTEXT is set but no CUDA context "
+          "is current\n");
+      std::abort();
+    }
+    CUdevice device;
+    FNACC_CUDA_CHECK(cuCtxGetDevice(&device));
+    for (int ordinal = 0; ordinal < count; ++ordinal) {
+      CUdevice candidate;
+      FNACC_CUDA_CHECK(cuDeviceGet(&candidate, ordinal));
+      if (candidate == device)
+        return ordinal;
+    }
+    std::fprintf(
+        stderr, "FNACC error: current context device is not visible\n");
+    std::abort();
+  }
+  int ordinal = fnaccGetDeviceOrdinal();
+  fnaccValidateDeviceOrdinal(ordinal, count);
+  return ordinal;
 }
 
 static void fnaccWaitForStream(CUstream stream, CUevent completionEvent) {
@@ -2358,6 +2463,25 @@ static void fnaccCompleteArrayLaunch(bool allArgumentsCached) {
     return;
   }
   fnaccWaitForRuntimeStream();
+}
+
+// Host-only helper: validate before dividing, including empty domains.
+// No CUDA initialization or launch-state mutation is needed.
+extern "C" void __fnacc_trip_count_i32(
+    int32_t lower, int32_t upper, int32_t step, int32_t *result) {
+  if (!result || step == 0) {
+    std::fprintf(stderr, "FNACC error: runtime loop step must be nonzero\n");
+    std::abort();
+  }
+  int64_t distance = step > 0 ? int64_t(upper) - lower : int64_t(lower) - upper;
+  int64_t magnitude = step > 0 ? int64_t(step) : -int64_t(step);
+  int64_t count = distance < 0 ? 0 : distance / magnitude + 1;
+  if (count > std::numeric_limits<int32_t>::max()) {
+    std::fprintf(stderr,
+        "FNACC error: runtime loop trip count exceeds signed 32-bit range\n");
+    std::abort();
+  }
+  *result = static_cast<int32_t>(count);
 }
 
 extern "C" void __fnacc_wait() {
@@ -4792,6 +4916,24 @@ extern "C" void __fnacc_commit_launch_v2() {
     }
 
   const FNACCKernelDesc *desc = fnaccLookupKernelDesc(pending.kernelId);
+  int32_t loopSteps[3];
+  for (int dim = 0; dim < 3; ++dim) {
+    loopSteps[dim] = desc->loopStep[dim];
+    int index = desc->loopStepScalarIndex[dim];
+    if (index >= 0) {
+      if (static_cast<std::size_t>(index) >= pending.scalars.size() ||
+          !pending.scalars[index].bound || pending.scalars[index].bytes != 4) {
+        std::fprintf(stderr,
+            "FNACC error: missing or invalid runtime loop step binding\n");
+        std::abort();
+      }
+      std::memcpy(&loopSteps[dim], &pending.scalars[index].storage, 4);
+    }
+    if (!loopSteps[dim]) {
+      std::fprintf(stderr, "FNACC error: runtime loop step must be nonzero\n");
+      std::abort();
+    }
+  }
   bool isReduction = desc->isReduction;
   bool anyReductionResultBound = std::any_of(pending.reductionResults.begin(),
       pending.reductionResults.end(),
@@ -4839,8 +4981,8 @@ extern "C" void __fnacc_commit_launch_v2() {
           fnaccCheckedI32Layout(array.lower[0], "matmul row lower bound");
       int64_t dc = int64_t(pending.loopLower[c]) -
           fnaccCheckedI32Layout(array.lower[1], "matmul column lower bound");
-      int64_t lastRow = dr + int64_t(pending.extent[r] - 1) * desc->loopStep[r];
-      int64_t lastCol = dc + int64_t(pending.extent[c] - 1) * desc->loopStep[c];
+      int64_t lastRow = dr + int64_t(pending.extent[r] - 1) * loopSteps[r];
+      int64_t lastCol = dc + int64_t(pending.extent[c] - 1) * loopSteps[c];
       int64_t elemBytes = parameter.type == "ptr<f64>" ? 8 : 4;
       // Current data ABI requires contiguous column-major storage.
       bool valid = array.stride[0] == 1 && array.stride[1] > 0 &&
