@@ -1766,6 +1766,8 @@ fnaccParseKernelDescsFromJson(const std::string &json) {
       std::abort();
     }
 
+    if (desc.backend == "cuda-tile")
+      expectedCudaThreads = 1;
     if (!hasThreadsPerCTA)
       desc.cudaThreadsPerCTA = static_cast<int32_t>(expectedCudaThreads);
     if (desc.cudaThreadsPerCTA != expectedCudaThreads) {
@@ -1775,10 +1777,10 @@ fnaccParseKernelDescsFromJson(const std::string &json) {
           desc.id);
       std::abort();
     }
-    if (desc.tritonHiddenPtrArgs != 2) {
+    if (desc.tritonHiddenPtrArgs != (desc.backend == "cuda-tile" ? 0 : 2)) {
       std::fprintf(stderr,
           "FNACC error: kernel id %d requires %d private pointer parameters; "
-          "this runtime ABI supports exactly 2\n",
+          "private argument count disagrees with backend\n",
           desc.id, desc.tritonHiddenPtrArgs);
       std::abort();
     }
@@ -1886,6 +1888,8 @@ static void fnaccCleanup() {
 
 static unsigned fnaccReductionIntegerDynamicSharedBytes(
     const FNACCKernelDesc *desc, int32_t blockX, size_t integerSize) {
+  if (desc && desc->backend == "cuda-tile")
+    return 0;
 
   std::size_t bytes = fnaccCheckedMul(static_cast<std::size_t>(blockX),
       integerSize, "reduction dynamic shared bytes");
@@ -1914,6 +1918,8 @@ static unsigned fnaccReductionIntegerDynamicSharedBytes(
 
 static unsigned fnaccReductionDynamicSharedBytes(
     const FNACCKernelDesc *desc, int32_t blockX) {
+  if (desc && desc->backend == "cuda-tile")
+    return 0;
 
   std::size_t bytes = fnaccCheckedMul(static_cast<std::size_t>(blockX),
       sizeof(float), "reduction dynamic shared bytes");
@@ -1942,6 +1948,8 @@ static unsigned fnaccReductionDynamicSharedBytes(
 
 static unsigned fnaccReductionF64DynamicSharedBytes(
     const FNACCKernelDesc *desc, int32_t blockX) {
+  if (desc && desc->backend == "cuda-tile")
+    return 0;
 
   std::size_t bytes = fnaccCheckedMul(static_cast<std::size_t>(blockX),
       sizeof(double), "reduction f64 dynamic shared bytes");
@@ -2528,7 +2536,9 @@ static void fnaccValidateSupportedHiddenPtrArgCount(
   int32_t count =
       desc ? desc->tritonHiddenPtrArgs : fnaccTritonHiddenPtrArgCount(kernelId);
 
-  if (count == 2)
+  if (!desc)
+    desc = fnaccLookupKernelDesc(kernelId);
+  if (count == (desc && desc->backend == "cuda-tile" ? 0 : 2))
     return;
 
   std::fprintf(stderr,
@@ -4385,11 +4395,42 @@ static void fnaccCommitReductionTypedV2(
     return;
   }
 
+  if (desc->backend == "cuda-tile") {
+    // The first Tile reduction emitter uses signed i32 layout arithmetic.
+    // Include inactive tail lanes in this check since pointer offsets are
+    // computed before masked loads. Host initial values never enter a tile.
+    if (pending.block[0] < 2 || pending.block[0] > 1024 ||
+        (pending.block[0] & (pending.block[0] - 1)) != 0) {
+      std::fprintf(stderr, "FNACC error: invalid CUDA Tile reduction tile\n");
+      std::abort();
+    }
+    int64_t padded = ((int64_t(pending.extent[0]) + pending.block[0] - 1) /
+                         pending.block[0]) *
+        pending.block[0];
+    for (const auto &array : pending.arrays) {
+      int64_t first = int64_t(pending.loopLower[0]) -
+          fnaccCheckedI32Layout(array.lower[0], "reduction array lower bound");
+      int64_t last = first + pending.extent[0] - 1;
+      int64_t paddedLast = first + padded - 1;
+      int64_t stride = array.stride[0];
+      // Division checks keep the validation itself free of overflow.
+      if (first < 0 || paddedLast > INT32_MAX || stride <= 0 ||
+          stride > INT32_MAX || paddedLast > INT32_MAX / stride ||
+          uint64_t(last * stride) >= array.bytes / sizeof(T)) {
+        std::fprintf(stderr,
+            "FNACC error: CUDA Tile reduction layout is out of bounds or "
+            "exceeds i32 indexing; use the Triton backend\n");
+        std::abort();
+      }
+    }
+  }
+
   CUfunction function = getKernelFunction(pending.kernelId);
   unsigned gridX = fnaccCdiv(
       pending.extent[0], pending.block[0], "v2 reduction grid dimension X");
   unsigned cudaBlockX = fnaccCudaThreadsPerCTA(desc);
-  fnaccValidateCudaBlockSize(function, pending.kernelId, cudaBlockX);
+  if (desc->backend != "cuda-tile")
+    fnaccValidateCudaBlockSize(function, pending.kernelId, cudaBlockX);
   fnaccValidateSupportedHiddenPtrArgCount(pending.kernelId, desc);
 
   auto &deviceArgs = pending.deviceArgs;
@@ -4477,8 +4518,10 @@ static void fnaccCommitReductionTypedV2(
     }
   }
   FNACCHiddenTritonArgs hidden;
-  arguments.push_back(&hidden.hidden0);
-  arguments.push_back(&hidden.hidden1);
+  if (desc->tritonHiddenPtrArgs == 2) {
+    arguments.push_back(&hidden.hidden0);
+    arguments.push_back(&hidden.hidden1);
+  }
 
   unsigned dynamicSharedBytes;
   if constexpr (std::is_same_v<T, double>) {
@@ -5000,9 +5043,32 @@ extern "C" void __fnacc_commit_launch_v2() {
     }
   }
 
+  // The initial Tile pointwise ABI uses signed i32 flattened coordinates.
+  // Check padded tiles too: masked lanes still evaluate their pointer offsets.
+  if (desc->backend == "cuda-tile") {
+    int64_t padded[2] = {1, 1};
+    for (int dim = 0; dim < pending.rank; ++dim) {
+      if (dim >= 2 || pending.block[dim] <= 0) {
+        std::fprintf(
+            stderr, "FNACC error: invalid CUDA Tile launch geometry\n");
+        std::abort();
+      }
+      padded[dim] = ((int64_t(pending.extent[dim]) + pending.block[dim] - 1) /
+                        pending.block[dim]) *
+          pending.block[dim];
+    }
+    if (padded[0] * padded[1] > INT32_MAX) {
+      std::fprintf(stderr,
+          "FNACC error: CUDA Tile pointwise indexing exceeds i32 range; "
+          "recompile with the Triton backend\n");
+      std::abort();
+    }
+  }
+
   CUfunction function = getKernelFunction(pending.kernelId);
   unsigned cudaBlockX = fnaccCudaThreadsPerCTA(desc);
-  fnaccValidateCudaBlockSize(function, pending.kernelId, cudaBlockX);
+  if (desc->backend != "cuda-tile")
+    fnaccValidateCudaBlockSize(function, pending.kernelId, cudaBlockX);
   fnaccValidateSupportedHiddenPtrArgCount(pending.kernelId, desc);
 
   // For profiling
@@ -5102,8 +5168,10 @@ extern "C" void __fnacc_commit_launch_v2() {
     }
   }
   FNACCHiddenTritonArgs hidden;
-  arguments.push_back(&hidden.hidden0);
-  arguments.push_back(&hidden.hidden1);
+  if (desc->tritonHiddenPtrArgs == 2) {
+    arguments.push_back(&hidden.hidden0);
+    arguments.push_back(&hidden.hidden1);
+  }
 
   unsigned gridX =
       fnaccCdiv(pending.extent[0], pending.block[0], "v2 grid dimension X");
@@ -6587,7 +6655,8 @@ static bool fnaccEnqueueReductionOnDevice(const FNACCKernelDesc *primaryDesc,
   unsigned stageCudaBlockX = fnaccCudaThreadsPerCTA(stageKernelId);
 
   fnaccValidateSupportedHiddenPtrArgCount(stageKernelId);
-  fnaccValidateCudaBlockSize(stageFn, stageKernelId, stageCudaBlockX);
+  if (stageDesc->backend != "cuda-tile")
+    fnaccValidateCudaBlockSize(stageFn, stageKernelId, stageCudaBlockX);
 
   CUdeviceptr current = dPartials;
   CUdeviceptr next = 0;
@@ -6620,13 +6689,15 @@ static bool fnaccEnqueueReductionOnDevice(const FNACCKernelDesc *primaryDesc,
     unsigned outputCount = fnaccCdiv(stageExtent, stageBlock, "output Count");
     FNACCHiddenTritonArgs hidden;
 
-    void *args[] = {
+    void *tritonArgs[] = {
         &current,
         &next,
         &stageExtent,
         &hidden.hidden0,
         &hidden.hidden1,
     };
+    void *tileArgs[] = {&current, &next, &stageExtent};
+    void **args = stageDesc->tritonHiddenPtrArgs == 0 ? tileArgs : tritonArgs;
 
     if (fnaccDebugEnabled()) {
       std::fprintf(stderr,

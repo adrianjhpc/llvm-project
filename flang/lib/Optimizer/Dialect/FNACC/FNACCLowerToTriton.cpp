@@ -18,9 +18,12 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cmath>
 #include <cstdint>
 #include <functional>
+#include <iomanip>
 #include <limits>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -2805,8 +2808,7 @@ static void emitJsonDescriptor(const fir::fnacc::FNACCKernelPlan &plan,
   os << "      \"image_file\": \"" << plan.name
      << deviceImageExtension(backend.getRuntimeImageKind()) << "\",\n";
   // Legacy aliases consumed by existing CUDA wrappers and runtimes.
-  if (backend.getRuntimeImageKind() !=
-      fir::fnacc::FNACCDeviceImageKind::HSACO) {
+  if (backend.getRuntimeImageKind() == fir::fnacc::FNACCDeviceImageKind::PTX) {
     os << "      \"ptx_index\": " << ptxIndex << ",\n";
     os << "      \"ptx_file\": \"" << plan.name << ".ptx\",\n";
   }
@@ -2830,10 +2832,16 @@ static void emitJsonDescriptor(const fir::fnacc::FNACCKernelPlan &plan,
   os << "      \"num_ctas\": 1,\n";
   os << "      \"num_stages\": " << schedule.pipelineStages << ",\n";
   os << "      \"threads_per_cta\": "
-     << schedule.parallelSubgroups * schedule.subgroupWidth << ",\n";
+     << (backend.getName() == "cuda-tile"
+             ? 1
+             : schedule.parallelSubgroups * schedule.subgroupWidth)
+     << ",\n";
   if (backend.getAcceleratorTarget() == "cuda")
     os << "      \"cuda_threads_per_cta\": "
-       << schedule.parallelSubgroups * schedule.subgroupWidth << ",\n";
+       << (backend.getName() == "cuda-tile"
+               ? 1
+               : schedule.parallelSubgroups * schedule.subgroupWidth)
+       << ",\n";
   os << "      \"private_pointer_args\": "
      << backend.getPrivatePointerArgumentCount(plan) << ",\n";
   os << "      \"triton_hidden_ptr_args\": "
@@ -2901,8 +2909,7 @@ emitJsonReductionStageDescriptor(const fir::fnacc::FNACCKernelPlan &plan,
   os << "      \"image_file\": \"" << stage.name
      << deviceImageExtension(backend.getRuntimeImageKind()) << "\",\n";
   // Legacy aliases consumed by existing CUDA wrappers and runtimes.
-  if (backend.getRuntimeImageKind() !=
-      fir::fnacc::FNACCDeviceImageKind::HSACO) {
+  if (backend.getRuntimeImageKind() == fir::fnacc::FNACCDeviceImageKind::PTX) {
     os << "      \"ptx_index\": " << ptxIndex << ",\n";
     os << "      \"ptx_file\": \"" << stage.name << ".ptx\",\n";
   }
@@ -2916,10 +2923,15 @@ emitJsonReductionStageDescriptor(const fir::fnacc::FNACCKernelPlan &plan,
   os << "      \"num_ctas\": 1,\n";
   os << "      \"num_stages\": " << plan.schedule.pipelineStages << ",\n";
   os << "      \"threads_per_cta\": "
-     << plan.schedule.parallelSubgroups * plan.schedule.subgroupWidth << ",\n";
+     << (backend.getName() == "cuda-tile"
+             ? 1
+             : plan.schedule.parallelSubgroups * plan.schedule.subgroupWidth)
+     << ",\n";
   if (backend.getAcceleratorTarget() == "cuda")
     os << "      \"cuda_threads_per_cta\": "
-       << plan.schedule.parallelSubgroups * plan.schedule.subgroupWidth
+       << (backend.getName() == "cuda-tile"
+               ? 1
+               : plan.schedule.parallelSubgroups * plan.schedule.subgroupWidth)
        << ",\n";
   os << "      \"private_pointer_args\": "
      << backend.getPrivatePointerArgumentCount(plan) << ",\n";
@@ -2929,6 +2941,8 @@ emitJsonReductionStageDescriptor(const fir::fnacc::FNACCKernelPlan &plan,
   emitJsonABI(stage.abi, os);
   os << "    }";
 }
+
+#include "FNACCCudaTileEmitter.inc"
 
 class TritonBackend final : public fir::fnacc::FNACCCodegenBackend {
 public:
@@ -3167,8 +3181,9 @@ struct FNACCLowerToTritonPass
     }
 
     TritonBackend tritonBackend(isHIP);
+    CudaTileBackend cudaTileBackend(isHIP);
     llvm::SmallVector<const fir::fnacc::FNACCCodegenBackend *> backends{
-        &tritonBackend};
+        &tritonBackend, &cudaTileBackend};
     std::vector<fir::fnacc::FNACCKernelPlan> plans;
     std::vector<const fir::fnacc::FNACCCodegenBackend *> selectedBackends;
     bool usedBackendFallback = false;
@@ -3287,6 +3302,21 @@ struct FNACCLowerToTritonPass
     const fir::fnacc::FNACCCodegenBackend *moduleBackend =
         selectedBackends.empty() ? &tritonBackend : selectedBackends.front();
 
+    bool mixedBackends = llvm::any_of(
+        selectedBackends, [&](const auto *b) { return b != moduleBackend; });
+    bool hasTile = llvm::is_contained(selectedBackends, &cudaTileBackend);
+    std::unique_ptr<llvm::raw_fd_ostream> tileOs;
+    if (hasTile) {
+      std::error_code ec;
+      tileOs =
+          std::make_unique<llvm::raw_fd_ostream>(ttirPath + ".cuda-tile", ec);
+      if (ec) {
+        module.emitError("cannot open CUDA Tile output: ") << ec.message();
+        signalPassFailure();
+        return;
+      }
+      cudaTileBackend.beginModule(planOptions, *tileOs);
+    }
     jsonOs << "{\n";
     jsonOs << "  \"fnacc_schema_version\": 1,\n";
     jsonOs << "  \"backend_contract_version\": 1,\n";
@@ -3301,7 +3331,8 @@ struct FNACCLowerToTritonPass
            << ",\n";
     jsonOs << "  \"used_backend_fallback\": "
            << (usedBackendFallback ? "true" : "false") << ",\n";
-    jsonOs << "  \"selected_backend\": \"" << moduleBackend->getName()
+    jsonOs << "  \"selected_backend\": \""
+           << (mixedBackends ? StringRef("mixed") : moduleBackend->getName())
            << "\",\n";
     jsonOs << "  \"device_ir_kind\": \""
            << fir::fnacc::fnaccDeviceIRKindName(
@@ -3313,7 +3344,7 @@ struct FNACCLowerToTritonPass
            << "\",\n";
     jsonOs << "  \"kernels\": [\n";
 
-    moduleBackend->beginModule(planOptions, ttirOs);
+    tritonBackend.beginModule(planOptions, ttirOs);
 
     bool firstKernel = true;
     bool emissionFailed = false;
@@ -3328,14 +3359,8 @@ struct FNACCLowerToTritonPass
       if (emissionFailed)
         break;
 
-      if (backend != moduleBackend) {
-        plan.launchOp.emitError(
-            "FNACC mixed-backend module emission is not available yet");
-        emissionFailed = true;
-        break;
-      }
-
-      if (mlir::failed(backend->emitKernel(plan, ttirOs))) {
+      if (mlir::failed(backend->emitKernel(
+              plan, backend == &cudaTileBackend ? *tileOs : ttirOs))) {
         plan.launchOp.emitError("FNACC backend '")
             << backend->getName() << "' failed while emitting kernel '"
             << plan.name << "'";
@@ -3353,7 +3378,9 @@ struct FNACCLowerToTritonPass
       }
     }
 
-    moduleBackend->endModule(ttirOs);
+    tritonBackend.endModule(ttirOs);
+    if (tileOs)
+      cudaTileBackend.endModule(*tileOs);
 
     jsonOs << "\n";
     jsonOs << "  ]\n";

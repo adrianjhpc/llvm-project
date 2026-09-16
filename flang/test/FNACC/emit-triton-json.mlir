@@ -7,7 +7,7 @@
 // RUN: python3 -m json.tool %t.json > /dev/null
 // RUN: fir-opt \
 // RUN:   --fnacc-assign-kernel-ids \
-// RUN:   --fnacc-lower-to-triton="ttir-output=%t.fallback.ttir json-output=%t.fallback.json backend=cuda-tile fallback-backend=triton allow-backend-fallback=true" \
+// RUN:   --fnacc-lower-to-triton="ttir-output=%t.fallback.ttir json-output=%t.fallback.json backend=unregistered-test fallback-backend=triton allow-backend-fallback=true" \
 // RUN:   %s -o /dev/null 2>&1 | FileCheck %s --check-prefix=FALLBACK
 // RUN: FileCheck %s --check-prefix=FALLBACK-JSON --input-file=%t.fallback.json
 // RUN: fir-opt \
@@ -18,7 +18,7 @@
 // RUN: python3 -m json.tool %t.hip.json > /dev/null
 // RUN: not fir-opt \
 // RUN:   --fnacc-assign-kernel-ids \
-// RUN:   --fnacc-lower-to-triton="ttir-output=%t.no-fallback.ttir json-output=%t.no-fallback.json backend=cuda-tile allow-backend-fallback=false" \
+// RUN:   --fnacc-lower-to-triton="ttir-output=%t.no-fallback.ttir json-output=%t.no-fallback.json backend=unregistered-test allow-backend-fallback=false" \
 // RUN:   %s -o /dev/null 2>&1 | FileCheck %s --check-prefix=NO-FALLBACK
 
 module {
@@ -149,8 +149,8 @@ module {
 // JSON: "copy_back_writes": true
 // JSON: "grid": ["cdiv(extent_x, tile_x)", "cdiv(extent_y, tile_y)", "1"]
 
-// FALLBACK: warning: requested backend 'cuda-tile' is not registered; falling back to 'triton'
-// FALLBACK-JSON: "requested_backend": "cuda-tile"
+// FALLBACK: warning: requested backend 'unregistered-test' is not registered; falling back to 'triton'
+// FALLBACK-JSON: "requested_backend": "unregistered-test"
 // FALLBACK-JSON: "used_backend_fallback": true
 // FALLBACK-JSON: "selected_backend": "triton"
 // HIP-JSON: "accelerator_target": "hip"
@@ -160,4 +160,4 @@ module {
 // HIP-JSON: "threads_per_warp": 64
 // HIP-JSON: "threads_per_cta": 64
 // HIP-JSON-NOT: "cuda_threads_per_cta"
-// NO-FALLBACK: error: FNACC backend selection failed: requested backend 'cuda-tile' is not registered
+// NO-FALLBACK: error: FNACC backend selection failed: requested backend 'unregistered-test' is not registered
