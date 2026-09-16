@@ -1,3 +1,4 @@
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 
@@ -6601,8 +6602,20 @@ static Real fnaccApplyReduction(
     }
     return lhs * rhs;
   case FNACCKernelDesc::ReductionOperator::Min:
+    if constexpr (std::is_floating_point_v<Real>) {
+      // Match arith.minimumf/maximumf and Tile minf/maxf propagate_nan.
+      if (std::isnan(lhs)) return lhs;
+      if (std::isnan(rhs)) return rhs;
+      if (lhs == Real(0) && rhs == Real(0)) return std::signbit(lhs) ? lhs : rhs;
+    }
     return rhs < lhs ? rhs : lhs;
   case FNACCKernelDesc::ReductionOperator::Max:
+    if constexpr (std::is_floating_point_v<Real>) {
+      // Match arith.minimumf/maximumf and Tile minf/maxf propagate_nan.
+      if (std::isnan(lhs)) return lhs;
+      if (std::isnan(rhs)) return rhs;
+      if (lhs == Real(0) && rhs == Real(0)) return std::signbit(lhs) ? rhs : lhs;
+    }
     return rhs > lhs ? rhs : lhs;
   }
   std::abort();

@@ -15,10 +15,10 @@ end subroutine
 subroutine total(n,a,s)
 integer :: n,i
 real :: a(n),s
-s=huge(s)
-!$fnacc parallel tile(16) reduction(min:s)
+s=1
+!$fnacc parallel tile(16) reduction(*:s)
 do i=1,n
- s=min(s,a(i))
+ s=s*a(i)
 enddo
 end subroutine
 ! FALLBACK: falling back to 'triton'

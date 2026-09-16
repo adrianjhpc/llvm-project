@@ -18,9 +18,11 @@ class CudaTileBackend final : public fir::fnacc::FNACCCodegenBackend {
   using ET = fir::fnacc::ElementType;
   bool isHIP;
 
-  static bool isSumReduction(const Plan &p) {
+  static bool isSupportedReductionKind(const Plan &p) {
     return p.kernel.kind == Kind::ReductionSum1D ||
-           p.kernel.kind == Kind::ReductionDot1D;
+           p.kernel.kind == Kind::ReductionDot1D ||
+           p.kernel.kind == Kind::ReductionMin1D ||
+           p.kernel.kind == Kind::ReductionMax1D;
   }
 
   // One partial per tile. The same body, with a contiguous input, implements
@@ -29,6 +31,16 @@ class CudaTileBackend final : public fir::fnacc::FNACCCodegenBackend {
     const auto &k = p.kernel;
     const auto &abi = stage ? p.reductionStage->abi : p.abi;
     std::string et = ttElementType(k.elementType).str();
+    using RO = fir::fnacc::ReductionOperator;
+    const bool minimum = k.reductionOperator == RO::Min;
+    const bool maximum = k.reductionOperator == RO::Max;
+    // Infinity is required: HUGE would corrupt all-infinite input tiles.
+    const char *identity = minimum
+        ? (k.elementType == ET::F32 ? "0x7F800000" : "0x7FF0000000000000")
+        : maximum
+        ? (k.elementType == ET::F32 ? "0xFF800000" : "0xFFF0000000000000")
+        : "0.0";
+    const char *operation = minimum ? "minf" : maximum ? "maxf" : "addf";
     std::string shape = std::to_string(p.schedule.tile.x);
     auto ty = [&](const std::string &t) {
       return "tile<" + shape + "x" + t + ">";
@@ -63,7 +75,7 @@ class CudaTileBackend final : public fir::fnacc::FNACCCodegenBackend {
     os << "    %offs = addi %base_s, %range : " << ty("i32") << "\n"
        << "    %mask = cmpi less_than %offs, %extent_s, signed : " << ty("i32")
        << " -> " << ty("i1") << "\n"
-       << "    %zero = constant <" << et << ": 0.0> : " << ty(et) << "\n"
+       << "    %identity = constant <" << et << ": " << identity << "> : " << ty(et) << "\n"
        << "    %start = make_token : token\n";
     std::string token = "%start";
     unsigned reads = stage ? 1 : k.readArrays.size();
@@ -91,7 +103,7 @@ class CudaTileBackend final : public fir::fnacc::FNACCCodegenBackend {
          << ty("ptr<" + et + ">") << "\n"
          << "    %" << stem << "_value, %" << stem
          << "_token = load_ptr_tko weak %" << stem
-         << "_addr, %mask, %zero token=" << token << " : "
+         << "_addr, %mask, %identity token=" << token << " : "
          << ty("ptr<" + et + ">") << ", " << ty("i1") << ", " << ty(et)
          << " -> " << ty(et) << ", token\n";
       token = "%" + stem + "_token";
@@ -101,10 +113,11 @@ class CudaTileBackend final : public fir::fnacc::FNACCCodegenBackend {
       os << "    %product = mulf %r0_value, %r1_value : " << ty(et) << "\n";
       value = "%product";
     }
-    os << "    %sum = reduce " << value << " dim=0 identities=[0.0 : " << et
+    os << "    %sum = reduce " << value << " dim=0 identities=[" << identity << " : " << et
        << "] : " << ty(et) << " -> tile<" << et << ">\n"
        << "      (%lhs: tile<" << et << ">, %rhs: tile<" << et << ">) {\n"
-       << "        %combined = addf %lhs, %rhs : tile<" << et << ">\n"
+       << "        %combined = " << operation << " %lhs, %rhs"
+       << ((minimum || maximum) ? " propagate_nan" : "") << " : tile<" << et << ">\n"
        << "        yield %combined : tile<" << et << ">\n"
        << "      }\n"
        << "    %out = offset " << (stage ? "%output" : "%partials")
@@ -159,25 +172,28 @@ public:
     const auto &k = p.kernel;
     if (isHIP)
       return Support::failure("CUDA Tile requires a CUDA target");
-    if (isSumReduction(p)) {
+    if (isSupportedReductionKind(p)) {
+      using RO = fir::fnacc::ReductionOperator;
+      const auto expected = k.kind == Kind::ReductionMin1D ? RO::Min
+          : k.kind == Kind::ReductionMax1D ? RO::Max : RO::Add;
       if ((k.elementType != ET::F32 && k.elementType != ET::F64) ||
           k.rank != 1 || k.loopStepX != 1 || !k.indexRefs.empty() ||
           !k.scalarRefs.empty() || !k.outputs.empty() ||
           !k.reductionOutputs.empty() ||
-          k.reductionOperator != fir::fnacc::ReductionOperator::Add ||
+          k.reductionOperator != expected ||
           !p.reductionStage || p.schedule.tile.x < 2 ||
           p.schedule.tile.x > 1024 ||
           (p.schedule.tile.x & (p.schedule.tile.x - 1)) != 0 ||
           k.arrayArguments.size() != k.readArrays.size())
         return Support::failure(
-            "CUDA Tile sum/dot requires a rank-1 f32/f64 unit-step reduction "
+            "CUDA Tile sum/dot/min/max requires a rank-1 f32/f64 unit-step reduction "
             "and a power-of-two tile of 2..1024");
-      if (k.kind == Kind::ReductionSum1D &&
+      if (k.kind != Kind::ReductionDot1D &&
           (k.readArrays.size() != 1 ||
            (k.expression && (k.expression->kind != EK::ArrayLoad ||
                              k.expression->source != k.readArrays[0]))))
         return Support::failure(
-            "CUDA Tile sum currently requires a plain array value");
+            "CUDA Tile single-input reduction currently requires a plain array value");
       if (k.kind == Kind::ReductionDot1D && k.readArrays.size() != 2)
         return Support::failure("CUDA Tile dot requires two input arrays");
       return Support::success();
@@ -186,7 +202,7 @@ public:
         k.kind != Kind::Expr1D && k.kind != Kind::Expr2D)
       return Support::failure(
           "CUDA Tile currently supports simple pointwise arrays and rank-1 "
-          "sum/dot; this kernel needs Triton");
+          "sum/dot/min/max; this kernel needs Triton");
     if ((k.elementType != ET::F32 && k.elementType != ET::F64) || k.rank < 1 ||
         k.rank > 2 || !k.outputs.empty() || !k.indexRefs.empty() ||
         k.loopStepX != 1 || k.loopStepY != 1)
@@ -216,7 +232,7 @@ public:
 
   LogicalResult emitKernel(const Plan &p,
                            llvm::raw_ostream &os) const override {
-    if (isSumReduction(p)) {
+    if (isSupportedReductionKind(p)) {
       emitReduction(p, false, os);
       emitReduction(p, true, os);
       return success();
