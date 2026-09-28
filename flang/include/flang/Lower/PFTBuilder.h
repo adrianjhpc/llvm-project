@@ -142,7 +142,7 @@ using Directives =
                parser::OpenACCRoutineConstruct,
                parser::OpenACCDeclarativeConstruct, parser::OpenMPConstruct,
                parser::OpenMPDeclarativeConstruct, parser::CUFKernelDoConstruct,
-               parser::FnACCConstruct, parser::FnACCStandaloneConstruct>;
+               parser::TileOffloadConstruct, parser::TileOffloadStandaloneConstruct>;
 
 using DeclConstructs = std::tuple<parser::OpenMPDeclarativeConstruct,
                                   parser::OpenACCDeclarativeConstruct>;
@@ -183,7 +183,7 @@ template <typename A>
 static constexpr bool isExecutableDirective{common::HasMember<
     A, std::tuple<parser::CompilerDirective, parser::OpenACCConstruct,
                   parser::OpenMPConstruct, parser::CUFKernelDoConstruct,
-                  parser::FnACCStandaloneConstruct>>};
+                  parser::TileOffloadStandaloneConstruct>>};
 
 template <typename A>
 static constexpr bool isOpenMPDirective{

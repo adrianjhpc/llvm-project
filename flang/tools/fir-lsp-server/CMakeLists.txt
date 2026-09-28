@@ -11,7 +11,7 @@ get_property(extension_libs GLOBAL PROPERTY MLIR_EXTENSION_LIBS)
 target_link_libraries(fir-lsp-server PRIVATE
   CUFDialect
   FIRDialect
-  FIRFNACCDialect
+  FIRTileOffloadDialect
   FIROpenACCSupport
   FIROpenMPSupport
   HLFIRDialect

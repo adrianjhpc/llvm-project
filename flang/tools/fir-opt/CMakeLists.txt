@@ -19,7 +19,7 @@ target_link_libraries(fir-opt PRIVATE
   FIRSupport
   FIRTransforms
   FIRCodeGen
-  FIRFNACCDialect
+  FIRTileOffloadDialect
   FIRCodeGenDialect
   HLFIRDialect
   HLFIRTransforms

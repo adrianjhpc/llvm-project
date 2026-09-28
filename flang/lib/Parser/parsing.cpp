@@ -101,8 +101,8 @@ const SourceFile *Parsing::Prescan(const std::string &path, Options options) {
     prescanner.AddCompilerDirectiveSentinel("$cuf");
     prescanner.AddCompilerDirectiveSentinel("@cuf");
   }
-  prescanner.AddCompilerDirectiveSentinel("$fnacc");
-  prescanner.AddCompilerDirectiveSentinel("@fnacc");
+  prescanner.AddCompilerDirectiveSentinel("$tileoff");
+  prescanner.AddCompilerDirectiveSentinel("@tileoff");
   for (const auto &sentinel : options.compilerDirectiveSentinels) {
     prescanner.AddCompilerDirectiveSentinel(sentinel);
   }

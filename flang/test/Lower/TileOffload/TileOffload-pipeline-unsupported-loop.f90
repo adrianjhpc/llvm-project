@@ -1,0 +1,29 @@
+! RUN: %flang_fc1 -emit-fir %s -o %t.fir
+! RUN: not fir-opt --TileOffload-pipeline="ttir-output=%t.ttir json-output=%t.json" %t.fir -o /dev/null 2>&1 | FileCheck %s
+
+subroutine bad_lower_bound(n, a, b, c)
+  integer :: n
+  real :: a(0:n), b(0:n), c(0:n)
+  integer :: i
+
+  !$tileoff parallel tile(128)
+  do i = 0, n
+    c(i) = a(i) + b(i)
+  end do
+end subroutine
+
+subroutine bad_step(n, a, b, c, step)
+  integer :: n
+  integer(8) :: step
+  real :: a(n), b(n), c(n)
+  integer :: i
+
+  !$tileoff parallel tile(128)
+  do i = 1, n, step
+    c(i) = a(i) + b(i)
+  end do
+end subroutine
+
+! CHECK: error: TileOffload cannot plan launch:
+! CHECK-SAME: 1-D runtime loop step must have signed 32-bit integer type
+

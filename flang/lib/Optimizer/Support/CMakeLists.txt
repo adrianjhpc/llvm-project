@@ -9,7 +9,7 @@ add_flang_library(FIRSupport
   FIROpsIncGen
   HLFIROpsIncGen
   MIFOpsIncGen
-  FnACCDialectIncGen
+  TileOffloadDialectIncGen
 
   LINK_LIBS
   FIRDialect

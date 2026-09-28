@@ -13,7 +13,7 @@
 
 #include "mlir/Tools/mlir-opt/MlirOptMain.h"
 #include "flang/Optimizer/CodeGen/CodeGen.h"
-#include "flang/Optimizer/Dialect/FNACC/FNACCPasses.h"
+#include "flang/Optimizer/Dialect/TileOffload/TileOffloadPasses.h"
 #include "flang/Optimizer/HLFIR/Passes.h"
 #include "flang/Optimizer/OpenACC/Passes.h"
 #include "flang/Optimizer/OpenMP/Passes.h"
@@ -41,12 +41,12 @@ void registerTestOpenACC();
 int main(int argc, char **argv) {
   fir::support::registerMLIRPassesForFortranTools();
   fir::registerFlangPipelinePasses();
-  fir::fnacc::registerFNACCOutlineKernelsPass();
-  fir::fnacc::registerFNACCEmitFortranAliasesPass();
-  fir::fnacc::registerFNACCLowerToTritonPass();
-  fir::fnacc::registerFNACCLowerToRuntimePass();
-  fir::fnacc::registerFNACCAssignKernelIdsPass();
-  fir::fnacc::registerFNACCPipelines();
+  fir::TileOffload::registerTileOffloadOutlineKernelsPass();
+  fir::TileOffload::registerTileOffloadEmitFortranAliasesPass();
+  fir::TileOffload::registerTileOffloadLowerToTritonPass();
+  fir::TileOffload::registerTileOffloadLowerToRuntimePass();
+  fir::TileOffload::registerTileOffloadAssignKernelIdsPass();
+  fir::TileOffload::registerTileOffloadPipelines();
 #ifdef FLANG_INCLUDE_TESTS
   fir::test::registerTestFIRAliasAnalysisPass();
   fir::test::registerTestFIROpenACCInterfacesPass();

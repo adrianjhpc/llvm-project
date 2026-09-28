@@ -2143,8 +2143,8 @@ void OmpVisitor::ProcessMapperSpecifier(const parser::OmpMapperSpecifier &spec,
   PopScope();
 }
 
-// Resolve names in FNACC constructs.
-class FnACCVisitor : public virtual DeclarationVisitor {
+// Resolve names in TileOffload constructs.
+class TileOffloadVisitor : public virtual DeclarationVisitor {
 public:
   bool CheckUniqueObjects(
       const std::list<parser::Name> &names, const char *clauseName) {
@@ -2157,7 +2157,7 @@ public:
 
       const Symbol *symbol = &name.symbol->GetUltimate();
       if (!seen.insert(symbol).second) {
-        Say(name.source, "'%s' appears more than once in FNACC %s"_err_en_US,
+        Say(name.source, "'%s' appears more than once in TileOffload %s"_err_en_US,
             name.source, clauseName);
         valid = false;
       }
@@ -2166,68 +2166,68 @@ public:
     return valid;
   }
 
-  bool Pre(const parser::FnACCConstruct &x) {
+  bool Pre(const parser::TileOffloadConstruct &x) {
     // Track source for diagnostics; descend into the construct.
-    const auto &dir{std::get<parser::FnACCParallelDirective>(x.t)};
+    const auto &dir{std::get<parser::TileOffloadParallelDirective>(x.t)};
     messageHandler().set_currStmtSource(dir.source);
     currScope().AddSourceRange(dir.source);
     return true;
   }
 
-  void Post(const parser::FnACCConstruct &) {
+  void Post(const parser::TileOffloadConstruct &) {
     messageHandler().set_currStmtSource(std::nullopt);
   }
 
-  void Post(const parser::FnACCParallelDirective &dir) {
+  void Post(const parser::TileOffloadParallelDirective &dir) {
     unsigned tileClauses = 0;
     unsigned packClauses = 0;
     unsigned reductionClauses = 0;
     unsigned noCopybackClauses = 0;
     unsigned matmulPrecisionClauses = 0;
-    for (const parser::FnACCClause &clause : std::get<0>(dir.t)) {
+    for (const parser::TileOffloadClause &clause : std::get<0>(dir.t)) {
       tileClauses +=
-          std::holds_alternative<parser::FnACCTileClause>(clause.u) ? 1 : 0;
+          std::holds_alternative<parser::TileOffloadTileClause>(clause.u) ? 1 : 0;
       packClauses +=
-          std::holds_alternative<parser::FnACCPackClause>(clause.u) ? 1 : 0;
+          std::holds_alternative<parser::TileOffloadPackClause>(clause.u) ? 1 : 0;
       reductionClauses +=
-          std::holds_alternative<parser::FnACCReductionClause>(clause.u) ? 1
+          std::holds_alternative<parser::TileOffloadReductionClause>(clause.u) ? 1
                                                                          : 0;
       noCopybackClauses +=
-          std::holds_alternative<parser::FnACCNoCopybackClause>(clause.u) ? 1
+          std::holds_alternative<parser::TileOffloadNoCopybackClause>(clause.u) ? 1
                                                                           : 0;
       matmulPrecisionClauses +=
-          std::holds_alternative<parser::FnACCMatmulPrecisionClause>(clause.u)
+          std::holds_alternative<parser::TileOffloadMatmulPrecisionClause>(clause.u)
           ? 1
           : 0;
     }
     if (tileClauses > 1)
-      Say(dir.source, "FNACC TILE clause may appear at most once"_err_en_US);
+      Say(dir.source, "TileOffload TILE clause may appear at most once"_err_en_US);
     if (packClauses > 1)
-      Say(dir.source, "FNACC PACK clause may appear at most once"_err_en_US);
+      Say(dir.source, "TileOffload PACK clause may appear at most once"_err_en_US);
     if (reductionClauses > 1)
       Say(dir.source,
-          "FNACC REDUCTION clause may appear at most once"_err_en_US);
+          "TileOffload REDUCTION clause may appear at most once"_err_en_US);
     if (noCopybackClauses > 1)
       Say(dir.source,
-          "FNACC NO_COPYBACK clause may appear at most once"_err_en_US);
+          "TileOffload NO_COPYBACK clause may appear at most once"_err_en_US);
     if (matmulPrecisionClauses > 1)
       Say(dir.source,
-          "FNACC MATMUL_PRECISION clause may appear at most once"_err_en_US);
+          "TileOffload MATMUL_PRECISION clause may appear at most once"_err_en_US);
   }
 
-  bool Pre(const parser::FnACCStandaloneConstruct &construct) {
+  bool Pre(const parser::TileOffloadStandaloneConstruct &construct) {
     messageHandler().set_currStmtSource(construct.source);
     currScope().AddSourceRange(construct.source);
     return true;
   }
 
-  void Post(const parser::FnACCStandaloneConstruct &) {
+  void Post(const parser::TileOffloadStandaloneConstruct &) {
     messageHandler().set_currStmtSource(std::nullopt);
   }
 
-  void Post(const parser::FnACCReductionClause::Item &item) {
+  void Post(const parser::TileOffloadReductionClause::Item &item) {
     auto &name{const_cast<parser::Name &>(std::get<parser::Name>(item.t))};
-    ResolveFNACCName(name, "REDUCTION clause");
+    ResolveTileOffloadName(name, "REDUCTION clause");
   }
 
   // The PACK clause holds bare parser::Name nodes. ResolveNamesVisitor does
@@ -2236,46 +2236,46 @@ public:
   // This handler is const because the parse-tree walker invokes Post(const T &)
   // in this part of the semantic walk. We const_cast the contained Name because
   // Resolve() must set name.symbol.
-  void Post(const parser::FnACCPackClause::Item &item) {
+  void Post(const parser::TileOffloadPackClause::Item &item) {
     auto &name{const_cast<parser::Name &>(std::get<parser::Name>(item.t))};
-    ResolveFNACCName(name, "PACK clause");
+    ResolveTileOffloadName(name, "PACK clause");
   }
 
-  // !$fnacc release all
-  void Post(const parser::FnACCReleaseAllDirective &) {}
+  // !$tileoff release all
+  void Post(const parser::TileOffloadReleaseAllDirective &) {}
 
-  // !$fnacc wait
-  void Post(const parser::FnACCWaitDirective &) {}
+  // !$tileoff wait
+  void Post(const parser::TileOffloadWaitDirective &) {}
 
-  void Post(const parser::FnACCTileClause &clause) {
+  void Post(const parser::TileOffloadTileClause &clause) {
     if (clause.v.empty() || clause.v.size() > 3) {
-      Say("FNACC TILE requires between one and three sizes"_err_en_US);
+      Say("TileOffload TILE requires between one and three sizes"_err_en_US);
       return;
     }
   }
 
-  void Post(const parser::FnACCEnterDataDirective &directive) {
+  void Post(const parser::TileOffloadEnterDataDirective &directive) {
     const auto &clauses{std::get<0>(directive.t)};
 
     if (clauses.empty()) {
       Say(directive.source,
-          "FNACC ENTER DATA requires at least one COPYIN or CREATE "
+          "TileOffload ENTER DATA requires at least one COPYIN or CREATE "
           "clause"_err_en_US);
     }
   }
 
-  void Post(const parser::FnACCExitDataDirective &directive) {
+  void Post(const parser::TileOffloadExitDataDirective &directive) {
     const auto &clauses{std::get<0>(directive.t)};
 
     if (clauses.empty()) {
       Say(directive.source,
-          "FNACC EXIT DATA requires at least one COPYOUT or DELETE "
+          "TileOffload EXIT DATA requires at least one COPYOUT or DELETE "
           "clause"_err_en_US);
     }
   }
 
 private:
-  void ResolveFNACCName(parser::Name &name, const char *context) {
+  void ResolveTileOffloadName(parser::Name &name, const char *context) {
     if (name.symbol)
       return; // Already resolved.
 
@@ -2284,7 +2284,7 @@ private:
       return;
     }
 
-    Say(name.source, "'%s' in FNACC %s is not a declared variable"_err_en_US,
+    Say(name.source, "'%s' in TileOffload %s is not a declared variable"_err_en_US,
         name.source, context);
   }
 };
@@ -2496,7 +2496,7 @@ class ResolveNamesVisitor : public virtual ScopeHandler,
                             public ConstructVisitor,
                             public OmpVisitor,
                             public AccVisitor,
-                            public FnACCVisitor {
+                            public TileOffloadVisitor {
 public:
   using AccVisitor::Post;
   using AccVisitor::Pre;
@@ -2505,8 +2505,8 @@ public:
   using ConstructVisitor::Pre;
   using DeclarationVisitor::Post;
   using DeclarationVisitor::Pre;
-  using FnACCVisitor::Post;
-  using FnACCVisitor::Pre;
+  using TileOffloadVisitor::Post;
+  using TileOffloadVisitor::Pre;
   using ImplicitRulesVisitor::Post;
   using ImplicitRulesVisitor::Pre;
   using InterfaceVisitor::Post;

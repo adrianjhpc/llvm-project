@@ -1,0 +1,41 @@
+! RUN: %flang_fc1 -emit-fir %s -o %t.fir
+! RUN: fir-opt --TileOffload-pipeline="launch-abi=2 ttir-output=%t.ttir json-output=%t.json" %t.fir -o %t.host.fir
+! RUN: FileCheck %s --check-prefix=HOST --input-file=%t.host.fir
+! RUN: FileCheck %s --check-prefix=TTIR --input-file=%t.ttir
+! RUN: FileCheck %s --check-prefix=JSON --input-file=%t.json
+! RUN: python3 -m json.tool %t.json > /dev/null
+
+subroutine matrix_add_explicit_shape(n, m, a, b, c)
+  integer :: n, m
+  real :: a(n, m), b(n, m), c(n, m)
+  integer :: i, j
+
+  !$tileoff parallel tile(16, 16)
+  do j = 1, m
+    do i = 1, n
+      c(i, j) = a(i, j) + b(i, j)
+    end do
+  end do
+end subroutine
+
+! HOST-DAG: func.func private @__tileoff_begin_launch_v2
+
+! HOST-LABEL: func.func @_QPmatrix_add_explicit_shape
+! HOST: call @__tileoff_begin_launch_v2
+! HOST-NOT: TileOffload.launch
+
+! TTIR: tt.func @tileoff_kernel_0
+! TTIR-SAME: %a: !tt.ptr<f32>
+! TTIR-SAME: %b: !tt.ptr<f32>
+! TTIR-SAME: %c: !tt.ptr<f32>
+! TTIR-SAME: %n: i32
+! TTIR-SAME: %m: i32
+! TTIR: tt.get_program_id y
+! TTIR: arith.addf
+! TTIR: tt.store
+
+! JSON: "id": 0
+! JSON: "name": "tileoff_kernel_0"
+! JSON: "kind": "binary"
+! JSON: "rank": 2
+! JSON: "tile": [16, 16, 1]

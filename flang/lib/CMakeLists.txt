@@ -14,6 +14,6 @@ if (FLANG_INCLUDE_TESTS)
   add_subdirectory(Testing)
 endif ()
 
-if (FLANG_FNACC_RUNTIME)
+if (FLANG_TILEOFFLOAD_RUNTIME)
   add_subdirectory(Runtime)
 endif()

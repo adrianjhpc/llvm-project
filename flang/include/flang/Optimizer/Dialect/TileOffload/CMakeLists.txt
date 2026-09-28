@@ -1,0 +1,6 @@
+set(LLVM_TARGET_DEFINITIONS TileOffloadOps.td)
+mlir_tablegen(TileOffloadOps.h.inc -gen-op-decls)
+mlir_tablegen(TileOffloadOps.cpp.inc -gen-op-defs)
+mlir_tablegen(TileOffloadDialect.h.inc -gen-dialect-decls)
+mlir_tablegen(TileOffloadDialect.cpp.inc -gen-dialect-defs)
+add_public_tablegen_target(TileOffloadDialectIncGen)

@@ -1,6 +1,0 @@
-set(LLVM_TARGET_DEFINITIONS FNACCOps.td)
-mlir_tablegen(FNACCOps.h.inc -gen-op-decls)
-mlir_tablegen(FNACCOps.cpp.inc -gen-op-defs)
-mlir_tablegen(FNACCDialect.h.inc -gen-dialect-decls)
-mlir_tablegen(FNACCDialect.cpp.inc -gen-dialect-defs)
-add_public_tablegen_target(FnACCDialectIncGen)

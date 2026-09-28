@@ -1,0 +1,19 @@
+! RUN: %flang_fc1 -emit-fir %s -o %t.fir
+! RUN: fir-opt --TileOffload-assign-kernel-ids \
+! RUN:   --TileOffload-lower-to-runtime %t.fir | FileCheck %s
+
+subroutine reduce_with_initial(n, a, total)
+  integer :: n, i
+  real :: a(n), total
+
+  total = 5.0
+
+  !$tileoff parallel tile(256) reduction(+:total)
+  do i = 1, n
+    total = total + a(i)
+  end do
+end subroutine
+
+! CHECK: %[[INITIAL:[0-9]+]] = fir.load %[[RESULT:[0-9]+]] : !fir.ref<f32>
+! CHECK: call @__tileoff_bind_reduction_result_f32_v2(%[[RESULT]], %[[INITIAL]])
+! CHECK: call @__tileoff_commit_launch_v2

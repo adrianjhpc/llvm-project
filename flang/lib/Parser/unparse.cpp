@@ -2853,9 +2853,9 @@ public:
     EndOpenMP();
   }
 
-  void Unparse(const FnACCConstruct &x) { Walk(x.t); }
-  void Unparse(const FnACCParallelDirective &x) {
-    Word("!$FNACC PARALLEL");
+  void Unparse(const TileOffloadConstruct &x) { Walk(x.t); }
+  void Unparse(const TileOffloadParallelDirective &x) {
+    Word("!$tileoff PARALLEL");
 
     const auto &clauses{std::get<0>(x.t)};
     if (!clauses.empty()) {
@@ -2865,140 +2865,140 @@ public:
 
     Put("\n");
   }
-  void Unparse(const FnACCPackTarget &x) {
+  void Unparse(const TileOffloadPackTarget &x) {
     switch (x) {
-    case FnACCPackTarget::Host:
+    case TileOffloadPackTarget::Host:
       Word("HOST");
       break;
-    case FnACCPackTarget::Device:
+    case TileOffloadPackTarget::Device:
       Word("DEVICE");
       break;
     }
   }
-  void Unparse(const FnACCClause &x) { Walk(x.u); }
-  void Unparse(const FnACCTileClause &x) {
+  void Unparse(const TileOffloadClause &x) { Walk(x.u); }
+  void Unparse(const TileOffloadTileClause &x) {
     Word("TILE");
     Put("(");
     Walk(x.v, ", ");
     Put(")");
   }
-  void Unparse(const FnACCNoCopybackClause &) { Word("NO_COPYBACK"); }
-  void Unparse(const FnACCMatmulPrecision &x) {
+  void Unparse(const TileOffloadNoCopybackClause &) { Word("NO_COPYBACK"); }
+  void Unparse(const TileOffloadMatmulPrecision &x) {
     switch (x) {
-    case FnACCMatmulPrecision::IEEE:
+    case TileOffloadMatmulPrecision::IEEE:
       Word("IEEE");
       break;
-    case FnACCMatmulPrecision::TF32:
+    case TileOffloadMatmulPrecision::TF32:
       Word("TF32");
       break;
-    case FnACCMatmulPrecision::TF32x3:
+    case TileOffloadMatmulPrecision::TF32x3:
       Word("TF32X3");
       break;
     }
   }
-  void Unparse(const FnACCMatmulPrecisionClause &x) {
+  void Unparse(const TileOffloadMatmulPrecisionClause &x) {
     Word("MATMUL_PRECISION");
     Put("(");
     Walk(x.v);
     Put(")");
   }
-  void Unparse(const FnACCPackClause &x) {
+  void Unparse(const TileOffloadPackClause &x) {
     Word("PACK");
     Put("(");
     Walk(x.v, ", ");
     Put(")");
   }
-  void Unparse(const FnACCPackClause::Item &x) {
+  void Unparse(const TileOffloadPackClause::Item &x) {
     Walk(std::get<0>(x.t));
     Put(":");
     Walk(std::get<1>(x.t));
   }
-  void Unparse(const FnACCReductionOperator &x) {
+  void Unparse(const TileOffloadReductionOperator &x) {
     switch (x) {
-    case FnACCReductionOperator::Add:
+    case TileOffloadReductionOperator::Add:
       Put("+");
       break;
-    case FnACCReductionOperator::Multiply:
+    case TileOffloadReductionOperator::Multiply:
       Put("*");
       break;
-    case FnACCReductionOperator::Min:
+    case TileOffloadReductionOperator::Min:
       Word("MIN");
       break;
-    case FnACCReductionOperator::Max:
+    case TileOffloadReductionOperator::Max:
       Word("MAX");
       break;
     }
   }
-  void Unparse(const FnACCReductionClause &x) {
+  void Unparse(const TileOffloadReductionClause &x) {
     Word("REDUCTION");
     Put("(");
     Walk(x.v, ", ");
     Put(")");
   }
-  void Unparse(const FnACCReductionClause::Item &x) {
+  void Unparse(const TileOffloadReductionClause::Item &x) {
     Walk(std::get<0>(x.t));
     Put(":");
     Walk(std::get<1>(x.t));
   }
-  void Unparse(const FnACCUpdateHostDirective &x) {
+  void Unparse(const TileOffloadUpdateHostDirective &x) {
     Word("UPDATE HOST");
     Put("(");
     Walk(std::get<0>(x.t), ", ");
     Put(")");
   }
-  void Unparse(const FnACCUpdateDeviceDirective &x) {
+  void Unparse(const TileOffloadUpdateDeviceDirective &x) {
     Word("UPDATE DEVICE");
     Put("(");
     Walk(std::get<0>(x.t), ", ");
     Put(")");
   }
-  void Unparse(const FnACCPresentDirective &x) {
+  void Unparse(const TileOffloadPresentDirective &x) {
     Word("PRESENT");
     Put("(");
     Walk(std::get<0>(x.t), ", ");
     Put(")");
   }
-  void Unparse(const FnACCReleaseDirective &x) {
+  void Unparse(const TileOffloadReleaseDirective &x) {
     Word("RELEASE");
     Put("(");
     Walk(std::get<0>(x.t), ", ");
     Put(")");
   }
-  void Unparse(const FnACCReleaseAllDirective &) { Word("RELEASE ALL"); }
-  void Unparse(const FnACCWaitDirective &) { Word("WAIT"); }
-  void Unparse(const FnACCStandaloneConstruct &x) {
-    Word("!$FNACC");
+  void Unparse(const TileOffloadReleaseAllDirective &) { Word("RELEASE ALL"); }
+  void Unparse(const TileOffloadWaitDirective &) { Word("WAIT"); }
+  void Unparse(const TileOffloadStandaloneConstruct &x) {
+    Word("!$tileoff");
     Put(" ");
     Walk(x.u);
     Put("\n");
   }
-  void Unparse(const FnACCCopyinClause &x) {
+  void Unparse(const TileOffloadCopyinClause &x) {
     Word("COPYIN");
     Put("(");
     Walk(x.v, ", ");
     Put(")");
   }
-  void Unparse(const FnACCCreateClause &x) {
+  void Unparse(const TileOffloadCreateClause &x) {
     Word("CREATE");
     Put("(");
     Walk(x.v, ", ");
     Put(")");
   }
-  void Unparse(const FnACCCopyoutClause &x) {
+  void Unparse(const TileOffloadCopyoutClause &x) {
     Word("COPYOUT");
     Put("(");
     Walk(x.v, ", ");
     Put(")");
   }
-  void Unparse(const FnACCDeleteClause &x) {
+  void Unparse(const TileOffloadDeleteClause &x) {
     Word("DELETE");
     Put("(");
     Walk(x.v, ", ");
     Put(")");
   }
-  void Unparse(const FnACCEnterDataClause &x) { Walk(x.u); }
-  void Unparse(const FnACCExitDataClause &x) { Walk(x.u); }
-  void Unparse(const FnACCEnterDataDirective &x) {
+  void Unparse(const TileOffloadEnterDataClause &x) { Walk(x.u); }
+  void Unparse(const TileOffloadExitDataClause &x) { Walk(x.u); }
+  void Unparse(const TileOffloadEnterDataDirective &x) {
     Word("ENTER DATA");
     const auto &clauses{std::get<0>(x.t)};
     if (!clauses.empty()) {
@@ -3007,7 +3007,7 @@ public:
     }
   }
 
-  void Unparse(const FnACCExitDataDirective &x) {
+  void Unparse(const TileOffloadExitDataDirective &x) {
     Word("EXIT DATA");
     const auto &clauses{std::get<0>(x.t)};
     if (!clauses.empty()) {

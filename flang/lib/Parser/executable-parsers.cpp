@@ -52,9 +52,9 @@ constexpr auto executableConstruct{first(
     construct<ExecutableConstruct>(indirect(openmpMisplacedEndDirective)),
     construct<ExecutableConstruct>(indirect(openmpInvalidDirective)),
     construct<ExecutableConstruct>(indirect(Parser<OpenACCConstruct>{})),
-    construct<ExecutableConstruct>(indirect(Parser<FnACCConstruct>{})),
+    construct<ExecutableConstruct>(indirect(Parser<TileOffloadConstruct>{})),
     construct<ExecutableConstruct>(
-        indirect(Parser<FnACCStandaloneConstruct>{})),
+        indirect(Parser<TileOffloadStandaloneConstruct>{})),
     construct<ExecutableConstruct>(indirect(compilerDirective)),
     construct<ExecutableConstruct>(indirect(Parser<CUFKernelDoConstruct>{})))};
 

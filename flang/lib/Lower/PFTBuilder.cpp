@@ -1238,7 +1238,7 @@ private:
             eval.isUnstructured = true;
           },
           [&](const parser::WhereConstruct &) { setConstructExit(eval); },
-          [&](const parser::FnACCConstruct &) {
+          [&](const parser::TileOffloadConstruct &) {
             eval.constructExit = &eval.evaluationList->back();
           },
           // Default - Common analysis for IO statements; otherwise nop.
@@ -1407,23 +1407,23 @@ public:
     return eval.visit([](const auto &parseTreeNode) -> llvm::StringRef {
       using NodeTy = std::decay_t<decltype(parseTreeNode)>;
 
-      if constexpr (std::is_same_v<NodeTy, Fortran::parser::FnACCConstruct>) {
-        return "FnACCConstruct";
+      if constexpr (std::is_same_v<NodeTy, Fortran::parser::TileOffloadConstruct>) {
+        return "TileOffloadConstruct";
       } else if constexpr (std::is_same_v<
                                NodeTy,
-                               Fortran::parser::FnACCStandaloneConstruct>) {
-        return "FnACCStandaloneConstruct";
-      } else if constexpr (std::is_same_v<
-                               NodeTy,
-                               Fortran::common::Indirection<
-                                   Fortran::parser::FnACCConstruct, false>>) {
-        return "FnACCConstruct";
+                               Fortran::parser::TileOffloadStandaloneConstruct>) {
+        return "TileOffloadStandaloneConstruct";
       } else if constexpr (std::is_same_v<
                                NodeTy,
                                Fortran::common::Indirection<
-                                   Fortran::parser::FnACCStandaloneConstruct,
+                                   Fortran::parser::TileOffloadConstruct, false>>) {
+        return "TileOffloadConstruct";
+      } else if constexpr (std::is_same_v<
+                               NodeTy,
+                               Fortran::common::Indirection<
+                                   Fortran::parser::TileOffloadStandaloneConstruct,
                                    false>>) {
-        return "FnACCStandaloneConstruct";
+        return "TileOffloadStandaloneConstruct";
       } else {
         return parser::ParseTreeDumper::GetNodeName(parseTreeNode);
       }

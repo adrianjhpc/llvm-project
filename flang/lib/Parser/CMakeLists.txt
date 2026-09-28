@@ -7,7 +7,7 @@ add_flang_library(FortranParser
   debug-parser.cpp
   executable-parsers.cpp
   expr-parsers.cpp
-  fnacc-parsers.cpp
+  TileOffload-parsers.cpp
   instrumented-parser.cpp
   io-parsers.cpp
   message.cpp

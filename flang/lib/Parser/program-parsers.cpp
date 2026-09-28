@@ -137,12 +137,12 @@ TYPE_CONTEXT_PARSER("declaration construct"_en_US,
             statement(indirect(Parser<StmtFunctionStmt>{}))),
         misplacedSpecificationStmt))
 
-// A !$FNACC executable directive marks the start of the execution part;
+// A !$tileoff executable directive marks the start of the execution part;
 // the specification part must yield to it cleanly (negation consumes nothing).
-constexpr auto notfnaccDirective{!(skipStuffBeforeStatement >>
-    ("!$FNACC "_sptok || "!@FNACC "_sptok))};
+constexpr auto notTileOffloadDirective{!(skipStuffBeforeStatement >>
+    ("!$tileoff "_sptok || "!@tileoff "_sptok))};
 
-constexpr auto recoveredDeclarationConstruct{notfnaccDirective >>
+constexpr auto recoveredDeclarationConstruct{notTileOffloadDirective >>
     recovery(withMessage("expected declaration construct"_err_en_US,
                  declarationConstruct),
         construct<DeclarationConstruct>(declErrorRecovery))};

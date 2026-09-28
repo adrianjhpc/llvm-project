@@ -50,7 +50,7 @@
 #include "flang/Optimizer/Dialect/CUF/CUFOps.h"
 #include "flang/Optimizer/Dialect/FIRAttr.h"
 #include "flang/Optimizer/Dialect/FIROps.h"
-#include "flang/Optimizer/Dialect/FNACC/FNACCDialect.h"
+#include "flang/Optimizer/Dialect/TileOffload/TileOffloadDialect.h"
 #include "flang/Optimizer/Dialect/Support/FIRContext.h"
 #include "flang/Optimizer/HLFIR/HLFIROps.h"
 #include "flang/Optimizer/Support/AllocationPolicy.h"
@@ -3564,15 +3564,15 @@ private:
         dir.u);
   }
 
-  void genFIR(const Fortran::parser::FnACCConstruct &fnacc) {
-    setCurrentPositionAt(fnacc);
+  void genFIR(const Fortran::parser::TileOffloadConstruct &TileOffload) {
+    setCurrentPositionAt(TileOffload);
     Fortran::lower::pft::Evaluation &eval = getEval();
     mlir::Location loc = toLocation();
 
     const auto &directive{
-        std::get<Fortran::parser::FnACCParallelDirective>(fnacc.t)};
+        std::get<Fortran::parser::TileOffloadParallelDirective>(TileOffload.t)};
     const auto &clauses{
-        std::get<std::list<Fortran::parser::FnACCClause>>(directive.t)};
+        std::get<std::list<Fortran::parser::TileOffloadClause>>(directive.t)};
 
     bool clauseError = false;
     int64_t tileProduct = 1;
@@ -3584,17 +3584,17 @@ private:
     bool noCopyback = false;
     const char *matmulPrecision = nullptr;
 
-    for (const Fortran::parser::FnACCClause &clause : clauses) {
+    for (const Fortran::parser::TileOffloadClause &clause : clauses) {
       Fortran::common::visit(
           Fortran::common::visitors{
-              [&](const Fortran::parser::FnACCTileClause &tileClause) {
+              [&](const Fortran::parser::TileOffloadTileClause &tileClause) {
                 for (const auto &expr : tileClause.v) {
                   std::optional<int64_t> value =
                       Fortran::semantics::GetIntValue(expr);
 
                   if (!value) {
                     mlir::emitError(loc)
-                        << "FNACC TILE size must be a constant integer";
+                        << "TileOffload TILE size must be a constant integer";
                     clauseError = true;
                     continue;
                   }
@@ -3602,14 +3602,14 @@ private:
                   if (*value <= 0 ||
                       *value > std::numeric_limits<int32_t>::max()) {
                     mlir::emitError(loc)
-                        << "FNACC TILE size must be positive and fit in i32";
+                        << "TileOffload TILE size must be positive and fit in i32";
                     clauseError = true;
                     continue;
                   }
 
                   if (tileProduct >
                       std::numeric_limits<int32_t>::max() / *value) {
-                    mlir::emitError(loc) << "FNACC TILE size product exceeds "
+                    mlir::emitError(loc) << "TileOffload TILE size product exceeds "
                                             "the runtime i32 limit";
                     clauseError = true;
                     continue;
@@ -3620,23 +3620,23 @@ private:
                 }
               },
 
-              [&](const Fortran::parser::FnACCPackClause &packClause) {
+              [&](const Fortran::parser::TileOffloadPackClause &packClause) {
                 for (const auto &item : packClause.v) {
                   const auto &name{std::get<Fortran::parser::Name>(item.t)};
                   const auto tgt{
-                      std::get<Fortran::parser::FnACCPackTarget>(item.t)};
+                      std::get<Fortran::parser::TileOffloadPackTarget>(item.t)};
                   if (name.symbol) {
                     packVars.push_back(getSymbolAddress(*name.symbol));
                     packTargets.push_back(
-                        tgt == Fortran::parser::FnACCPackTarget::Device ? 1
+                        tgt == Fortran::parser::TileOffloadPackTarget::Device ? 1
                                                                         : 0);
                   }
                 }
               },
-              [&](const Fortran::parser::FnACCReductionClause &redClause) {
+              [&](const Fortran::parser::TileOffloadReductionClause &redClause) {
                 for (const auto &item : redClause.v) {
                   const auto op{
-                      std::get<Fortran::parser::FnACCReductionOperator>(
+                      std::get<Fortran::parser::TileOffloadReductionOperator>(
                           item.t)};
                   const auto &name{std::get<Fortran::parser::Name>(item.t)};
 
@@ -3646,34 +3646,34 @@ private:
                     // Stable runtime/compiler metadata:
                     //   0 = add, 1 = multiply, 2 = min, 3 = max.
                     switch (op) {
-                    case Fortran::parser::FnACCReductionOperator::Add:
+                    case Fortran::parser::TileOffloadReductionOperator::Add:
                       reductionOps.push_back(0);
                       break;
-                    case Fortran::parser::FnACCReductionOperator::Multiply:
+                    case Fortran::parser::TileOffloadReductionOperator::Multiply:
                       reductionOps.push_back(1);
                       break;
-                    case Fortran::parser::FnACCReductionOperator::Min:
+                    case Fortran::parser::TileOffloadReductionOperator::Min:
                       reductionOps.push_back(2);
                       break;
-                    case Fortran::parser::FnACCReductionOperator::Max:
+                    case Fortran::parser::TileOffloadReductionOperator::Max:
                       reductionOps.push_back(3);
                       break;
                     }
                   }
                 }
               },
-              [&](const Fortran::parser::FnACCNoCopybackClause &) {
+              [&](const Fortran::parser::TileOffloadNoCopybackClause &) {
                 noCopyback = true;
               },
-              [&](const Fortran::parser::FnACCMatmulPrecisionClause &clause) {
+              [&](const Fortran::parser::TileOffloadMatmulPrecisionClause &clause) {
                 switch (clause.v) {
-                case Fortran::parser::FnACCMatmulPrecision::IEEE:
+                case Fortran::parser::TileOffloadMatmulPrecision::IEEE:
                   matmulPrecision = "ieee";
                   break;
-                case Fortran::parser::FnACCMatmulPrecision::TF32:
+                case Fortran::parser::TileOffloadMatmulPrecision::TF32:
                   matmulPrecision = "tf32";
                   break;
-                case Fortran::parser::FnACCMatmulPrecision::TF32x3:
+                case Fortran::parser::TileOffloadMatmulPrecision::TF32x3:
                   matmulPrecision = "tf32x3";
                   break;
                 }
@@ -3694,15 +3694,15 @@ private:
       packTargets.push_back(0);
     }
 
-    auto launchOp = fir::fnacc::LaunchOp::create(
+    auto launchOp = fir::TileOffload::LaunchOp::create(
         *builder, loc, builder->getDenseI64ArrayAttr(tileSizes), packVars,
         builder->getDenseI32ArrayAttr(packTargets));
 
     if (noCopyback)
-      launchOp->setAttr("fnacc.no_copyback", builder->getUnitAttr());
+      launchOp->setAttr("TileOffload.no_copyback", builder->getUnitAttr());
 
     if (matmulPrecision)
-      launchOp->setAttr("fnacc.matmul_precision",
+      launchOp->setAttr("TileOffload.matmul_precision",
                         builder->getStringAttr(matmulPrecision));
 
     if (!reductionVars.empty()) {
@@ -3710,9 +3710,9 @@ private:
       for (unsigned i = 0; i < reductionVars.size(); ++i)
         reductionSlots.push_back(reductionBase + i);
 
-      launchOp->setAttr("fnacc.reduction_slots",
+      launchOp->setAttr("TileOffload.reduction_slots",
                         builder->getDenseI32ArrayAttr(reductionSlots));
-      launchOp->setAttr("fnacc.reduction_ops",
+      launchOp->setAttr("TileOffload.reduction_ops",
                         builder->getDenseI32ArrayAttr(reductionOps));
     }
 
@@ -3727,12 +3727,12 @@ private:
     // 6. Terminate and move out
     mlir::Block &launchBlock{launchOp.getRegion().front()};
     builder->setInsertionPointToEnd(&launchBlock);
-    fir::fnacc::TerminatorOp::create(*builder, loc);
+    fir::TileOffload::TerminatorOp::create(*builder, loc);
     builder->setInsertionPointAfter(launchOp);
   }
 
-  void genFIR(const Fortran::parser::FnACCStandaloneConstruct &fnacc) {
-    setCurrentPositionAt(fnacc);
+  void genFIR(const Fortran::parser::TileOffloadStandaloneConstruct &TileOffload) {
+    setCurrentPositionAt(TileOffload);
     mlir::Location loc = toLocation();
     Fortran::lower::StatementContext stmtCtx;
 
@@ -3742,7 +3742,7 @@ private:
           Fortran::semantics::GetExpr(variable);
       if (!expr) {
         mlir::emitError(loc)
-            << "FNACC data directive variable has no semantic expression";
+            << "TileOffload data directive variable has no semantic expression";
         return {};
       }
 
@@ -3759,7 +3759,7 @@ private:
       }
       if (!value) {
         mlir::emitError(loc)
-            << "FNACC data directive variable has no FIR address";
+            << "TileOffload data directive variable has no FIR address";
         return {};
       }
 
@@ -3768,7 +3768,7 @@ private:
 
     Fortran::common::visit(
         Fortran::common::visitors{
-            [&](const Fortran::parser::FnACCUpdateHostDirective &dir) {
+            [&](const Fortran::parser::TileOffloadUpdateHostDirective &dir) {
               const auto &variables{std::get<0>(dir.t)};
 
               for (const Fortran::parser::Variable &variable : variables) {
@@ -3776,11 +3776,11 @@ private:
                 if (!value)
                   continue;
 
-                fir::fnacc::UpdateHostOp::create(*builder, loc, value);
+                fir::TileOffload::UpdateHostOp::create(*builder, loc, value);
               }
             },
 
-            [&](const Fortran::parser::FnACCUpdateDeviceDirective &dir) {
+            [&](const Fortran::parser::TileOffloadUpdateDeviceDirective &dir) {
               const auto &variables{std::get<0>(dir.t)};
 
               for (const Fortran::parser::Variable &variable : variables) {
@@ -3788,11 +3788,11 @@ private:
                 if (!value)
                   continue;
 
-                fir::fnacc::UpdateDeviceOp::create(*builder, loc, value);
+                fir::TileOffload::UpdateDeviceOp::create(*builder, loc, value);
               }
             },
 
-            [&](const Fortran::parser::FnACCPresentDirective &dir) {
+            [&](const Fortran::parser::TileOffloadPresentDirective &dir) {
               const auto &variables{std::get<0>(dir.t)};
 
               for (const Fortran::parser::Variable &variable : variables) {
@@ -3800,11 +3800,11 @@ private:
                 if (!value)
                   continue;
 
-                fir::fnacc::PresentOp::create(*builder, loc, value);
+                fir::TileOffload::PresentOp::create(*builder, loc, value);
               }
             },
 
-            [&](const Fortran::parser::FnACCReleaseDirective &dir) {
+            [&](const Fortran::parser::TileOffloadReleaseDirective &dir) {
               const auto &variables{std::get<0>(dir.t)};
 
               llvm::SmallVector<mlir::Value> values;
@@ -3815,51 +3815,51 @@ private:
               }
 
               if (!values.empty())
-                fir::fnacc::ReleaseOp::create(*builder, loc, values);
+                fir::TileOffload::ReleaseOp::create(*builder, loc, values);
             },
 
-            [&](const Fortran::parser::FnACCEnterDataDirective &dir) {
-              fir::fnacc::DataRegionEnterOp::create(*builder, loc);
+            [&](const Fortran::parser::TileOffloadEnterDataDirective &dir) {
+              fir::TileOffload::DataRegionEnterOp::create(*builder, loc);
 
               const auto &clauses{std::get<0>(dir.t)};
 
-              for (const Fortran::parser::FnACCEnterDataClause &clause :
+              for (const Fortran::parser::TileOffloadEnterDataClause &clause :
                    clauses) {
                 Fortran::common::visit(
                     Fortran::common::visitors{
-                        [&](const Fortran::parser::FnACCCopyinClause &copyin) {
+                        [&](const Fortran::parser::TileOffloadCopyinClause &copyin) {
                           for (const Fortran::parser::Variable &variable :
                                copyin.v) {
                             mlir::Value value = getValueForVariable(variable);
                             if (!value)
                               continue;
 
-                            fir::fnacc::CopyinOp::create(*builder, loc, value);
+                            fir::TileOffload::CopyinOp::create(*builder, loc, value);
                           }
                         },
 
-                        [&](const Fortran::parser::FnACCCreateClause &create) {
+                        [&](const Fortran::parser::TileOffloadCreateClause &create) {
                           for (const Fortran::parser::Variable &variable :
                                create.v) {
                             mlir::Value value = getValueForVariable(variable);
                             if (!value)
                               continue;
 
-                            fir::fnacc::CreateOp::create(*builder, loc, value);
+                            fir::TileOffload::CreateOp::create(*builder, loc, value);
                           }
                         }},
                     clause.u);
               }
             },
 
-            [&](const Fortran::parser::FnACCExitDataDirective &dir) {
+            [&](const Fortran::parser::TileOffloadExitDataDirective &dir) {
               const auto &clauses{std::get<0>(dir.t)};
 
-              for (const Fortran::parser::FnACCExitDataClause &clause :
+              for (const Fortran::parser::TileOffloadExitDataClause &clause :
                    clauses) {
                 Fortran::common::visit(
                     Fortran::common::visitors{
-                        [&](const Fortran::parser::FnACCCopyoutClause
+                        [&](const Fortran::parser::TileOffloadCopyoutClause
                                 &copyout) {
                           for (const Fortran::parser::Variable &variable :
                                copyout.v) {
@@ -3867,34 +3867,34 @@ private:
                             if (!value)
                               continue;
 
-                            fir::fnacc::CopyoutOp::create(*builder, loc, value);
+                            fir::TileOffload::CopyoutOp::create(*builder, loc, value);
                           }
                         },
 
-                        [&](const Fortran::parser::FnACCDeleteClause &del) {
+                        [&](const Fortran::parser::TileOffloadDeleteClause &del) {
                           for (const Fortran::parser::Variable &variable :
                                del.v) {
                             mlir::Value value = getValueForVariable(variable);
                             if (!value)
                               continue;
 
-                            fir::fnacc::DeleteOp::create(*builder, loc, value);
+                            fir::TileOffload::DeleteOp::create(*builder, loc, value);
                           }
                         }},
                     clause.u);
               }
 
-              fir::fnacc::DataRegionExitOp::create(*builder, loc);
+              fir::TileOffload::DataRegionExitOp::create(*builder, loc);
             },
 
-            [&](const Fortran::parser::FnACCReleaseAllDirective &) {
-              fir::fnacc::ReleaseAllOp::create(*builder, loc);
+            [&](const Fortran::parser::TileOffloadReleaseAllDirective &) {
+              fir::TileOffload::ReleaseAllOp::create(*builder, loc);
             },
 
-            [&](const Fortran::parser::FnACCWaitDirective &) {
-              fir::fnacc::WaitOp::create(*builder, loc);
+            [&](const Fortran::parser::TileOffloadWaitDirective &) {
+              fir::TileOffload::WaitOp::create(*builder, loc);
             }},
-        fnacc.u);
+        TileOffload.u);
   }
 
   void genFIR(const Fortran::parser::OpenACCConstruct &acc) {

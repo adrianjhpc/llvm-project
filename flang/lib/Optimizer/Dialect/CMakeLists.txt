@@ -47,20 +47,20 @@ add_flang_library(FIRDialect
   MLIRTargetLLVMIRExport
 )
 
-# --- FNACC Dialect Library Target ---
-add_flang_library(FIRFNACCDialect
-  FNACC/FNACCDialect.cpp
-  FNACC/FNACCAssignKernelIds.cpp
-  FNACC/FNACCEmitFortranAliases.cpp
-  FNACC/FNACCKernelAnalysis.cpp
-  FNACC/FNACCOutlineKernels.cpp
-  FNACC/FNACCPipelines.cpp
-  FNACC/FNACCLowerToTriton.cpp
-  FNACC/FNACCLowerToRuntime.cpp
+# --- TileOffload Dialect Library Target ---
+add_flang_library(FIRTileOffloadDialect
+  TileOffload/TileOffloadDialect.cpp
+  TileOffload/TileOffloadAssignKernelIds.cpp
+  TileOffload/TileOffloadEmitFortranAliases.cpp
+  TileOffload/TileOffloadKernelAnalysis.cpp
+  TileOffload/TileOffloadOutlineKernels.cpp
+  TileOffload/TileOffloadPipelines.cpp
+  TileOffload/TileOffloadLowerToTriton.cpp
+  TileOffload/TileOffloadLowerToRuntime.cpp
 
   DEPENDS
-  FnACCDialectIncGen
-  FNACCPassesIncGen
+  TileOffloadDialectIncGen
+  TileOffloadPassesIncGen
 
   LINK_LIBS
   FIRDialect 

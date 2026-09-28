@@ -528,13 +528,13 @@ if (FLANG_INCLUDE_DOCS)
 endif()
 
 # Backwards-compatible spelling for existing build scripts.
-set(_flang_fnacc_runtime_default OFF)
-if(DEFINED FLANG_FNACC AND NOT DEFINED FLANG_FNACC_RUNTIME)
-  set(_flang_fnacc_runtime_default ${FLANG_FNACC})
+set(_flang_tileoff_runtime_default OFF)
+if(DEFINED FLANG_TILEOFFLOAD AND NOT DEFINED FLANG_TILEOFFLOAD_RUNTIME)
+  set(_flang_tileoff_runtime_default ${FLANG_TILEOFFLOAD})
 endif()
-option(FLANG_FNACC_RUNTIME "Build the experimental FNACC CUDA runtime"
-       ${_flang_fnacc_runtime_default})
-unset(_flang_fnacc_runtime_default)
+option(FLANG_TILEOFFLOAD_RUNTIME "Build the experimental TILEOFFLOAD CUDA runtime"
+       ${_flang_tileoff_runtime_default})
+unset(_flang_tileoff_runtime_default)
 
 
 # Custom target to install Flang libraries.
