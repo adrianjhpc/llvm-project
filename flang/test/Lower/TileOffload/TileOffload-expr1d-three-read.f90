@@ -1,5 +1,5 @@
 ! RUN: %flang_fc1 -emit-fir %s -o %t.fir
-! RUN: fir-opt --TileOffload-pipeline="ttir-output=%t.ttir json-output=%t.json" %t.fir -o %t.host.fir
+! RUN: fir-opt --tileoff-pipeline="ttir-output=%t.ttir json-output=%t.json" %t.fir -o %t.host.fir
 ! RUN: FileCheck %s --check-prefix=TTIR --input-file=%t.ttir
 ! RUN: FileCheck %s --check-prefix=JSON --input-file=%t.json
 ! RUN: python3 -m json.tool %t.json > /dev/null

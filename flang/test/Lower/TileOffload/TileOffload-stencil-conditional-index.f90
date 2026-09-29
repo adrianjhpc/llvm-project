@@ -1,6 +1,6 @@
 ! RUN: %flang_fc1 -emit-fir %s -o %t.fir
 ! RUN: fir-opt \
-! RUN:   --TileOffload-pipeline="launch-abi=2 ttir-output=%t.ttir json-output=%t.json" \
+! RUN:   --tileoff-pipeline="launch-abi=2 ttir-output=%t.ttir json-output=%t.json" \
 ! RUN:   %t.fir -o %t.host.fir
 ! RUN: FileCheck %s --check-prefix=HOST --input-file=%t.host.fir
 ! RUN: FileCheck %s --check-prefix=TTIR --input-file=%t.ttir

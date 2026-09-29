@@ -1,7 +1,7 @@
 ! RUN: %flang_fc1 -emit-fir %s -o %t.fir
-! RUN: fir-opt --TileOffload-pipeline="launch-abi=2 ttir-output=%t.2.ttir json-output=%t.2.json" %t.fir -o %t.2.host
+! RUN: fir-opt --tileoff-pipeline="launch-abi=2 ttir-output=%t.2.ttir json-output=%t.2.json" %t.fir -o %t.2.host
 ! RUN: FileCheck %s --check-prefix=HOST --implicit-check-not=TileOffload.launch < %t.2.host
-! RUN: fir-opt --TileOffload-pipeline="launch-abi=3 ttir-output=%t.3.ttir json-output=%t.3.json" %t.fir -o %t.3.host
+! RUN: fir-opt --tileoff-pipeline="launch-abi=3 ttir-output=%t.3.ttir json-output=%t.3.json" %t.fir -o %t.3.host
 ! RUN: FileCheck %s --check-prefix=HOST --implicit-check-not=TileOffload.launch < %t.3.host
 
 subroutine array_bounds_1d(a,b,lo,hi)

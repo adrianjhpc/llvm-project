@@ -76,7 +76,7 @@ struct TileOffloadAssignKernelIdsPass
 
     llvm::DenseMap<Operation *, unsigned> localOrdinals;
     int32_t nextSequentialId = 0;
-    const char *bundleKey = std::getenv("tileoff_KERNEL_BUNDLE_KEY");
+    const char *bundleKey = std::getenv("TILEOFF_KERNEL_BUNDLE_KEY");
     bool useBundleStableIds = bundleKey && bundleKey[0] != '\0';
     llvm::StringSet<> usedNames;
 

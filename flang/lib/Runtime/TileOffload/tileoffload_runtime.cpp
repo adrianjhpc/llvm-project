@@ -8,14 +8,14 @@
 // Optional instrumentation; disabled builds do not require NVTX headers.
 #if defined(TILEOFFLOAD_ENABLE_NVTX) && TILEOFFLOAD_ENABLE_NVTX
 #include <nvtx3/nvtx3.hpp>
-#define tileoff_PROFILE_SCOPE(name) \
+#define TILEOFF_PROFILE_SCOPE(name) \
   nvtx3::scoped_range TileOffloadProfileRange { name }
-#define tileoff_PROFILE_PUSH(name) nvtxRangePushA(name)
-#define tileoff_PROFILE_POP() nvtxRangePop()
+#define TILEOFF_PROFILE_PUSH(name) nvtxRangePushA(name)
+#define TILEOFF_PROFILE_POP() nvtxRangePop()
 #else
-#define tileoff_PROFILE_SCOPE(name) ((void)0)
-#define tileoff_PROFILE_PUSH(name) ((void)0)
-#define tileoff_PROFILE_POP() ((void)0)
+#define TILEOFF_PROFILE_SCOPE(name) ((void)0)
+#define TILEOFF_PROFILE_PUSH(name) ((void)0)
+#define TILEOFF_PROFILE_POP() ((void)0)
 #endif
 
 #if defined(TILEOFFLOAD_RUNTIME_USE_HIP) && TILEOFFLOAD_RUNTIME_USE_HIP
@@ -156,10 +156,10 @@ static CUresult cuLaunchKernel(CUfunction function, unsigned gridX,
       blockZ, sharedBytes, stream, kernelParams, extra);
 }
 
-static constexpr const char *tileoff_ACCELERATOR_NAME = "HIP";
+static constexpr const char *TILEOFF_ACCELERATOR_NAME = "HIP";
 #else
 #include <cuda.h>
-static constexpr const char *tileoff_ACCELERATOR_NAME = "CUDA";
+static constexpr const char *TILEOFF_ACCELERATOR_NAME = "CUDA";
 #endif
 
 #include <algorithm>
@@ -196,8 +196,8 @@ static std::shared_mutex &TileOffloadGetLifetimeMutex() {
   return mutex;
 }
 class TileOffloadOperationGuard;
-#define tileoff_RUNTIME_GUARD() TileOffloadOperationGuard TileOffloadRuntimeLock
-#define tileoff_REGISTRY_GUARD() \
+#define TILEOFF_RUNTIME_GUARD() TileOffloadOperationGuard TileOffloadRuntimeLock
+#define TILEOFF_REGISTRY_GUARD() \
   std::unique_lock<std::shared_mutex> TileOffloadLifetimeLock( \
       TileOffloadGetLifetimeMutex()); \
   std::lock_guard<std::recursive_mutex> TileOffloadRegistryLock( \
@@ -216,19 +216,19 @@ static void TileOffloadCudaCheck(
 
   std::fprintf(stderr,
       "TileOffload %s driver error at %s:%d while executing %s: %s: %s\n",
-      tileoff_ACCELERATOR_NAME, file, line, expr, name ? name : "<unknown>",
+      TILEOFF_ACCELERATOR_NAME, file, line, expr, name ? name : "<unknown>",
       desc ? desc : "<no description>");
 
   std::abort();
 }
 
-#define tileoff_CUDA_CHECK(expr) \
+#define TILEOFF_CUDA_CHECK(expr) \
   do { \
     TileOffloadCudaCheck((expr), #expr, __FILE__, __LINE__); \
   } while (false)
 
-static constexpr const char *tileoff_RUNTIME_BUILD_ID =
-    "tileoff_RUNTIME_BUILD_ID_data_only_runtime_v13";
+static constexpr const char *TILEOFF_RUNTIME_BUILD_ID =
+    "TILEOFF_RUNTIME_BUILD_ID_data_only_runtime_v13";
 
 static std::size_t TileOffloadCheckedMul(
     std::size_t a, std::size_t b, const char *what) {
@@ -329,7 +329,7 @@ static void TileOffloadValidateCudaBlockSize(
     CUfunction fn, int32_t kernelId, unsigned cudaBlockX) {
   auto &properties = TileOffloadGetFunctionProperties(fn);
   if (properties.maxThreadsPerBlock == 0)
-    tileoff_CUDA_CHECK(cuFuncGetAttribute(&properties.maxThreadsPerBlock,
+    TILEOFF_CUDA_CHECK(cuFuncGetAttribute(&properties.maxThreadsPerBlock,
         CU_FUNC_ATTRIBUTE_MAX_THREADS_PER_BLOCK, fn));
   int maxThreadsPerBlock = properties.maxThreadsPerBlock;
 
@@ -349,13 +349,13 @@ static thread_local int TileOffloadSelectedDeviceOrdinal = -1;
 static int TileOffloadGetDeviceOrdinal() {
   if (TileOffloadSelectedDeviceOrdinal >= 0)
     return TileOffloadSelectedDeviceOrdinal;
-  const char *variable = "tileoff_DEVICE";
+  const char *variable = "TILEOFF_DEVICE";
   const char *value = std::getenv(variable);
   if (!value || value[0] == '\0') {
 #if defined(TILEOFFLOAD_RUNTIME_USE_HIP) && TILEOFFLOAD_RUNTIME_USE_HIP
-    variable = "tileoff_HIP_DEVICE";
+    variable = "TILEOFF_HIP_DEVICE";
 #else
-    variable = "tileoff_CUDA_DEVICE";
+    variable = "TILEOFF_CUDA_DEVICE";
 #endif
     value = std::getenv(variable);
   }
@@ -660,13 +660,13 @@ static void TileOffloadValidateContiguousDescriptor(const char *operationName,
   }
 }
 
-static constexpr int32_t tileoff_SUPPORTED_SCHEMA_VERSION = 1;
-static constexpr int32_t tileoff_PACK_TARGET_HOST = 0;
-static constexpr int32_t tileoff_PACK_TARGET_DEVICE = 1;
+static constexpr int32_t TILEOFF_SUPPORTED_SCHEMA_VERSION = 1;
+static constexpr int32_t TILEOFF_PACK_TARGET_HOST = 0;
+static constexpr int32_t TILEOFF_PACK_TARGET_DEVICE = 1;
 
 struct TileOffloadPackEntry {
   int32_t kernelArgSlot = -1;
-  int32_t target = tileoff_PACK_TARGET_HOST;
+  int32_t target = TILEOFF_PACK_TARGET_HOST;
 };
 
 static std::vector<TileOffloadPackEntry> jsonParsePackEntries(
@@ -698,15 +698,15 @@ static std::vector<TileOffloadPackEntry> jsonParsePackEntries(
     }
 
     if (!jsonFindInt(objectText, "target", entry.target))
-      entry.target = tileoff_PACK_TARGET_HOST;
+      entry.target = TILEOFF_PACK_TARGET_HOST;
 
-    if (entry.target != tileoff_PACK_TARGET_HOST &&
-        entry.target != tileoff_PACK_TARGET_DEVICE) {
+    if (entry.target != TILEOFF_PACK_TARGET_HOST &&
+        entry.target != TILEOFF_PACK_TARGET_DEVICE) {
       std::fprintf(stderr,
           "TileOffload warning: invalid pack target %d for slot %d; "
           "defaulting to host\n",
           entry.target, entry.kernelArgSlot);
-      entry.target = tileoff_PACK_TARGET_HOST;
+      entry.target = TILEOFF_PACK_TARGET_HOST;
     }
 
     entries.push_back(entry);
@@ -1293,9 +1293,9 @@ public:
     if (!parent) {
       lifetime = std::shared_lock<std::shared_mutex>(TileOffloadGetLifetimeMutex());
       registry = std::unique_lock<std::recursive_mutex>(TileOffloadGetRuntimeMutex());
-      debug = TileOffloadReadEnvFlag("tileoff_DEBUG");
-      asyncResident = TileOffloadReadEnvFlag("tileoff_ASYNC_RESIDENT");
-      reductionStats = TileOffloadReadEnvFlag("tileoff_REDUCTION_STATS");
+      debug = TileOffloadReadEnvFlag("TILEOFF_DEBUG");
+      asyncResident = TileOffloadReadEnvFlag("TILEOFF_ASYNC_RESIDENT");
+      reductionStats = TileOffloadReadEnvFlag("TILEOFF_REDUCTION_STATS");
     } else {
       debug = parent->debug;
       asyncResident = parent->asyncResident;
@@ -1337,7 +1337,7 @@ private:
 struct TileOffloadDeviceArg {
   CUdeviceptr ptr = 0;
   bool cached = false;
-  int32_t target = tileoff_PACK_TARGET_HOST;
+  int32_t target = TILEOFF_PACK_TARGET_HOST;
   int32_t slot = -1;
 };
 
@@ -1347,11 +1347,11 @@ static TileOffloadFunctionProperties &TileOffloadGetFunctionProperties(CUfunctio
 
 static bool TileOffloadEnvFlagEnabled(const char *name) {
   if (TileOffloadOperation) {
-    if (std::strcmp(name, "tileoff_DEBUG") == 0)
+    if (std::strcmp(name, "TILEOFF_DEBUG") == 0)
       return TileOffloadOperation->debug;
-    if (std::strcmp(name, "tileoff_ASYNC_RESIDENT") == 0)
+    if (std::strcmp(name, "TILEOFF_ASYNC_RESIDENT") == 0)
       return TileOffloadOperation->asyncResident;
-    if (std::strcmp(name, "tileoff_REDUCTION_STATS") == 0)
+    if (std::strcmp(name, "TILEOFF_REDUCTION_STATS") == 0)
       return TileOffloadOperation->reductionStats;
   }
   return TileOffloadReadEnvFlag(name);
@@ -1359,11 +1359,11 @@ static bool TileOffloadEnvFlagEnabled(const char *name) {
 
 static bool TileOffloadDebugEnabled() {
   return TileOffloadOperation ? TileOffloadOperation->debug
-                        : TileOffloadReadEnvFlag("tileoff_DEBUG");
+                        : TileOffloadReadEnvFlag("TILEOFF_DEBUG");
 }
 
 static bool TileOffloadReductionStatsEnabled() {
-  return TileOffloadEnvFlagEnabled("tileoff_REDUCTION_STATS");
+  return TileOffloadEnvFlagEnabled("TILEOFF_REDUCTION_STATS");
 }
 
 // Reuse context selection only inside a guarded runtime call. Never retain
@@ -1381,7 +1381,7 @@ public:
       if (result == CUDA_ERROR_NOT_INITIALIZED)
         previousContext = nullptr;
       else
-        tileoff_CUDA_CHECK(result);
+        TILEOFF_CUDA_CHECK(result);
     }
     TileOffloadContextScope = this;
   }
@@ -1541,7 +1541,7 @@ static std::vector<std::string> TileOffloadGetPtxTextsFromDirectory(
     const std::unordered_map<int32_t, TileOffloadKernelDesc> &kernels) {
   std::vector<std::string> result;
 
-  const char *dir = std::getenv("tileoff_PTX_DIR");
+  const char *dir = std::getenv("TILEOFF_PTX_DIR");
   if (!dir || dir[0] == '\0')
     return result;
 
@@ -1574,7 +1574,7 @@ static std::vector<std::string> TileOffloadGetPtxTextsFromDirectory(
 
 static std::vector<std::string> TileOffloadGetPtxTexts(
     const std::unordered_map<int32_t, TileOffloadKernelDesc> &kernels) {
-  const char *singlePtxPath = std::getenv("tileoff_PTX");
+  const char *singlePtxPath = std::getenv("TILEOFF_PTX");
 
   if (singlePtxPath && singlePtxPath[0] != '\0') {
     if (TileOffloadDebugEnabled())
@@ -1584,7 +1584,7 @@ static std::vector<std::string> TileOffloadGetPtxTexts(
     return {TileOffloadReadTextFile(singlePtxPath)};
   }
 
-  if (const char *dir = std::getenv("tileoff_PTX_DIR")) {
+  if (const char *dir = std::getenv("TILEOFF_PTX_DIR")) {
     if (dir[0] != '\0')
       return TileOffloadGetPtxTextsFromDirectory(kernels);
   }
@@ -1597,7 +1597,7 @@ static std::vector<std::string> TileOffloadGetPtxTexts(
 }
 
 static std::string TileOffloadGetJsonText() {
-  const char *jsonPath = std::getenv("tileoff_KERNELS_JSON");
+  const char *jsonPath = std::getenv("TILEOFF_KERNELS_JSON");
 
   if (jsonPath && jsonPath[0] != '\0') {
     if (TileOffloadDebugEnabled())
@@ -1837,7 +1837,7 @@ TileOffloadParseKernelDescsFromJson(const std::string &json) {
 }
 
 static void TileOffloadCleanup() {
-  tileoff_REGISTRY_GUARD();
+  TILEOFF_REGISTRY_GUARD();
   if (!TileOffloadRegistry.initialized)
     return;
 
@@ -2024,14 +2024,14 @@ static unsigned TileOffloadMatmulDynamicSharedBytes(const TileOffloadKernelDesc 
   // Optional override for experiments, but do not allow values below the
   // computed requirement. A too-small dynamic shared memory size can cause
   // illegal GPU memory accesses.
-  if (const char *value = std::getenv("tileoff_MATMUL_SHARED_BYTES")) {
+  if (const char *value = std::getenv("TILEOFF_MATMUL_SHARED_BYTES")) {
     if (value[0] != '\0') {
       unsigned requested = TileOffloadGetEnvUnsignedAllowZero(
-          "tileoff_MATMUL_SHARED_BYTES", requiredBytes);
+          "TILEOFF_MATMUL_SHARED_BYTES", requiredBytes);
 
       if (requested < requiredBytes) {
         std::fprintf(stderr,
-            "TileOffload error: tileoff_MATMUL_SHARED_BYTES=%u is smaller than the "
+            "TileOffload error: TILEOFF_MATMUL_SHARED_BYTES=%u is smaller than the "
             "computed required minimum %u bytes for tile=(%d,%d,%d), "
             "num_stages=%d. Refusing to launch because this can cause "
             "CUDA_ERROR_ILLEGAL_ADDRESS.\n",
@@ -2106,14 +2106,14 @@ static unsigned TileOffloadMatmulF64DynamicSharedBytes(
   unsigned requiredBytes = static_cast<unsigned>(bytes);
 
   // Debug/tuning override. Do not allow values below the computed minimum.
-  if (const char *value = std::getenv("tileoff_MATMUL_F64_SHARED_BYTES")) {
+  if (const char *value = std::getenv("TILEOFF_MATMUL_F64_SHARED_BYTES")) {
     if (value[0] != '\0') {
       unsigned requested = TileOffloadGetEnvUnsignedAllowZero(
-          "tileoff_MATMUL_F64_SHARED_BYTES", requiredBytes);
+          "TILEOFF_MATMUL_F64_SHARED_BYTES", requiredBytes);
 
       if (requested < requiredBytes) {
         std::fprintf(stderr,
-            "TileOffload error: tileoff_MATMUL_F64_SHARED_BYTES=%u is smaller than "
+            "TileOffload error: TILEOFF_MATMUL_F64_SHARED_BYTES=%u is smaller than "
             "the computed required minimum %u bytes for tile=(%d,%d,%d). "
             "Refusing to launch because this can cause illegal GPU memory "
             "accesses.\n",
@@ -2134,9 +2134,9 @@ static void TileOffloadEnsureInitialized() {
 
   if (TileOffloadDebugEnabled())
     std::fprintf(
-        stderr, "TileOffload: runtime build id: %s\n", tileoff_RUNTIME_BUILD_ID);
+        stderr, "TileOffload: runtime build id: %s\n", TILEOFF_RUNTIME_BUILD_ID);
 
-  tileoff_CUDA_CHECK(cuInit(0));
+  TILEOFF_CUDA_CHECK(cuInit(0));
   auto parseOneJson = [&](const std::string &json, int32_t imageBase) {
     int32_t schemaVersion = 0;
     if (!jsonFindInt(json, "tileoff_schema_version", schemaVersion)) {
@@ -2144,11 +2144,11 @@ static void TileOffloadEnsureInitialized() {
           stderr, "TileOffload error: kernel JSON is missing tileoff_schema_version\n");
       std::abort();
     }
-    if (schemaVersion != tileoff_SUPPORTED_SCHEMA_VERSION) {
+    if (schemaVersion != TILEOFF_SUPPORTED_SCHEMA_VERSION) {
       std::fprintf(stderr,
           "TileOffload error: unsupported kernel JSON schema version %d; "
           "runtime supports version %d\n",
-          schemaVersion, tileoff_SUPPORTED_SCHEMA_VERSION);
+          schemaVersion, TILEOFF_SUPPORTED_SCHEMA_VERSION);
       std::abort();
     }
 
@@ -2169,7 +2169,7 @@ static void TileOffloadEnsureInitialized() {
     }
   };
 
-  const char *jsonOverride = std::getenv("tileoff_KERNELS_JSON");
+  const char *jsonOverride = std::getenv("TILEOFF_KERNELS_JSON");
   bool hasJsonOverride = jsonOverride && jsonOverride[0] != '\0';
   bool useEmbeddedBundles = !hasJsonOverride && TileOffloadHasEmbeddedBundles();
   bool useLegacySidecars = !hasJsonOverride && !useEmbeddedBundles &&
@@ -2263,14 +2263,14 @@ static TileOffloadContextState &TileOffloadCreateContextState(
   state.device = device;
   state.context = context;
   state.retainedPrimaryContext = retainedPrimaryContext;
-  tileoff_CUDA_CHECK(cuCtxSetCurrent(state.context));
-  tileoff_CUDA_CHECK(cuStreamCreate(&state.stream, CU_STREAM_DEFAULT));
-  tileoff_CUDA_CHECK(
+  TILEOFF_CUDA_CHECK(cuCtxSetCurrent(state.context));
+  TILEOFF_CUDA_CHECK(cuStreamCreate(&state.stream, CU_STREAM_DEFAULT));
+  TILEOFF_CUDA_CHECK(
       cuEventCreate(&state.completionEvent, CU_EVENT_DISABLE_TIMING));
 
   state.modules.resize(TileOffloadRegistry.ptxTexts.size(), nullptr);
   for (std::size_t i = 0; i < TileOffloadRegistry.ptxTexts.size(); ++i) {
-    tileoff_CUDA_CHECK(cuModuleLoadDataEx(&state.modules[i],
+    TILEOFF_CUDA_CHECK(cuModuleLoadDataEx(&state.modules[i],
         TileOffloadRegistry.ptxTexts[i].c_str(), 0, nullptr, nullptr));
     if (TileOffloadDebugEnabled())
       std::fprintf(stderr,
@@ -2295,8 +2295,8 @@ static TileOffloadContextState &TileOffloadGetOrCreatePrimaryContextState(int or
 
   CUdevice device = 0;
   CUcontext context = nullptr;
-  tileoff_CUDA_CHECK(cuDeviceGet(&device, ordinal));
-  tileoff_CUDA_CHECK(cuDevicePrimaryCtxRetain(&context, device));
+  TILEOFF_CUDA_CHECK(cuDeviceGet(&device, ordinal));
+  TILEOFF_CUDA_CHECK(cuDevicePrimaryCtxRetain(&context, device));
 
   // A primary context may already have been registered through caller-owned
   // mode. Retaining it must not create a duplicate state or a second stream.
@@ -2320,17 +2320,17 @@ static void TileOffloadEnsureCurrentContext() {
   TileOffloadEnsureInitialized();
 
   if (TileOffloadSelectedDeviceOrdinal < 0 &&
-      TileOffloadEnvFlagEnabled("tileoff_USE_CURRENT_CONTEXT")) {
+      TileOffloadEnvFlagEnabled("TILEOFF_USE_CURRENT_CONTEXT")) {
     CUcontext context = nullptr;
     CUdevice device = 0;
-    tileoff_CUDA_CHECK(cuCtxGetCurrent(&context));
+    TILEOFF_CUDA_CHECK(cuCtxGetCurrent(&context));
     if (!context) {
       std::fprintf(stderr,
-          "TileOffload error: tileoff_USE_CURRENT_CONTEXT is set but no CUDA context "
+          "TileOffload error: TILEOFF_USE_CURRENT_CONTEXT is set but no CUDA context "
           "is current\n");
       std::abort();
     }
-    tileoff_CUDA_CHECK(cuCtxGetDevice(&device));
+    TILEOFF_CUDA_CHECK(cuCtxGetDevice(&device));
     auto known = TileOffloadRegistry.contexts.find(context);
     TileOffloadContextState &state = known != TileOffloadRegistry.contexts.end()
         ? known->second
@@ -2345,7 +2345,7 @@ static void TileOffloadEnsureCurrentContext() {
   int ordinal = TileOffloadGetDeviceOrdinal();
   TileOffloadContextState &state = TileOffloadGetOrCreatePrimaryContextState(ordinal);
   if (!TileOffloadContextScope || TileOffloadContextScope->callerContext() != state.context)
-    tileoff_CUDA_CHECK(cuCtxSetCurrent(state.context));
+    TILEOFF_CUDA_CHECK(cuCtxSetCurrent(state.context));
   TileOffloadOperation->select(state);
   if (TileOffloadContextScope)
     TileOffloadContextScope->select(state.context);
@@ -2362,12 +2362,12 @@ static int TileOffloadVisibleDeviceCount() {
   CUresult status = cuInit(0);
   if (status == CUDA_ERROR_NO_DEVICE)
     return 0;
-  tileoff_CUDA_CHECK(status);
+  TILEOFF_CUDA_CHECK(status);
   int count = 0;
   status = cuDeviceGetCount(&count);
   if (status == CUDA_ERROR_NO_DEVICE)
     return 0;
-  tileoff_CUDA_CHECK(status);
+  TILEOFF_CUDA_CHECK(status);
   return count;
 }
 
@@ -2381,34 +2381,34 @@ static void TileOffloadValidateDeviceOrdinal(int ordinal, int count) {
 }
 
 extern "C" int32_t tileoff_get_num_devices() {
-  tileoff_RUNTIME_GUARD();
+  TILEOFF_RUNTIME_GUARD();
   return TileOffloadVisibleDeviceCount();
 }
 
 extern "C" void tileoff_set_device_num(int32_t device) {
-  tileoff_RUNTIME_GUARD();
+  TILEOFF_RUNTIME_GUARD();
   TileOffloadValidateDeviceOrdinal(device, TileOffloadVisibleDeviceCount());
   TileOffloadSelectedDeviceOrdinal = device;
 }
 
 extern "C" int32_t tileoff_get_device_num() {
-  tileoff_RUNTIME_GUARD();
+  TILEOFF_RUNTIME_GUARD();
   int count = TileOffloadVisibleDeviceCount();
   if (TileOffloadSelectedDeviceOrdinal < 0 &&
-      TileOffloadEnvFlagEnabled("tileoff_USE_CURRENT_CONTEXT")) {
+      TileOffloadEnvFlagEnabled("TILEOFF_USE_CURRENT_CONTEXT")) {
     CUcontext context = nullptr;
-    tileoff_CUDA_CHECK(cuCtxGetCurrent(&context));
+    TILEOFF_CUDA_CHECK(cuCtxGetCurrent(&context));
     if (!context) {
       std::fprintf(stderr,
-          "TileOffload error: tileoff_USE_CURRENT_CONTEXT is set but no CUDA context "
+          "TileOffload error: TILEOFF_USE_CURRENT_CONTEXT is set but no CUDA context "
           "is current\n");
       std::abort();
     }
     CUdevice device;
-    tileoff_CUDA_CHECK(cuCtxGetDevice(&device));
+    TILEOFF_CUDA_CHECK(cuCtxGetDevice(&device));
     for (int ordinal = 0; ordinal < count; ++ordinal) {
       CUdevice candidate;
-      tileoff_CUDA_CHECK(cuDeviceGet(&candidate, ordinal));
+      TILEOFF_CUDA_CHECK(cuDeviceGet(&candidate, ordinal));
       if (candidate == device)
         return ordinal;
     }
@@ -2426,8 +2426,8 @@ static void TileOffloadWaitForStream(CUstream stream, CUevent completionEvent) {
     std::fprintf(stderr, "TileOffload error: runtime stream is not initialized\n");
     std::abort();
   }
-  tileoff_CUDA_CHECK(cuEventRecord(completionEvent, stream));
-  tileoff_CUDA_CHECK(cuEventSynchronize(completionEvent));
+  TILEOFF_CUDA_CHECK(cuEventRecord(completionEvent, stream));
+  TILEOFF_CUDA_CHECK(cuEventSynchronize(completionEvent));
 }
 
 static void TileOffloadWaitForRuntimeStream() {
@@ -2469,7 +2469,7 @@ static CUresult TileOffloadMemcpyDtoH(void *dst, CUdeviceptr src, std::size_t by
 // Only allocations retained in the runtime cache may outlive a launch call;
 // host outputs, temporaries, and scalar reductions retain their waits.
 static void TileOffloadCompleteArrayLaunch(bool allArgumentsCached) {
-  if (allArgumentsCached && TileOffloadEnvFlagEnabled("tileoff_ASYNC_RESIDENT")) {
+  if (allArgumentsCached && TileOffloadEnvFlagEnabled("TILEOFF_ASYNC_RESIDENT")) {
     TileOffloadActiveContextState().pendingResidentLaunches = true;
     return;
   }
@@ -2496,7 +2496,7 @@ extern "C" void __tileoff_trip_count_i32(
 }
 
 extern "C" void __tileoff_wait() {
-  tileoff_RUNTIME_GUARD();
+  TILEOFF_RUNTIME_GUARD();
   TileOffloadCurrentContextGuard contextGuard;
   TileOffloadEnsureCurrentContext();
 
@@ -2587,15 +2587,15 @@ static int32_t TileOffloadEffectivePackTargetForSlot(
   // enter data/update device/pack(...:device), then later launches can omit
   // pack(...:device). We use the cached device allocation automatically.
   if (TileOffloadHostPointerIsPresentOnDevice(hostPtr))
-    return tileoff_PACK_TARGET_DEVICE;
+    return TILEOFF_PACK_TARGET_DEVICE;
 
-  return tileoff_PACK_TARGET_HOST;
+  return TILEOFF_PACK_TARGET_HOST;
 }
 
 static int32_t TileOffloadEffectiveWriteTargetForSlot(
     const TileOffloadKernelDesc *desc, int32_t slot, void *hostPtr) {
   if (desc && !desc->copyBackWrites)
-    return tileoff_PACK_TARGET_DEVICE;
+    return TILEOFF_PACK_TARGET_DEVICE;
   return TileOffloadEffectivePackTargetForSlot(desc, slot, hostPtr);
 }
 
@@ -2611,20 +2611,20 @@ static const char *TileOffloadPackTargetSourceName(
 }
 
 static const char *TileOffloadPackTargetName(int32_t target) {
-  return target == tileoff_PACK_TARGET_DEVICE ? "device" : "host";
+  return target == TILEOFF_PACK_TARGET_DEVICE ? "device" : "host";
 }
 
 static TileOffloadDeviceArg TileOffloadMakeTemporaryDeviceBuffer(void *hostPtr,
     std::size_t bytes, bool copyHostToDevice, int32_t slot, const char *role) {
   TileOffloadDeviceArg arg;
   arg.cached = false;
-  arg.target = tileoff_PACK_TARGET_HOST;
+  arg.target = TILEOFF_PACK_TARGET_HOST;
   arg.slot = slot;
 
-  tileoff_CUDA_CHECK(cuMemAlloc(&arg.ptr, bytes));
+  TILEOFF_CUDA_CHECK(cuMemAlloc(&arg.ptr, bytes));
 
   if (copyHostToDevice)
-    tileoff_CUDA_CHECK(TileOffloadMemcpyHtoD(arg.ptr, hostPtr, bytes));
+    TILEOFF_CUDA_CHECK(TileOffloadMemcpyHtoD(arg.ptr, hostPtr, bytes));
 
   if (TileOffloadDebugEnabled()) {
     std::fprintf(stderr,
@@ -2644,7 +2644,7 @@ static TileOffloadDeviceArg TileOffloadGetCachedDeviceBuffer(void *hostPtr,
     std::optional<TileOffloadDeviceCache::iterator> known = std::nullopt) {
   TileOffloadDeviceArg arg;
   arg.cached = true;
-  arg.target = tileoff_PACK_TARGET_DEVICE;
+  arg.target = TILEOFF_PACK_TARGET_DEVICE;
   arg.slot = slot;
 
   auto &cache = TileOffloadActiveContextState().deviceCache;
@@ -2671,7 +2671,7 @@ static TileOffloadDeviceArg TileOffloadGetCachedDeviceBuffer(void *hostPtr,
 
     TileOffloadSynchronizeActiveContext();
 
-    tileoff_CUDA_CHECK(cuMemFree(it->second.ptr));
+    TILEOFF_CUDA_CHECK(cuMemFree(it->second.ptr));
     cache.erase(it);
     needAllocate = true;
   }
@@ -2679,10 +2679,10 @@ static TileOffloadDeviceArg TileOffloadGetCachedDeviceBuffer(void *hostPtr,
   if (needAllocate) {
     TileOffloadDeviceAllocation allocation;
     allocation.bytes = bytes;
-    tileoff_CUDA_CHECK(cuMemAlloc(&allocation.ptr, bytes));
+    TILEOFF_CUDA_CHECK(cuMemAlloc(&allocation.ptr, bytes));
 
     if (copyHostToDeviceOnMiss)
-      tileoff_CUDA_CHECK(TileOffloadMemcpyHtoD(allocation.ptr, hostPtr, bytes));
+      TILEOFF_CUDA_CHECK(TileOffloadMemcpyHtoD(allocation.ptr, hostPtr, bytes));
 
     auto inserted = cache.emplace(hostPtr, allocation);
     arg.ptr = inserted.first->second.ptr;
@@ -2710,7 +2710,7 @@ static TileOffloadDeviceArg TileOffloadGetCachedDeviceBuffer(void *hostPtr,
 
 static TileOffloadDeviceArg TileOffloadPrepareReadBuffer(
     void *hostPtr, std::size_t bytes, int32_t target, int32_t slot) {
-  if (target == tileoff_PACK_TARGET_DEVICE) {
+  if (target == TILEOFF_PACK_TARGET_DEVICE) {
     // Device target means cache/reuse device allocation. Copy in only on miss.
     return TileOffloadGetCachedDeviceBuffer(static_cast<void *>(hostPtr), bytes,
         /*copyHostToDeviceOnMiss=*/true, slot, "read");
@@ -2722,7 +2722,7 @@ static TileOffloadDeviceArg TileOffloadPrepareReadBuffer(
 
 static TileOffloadDeviceArg TileOffloadPrepareWriteBuffer(
     void *hostPtr, std::size_t bytes, int32_t target, int32_t slot) {
-  if (target == tileoff_PACK_TARGET_DEVICE) {
+  if (target == TILEOFF_PACK_TARGET_DEVICE) {
     // Device target means keep the output allocation cached. No copy-in needed.
     return TileOffloadGetCachedDeviceBuffer(static_cast<void *>(hostPtr), bytes,
         /*copyHostToDeviceOnMiss=*/false, slot, "write");
@@ -2740,12 +2740,12 @@ static TileOffloadDeviceArg TileOffloadPrepareArrayBuffer(const TileOffloadKerne
   const auto &explicitTarget = desc->explicitArrayTargets[slot];
   bool present = it != cache.end() && it->second.ptr && it->second.bytes;
   int32_t target = explicitTarget ? *explicitTarget
-      : present                   ? tileoff_PACK_TARGET_DEVICE
-                                  : tileoff_PACK_TARGET_HOST;
+      : present                   ? TILEOFF_PACK_TARGET_DEVICE
+                                  : TILEOFF_PACK_TARGET_HOST;
   if ((flags & 2) && !desc->copyBackWrites)
-    target = tileoff_PACK_TARGET_DEVICE;
+    target = TILEOFF_PACK_TARGET_DEVICE;
   bool read = (flags & 1) != 0;
-  if (target == tileoff_PACK_TARGET_DEVICE)
+  if (target == TILEOFF_PACK_TARGET_DEVICE)
     return TileOffloadGetCachedDeviceBuffer(
         host, bytes, read, slot, read ? "read" : "write", it);
   return TileOffloadMakeTemporaryDeviceBuffer(
@@ -2755,7 +2755,7 @@ static TileOffloadDeviceArg TileOffloadPrepareArrayBuffer(const TileOffloadKerne
 static void TileOffloadCopyBackWriteBuffer(
     void *hostPtr, const TileOffloadDeviceArg &arg, std::size_t bytes) {
   // Callers invoke this only when host visibility is required.
-  tileoff_CUDA_CHECK(TileOffloadMemcpyDtoH(hostPtr, arg.ptr, bytes));
+  TILEOFF_CUDA_CHECK(TileOffloadMemcpyDtoH(hostPtr, arg.ptr, bytes));
 
   if (TileOffloadDebugEnabled()) {
     std::fprintf(stderr,
@@ -2773,7 +2773,7 @@ static void TileOffloadReleaseDeviceArg(const TileOffloadDeviceArg &arg) {
   if (arg.cached)
     return;
 
-  tileoff_CUDA_CHECK(cuMemFree(arg.ptr));
+  TILEOFF_CUDA_CHECK(cuMemFree(arg.ptr));
 
   if (TileOffloadDebugEnabled()) {
     std::fprintf(stderr,
@@ -2852,7 +2852,7 @@ static CUfunction getKernelFunction(int32_t kernelId) {
   }
 
   CUfunction fn = nullptr;
-  tileoff_CUDA_CHECK(
+  TILEOFF_CUDA_CHECK(
       cuModuleGetFunction(&fn, state.modules[moduleIndex], kernelName.c_str()));
 
   state.functionCache[kernelId] = fn;
@@ -3149,7 +3149,7 @@ static TileOffloadDeviceAllocation &TileOffloadGetOrCreateCachedAllocation(void 
 
     TileOffloadSynchronizeActiveContext();
 
-    tileoff_CUDA_CHECK(cuMemFree(it->second.ptr));
+    TILEOFF_CUDA_CHECK(cuMemFree(it->second.ptr));
     cache.erase(it);
   }
 
@@ -3157,10 +3157,10 @@ static TileOffloadDeviceAllocation &TileOffloadGetOrCreateCachedAllocation(void 
   allocation.bytes = bytes;
 
   if (bytes > 0) {
-    tileoff_CUDA_CHECK(cuMemAlloc(&allocation.ptr, bytes));
+    TILEOFF_CUDA_CHECK(cuMemAlloc(&allocation.ptr, bytes));
 
     if (copyHostToDeviceOnCreateOrResize)
-      tileoff_CUDA_CHECK(TileOffloadMemcpyHtoD(allocation.ptr, hostPtr, bytes));
+      TILEOFF_CUDA_CHECK(TileOffloadMemcpyHtoD(allocation.ptr, hostPtr, bytes));
   }
 
   auto inserted = cache.emplace(hostPtr, allocation);
@@ -3302,7 +3302,7 @@ static void TileOffloadCopyoutDataRegionAllocation(
   // reference. The host is updated only by the last owning region.
   if (allocation.dataRegionReferences == 1) {
     if (bytes != 0)
-      tileoff_CUDA_CHECK(TileOffloadMemcpyDtoH(hostPtr, allocation.ptr, bytes));
+      TILEOFF_CUDA_CHECK(TileOffloadMemcpyDtoH(hostPtr, allocation.ptr, bytes));
   } else if (TileOffloadDebugEnabled()) {
     std::fprintf(stderr,
         "TileOffload: %s deferred host copy for host=%p; %zu enclosing data "
@@ -3343,7 +3343,7 @@ static void TileOffloadReleaseDataRegionAllocation(
   std::size_t bytes = allocation->second.bytes;
   TileOffloadSynchronizeActiveContext();
   if (devicePtr)
-    tileoff_CUDA_CHECK(cuMemFree(devicePtr));
+    TILEOFF_CUDA_CHECK(cuMemFree(devicePtr));
   cache.erase(allocation);
 
   if (TileOffloadDebugEnabled()) {
@@ -3356,7 +3356,7 @@ static void TileOffloadReleaseDataRegionAllocation(
 }
 
 extern "C" void __tileoff_enter_data_region() {
-  tileoff_RUNTIME_GUARD();
+  TILEOFF_RUNTIME_GUARD();
   TileOffloadCurrentContextGuard contextGuard;
   TileOffloadEnsureCurrentContext();
 
@@ -3367,7 +3367,7 @@ extern "C" void __tileoff_enter_data_region() {
 }
 
 extern "C" void __tileoff_exit_data_region() {
-  tileoff_RUNTIME_GUARD();
+  TILEOFF_RUNTIME_GUARD();
   TileOffloadCurrentContextGuard contextGuard;
   TileOffloadEnsureCurrentContext();
 
@@ -3389,7 +3389,7 @@ extern "C" void __tileoff_exit_data_region() {
 }
 
 extern "C" void __tileoff_data_copyin_bytes(void *hostPtr, int64_t bytesValue) {
-  tileoff_RUNTIME_GUARD();
+  TILEOFF_RUNTIME_GUARD();
   TileOffloadCurrentContextGuard contextGuard;
   TileOffloadEnsureCurrentContext();
   if (!hostPtr)
@@ -3406,7 +3406,7 @@ extern "C" void __tileoff_data_copyin_bytes(void *hostPtr, int64_t bytesValue) {
 }
 
 extern "C" void __tileoff_data_create_bytes(void *hostPtr, int64_t bytesValue) {
-  tileoff_RUNTIME_GUARD();
+  TILEOFF_RUNTIME_GUARD();
   TileOffloadCurrentContextGuard contextGuard;
   TileOffloadEnsureCurrentContext();
   if (!hostPtr)
@@ -3423,7 +3423,7 @@ extern "C" void __tileoff_data_create_bytes(void *hostPtr, int64_t bytesValue) {
 }
 
 extern "C" void __tileoff_data_copyout_bytes(void *hostPtr, int64_t bytesValue) {
-  tileoff_RUNTIME_GUARD();
+  TILEOFF_RUNTIME_GUARD();
   TileOffloadCurrentContextGuard contextGuard;
   TileOffloadEnsureCurrentContext();
   if (!hostPtr)
@@ -3441,7 +3441,7 @@ extern "C" void __tileoff_data_copyout_bytes(void *hostPtr, int64_t bytesValue) 
 extern "C" void __tileoff_data_copyin_desc(void *hostPtr, int64_t elementBytes,
     int32_t rank, int64_t extent0, int64_t extent1, int64_t extent2,
     int64_t stride0, int64_t stride1, int64_t stride2) {
-  tileoff_RUNTIME_GUARD();
+  TILEOFF_RUNTIME_GUARD();
   TileOffloadCurrentContextGuard contextGuard;
   TileOffloadEnsureCurrentContext();
   if (!hostPtr)
@@ -3457,7 +3457,7 @@ extern "C" void __tileoff_data_copyin_desc(void *hostPtr, int64_t elementBytes,
 extern "C" void __tileoff_data_create_desc(void *hostPtr, int64_t elementBytes,
     int32_t rank, int64_t extent0, int64_t extent1, int64_t extent2,
     int64_t stride0, int64_t stride1, int64_t stride2) {
-  tileoff_RUNTIME_GUARD();
+  TILEOFF_RUNTIME_GUARD();
   TileOffloadCurrentContextGuard contextGuard;
   TileOffloadEnsureCurrentContext();
   if (!hostPtr)
@@ -3473,7 +3473,7 @@ extern "C" void __tileoff_data_create_desc(void *hostPtr, int64_t elementBytes,
 extern "C" void __tileoff_data_copyout_desc(void *hostPtr, int64_t elementBytes,
     int32_t rank, int64_t extent0, int64_t extent1, int64_t extent2,
     int64_t stride0, int64_t stride1, int64_t stride2) {
-  tileoff_RUNTIME_GUARD();
+  TILEOFF_RUNTIME_GUARD();
   TileOffloadCurrentContextGuard contextGuard;
   TileOffloadEnsureCurrentContext();
   if (!hostPtr)
@@ -3486,7 +3486,7 @@ extern "C" void __tileoff_data_copyout_desc(void *hostPtr, int64_t elementBytes,
 }
 
 extern "C" void __tileoff_data_copyin(void *hostPtr) {
-  tileoff_RUNTIME_GUARD();
+  TILEOFF_RUNTIME_GUARD();
   TileOffloadCurrentContextGuard contextGuard;
   TileOffloadEnsureCurrentContext();
   if (hostPtr)
@@ -3494,7 +3494,7 @@ extern "C" void __tileoff_data_copyin(void *hostPtr) {
 }
 
 extern "C" void __tileoff_data_copyout(void *hostPtr) {
-  tileoff_RUNTIME_GUARD();
+  TILEOFF_RUNTIME_GUARD();
   TileOffloadCurrentContextGuard contextGuard;
   TileOffloadEnsureCurrentContext();
   if (!hostPtr)
@@ -3505,7 +3505,7 @@ extern "C" void __tileoff_data_copyout(void *hostPtr) {
 }
 
 extern "C" void __tileoff_data_delete(void *hostPtr) {
-  tileoff_RUNTIME_GUARD();
+  TILEOFF_RUNTIME_GUARD();
   TileOffloadCurrentContextGuard contextGuard;
   TileOffloadEnsureCurrentContext();
   if (!hostPtr)
@@ -3560,14 +3560,14 @@ static void TileOffloadRequirePresentAllocation(
 }
 
 extern "C" void __tileoff_present(void *hostPtr) {
-  tileoff_RUNTIME_GUARD();
+  TILEOFF_RUNTIME_GUARD();
   TileOffloadCurrentContextGuard contextGuard;
   TileOffloadEnsureCurrentContext();
   TileOffloadRequirePresentAllocation("present", hostPtr, 0);
 }
 
 extern "C" void __tileoff_present_bytes(void *hostPtr, int64_t bytesValue) {
-  tileoff_RUNTIME_GUARD();
+  TILEOFF_RUNTIME_GUARD();
   TileOffloadCurrentContextGuard contextGuard;
   TileOffloadEnsureCurrentContext();
 
@@ -3587,7 +3587,7 @@ extern "C" void __tileoff_present_bytes(void *hostPtr, int64_t bytesValue) {
 extern "C" void __tileoff_present_desc(void *hostPtr, int64_t elementBytes,
     int32_t rank, int64_t extent0, int64_t extent1, int64_t extent2,
     int64_t stride0, int64_t stride1, int64_t stride2) {
-  tileoff_RUNTIME_GUARD();
+  TILEOFF_RUNTIME_GUARD();
   TileOffloadCurrentContextGuard contextGuard;
   TileOffloadEnsureCurrentContext();
 
@@ -3602,7 +3602,7 @@ extern "C" void __tileoff_present_desc(void *hostPtr, int64_t elementBytes,
 }
 
 extern "C" void __tileoff_create_bytes(void *hostPtr, int64_t bytesValue) {
-  tileoff_RUNTIME_GUARD();
+  TILEOFF_RUNTIME_GUARD();
   TileOffloadCurrentContextGuard contextGuard;
   TileOffloadEnsureCurrentContext();
 
@@ -3642,7 +3642,7 @@ extern "C" void __tileoff_create_bytes(void *hostPtr, int64_t bytesValue) {
 extern "C" void __tileoff_create_desc(void *hostPtr, int64_t elementBytes,
     int32_t rank, int64_t extent0, int64_t extent1, int64_t extent2,
     int64_t stride0, int64_t stride1, int64_t stride2) {
-  tileoff_RUNTIME_GUARD();
+  TILEOFF_RUNTIME_GUARD();
   TileOffloadCurrentContextGuard contextGuard;
   TileOffloadEnsureCurrentContext();
 
@@ -3681,7 +3681,7 @@ extern "C" void __tileoff_create_desc(void *hostPtr, int64_t elementBytes,
 }
 
 extern "C" void __tileoff_update_device_bytes(void *hostPtr, int64_t bytesValue) {
-  tileoff_RUNTIME_GUARD();
+  TILEOFF_RUNTIME_GUARD();
   TileOffloadCurrentContextGuard contextGuard;
 
   TileOffloadEnsureCurrentContext();
@@ -3713,7 +3713,7 @@ extern "C" void __tileoff_update_device_bytes(void *hostPtr, int64_t bytesValue)
   TileOffloadDeviceAllocation &allocation = TileOffloadGetOrCreateCachedAllocation(hostPtr,
       bytes, /*copyHostToDeviceOnCreateOrResize=*/false, "update_device_bytes");
 
-  tileoff_CUDA_CHECK(TileOffloadMemcpyHtoD(allocation.ptr, hostPtr, bytes));
+  TILEOFF_CUDA_CHECK(TileOffloadMemcpyHtoD(allocation.ptr, hostPtr, bytes));
 
   if (TileOffloadDebugEnabled()) {
     std::fprintf(stderr,
@@ -3723,7 +3723,7 @@ extern "C" void __tileoff_update_device_bytes(void *hostPtr, int64_t bytesValue)
 }
 
 extern "C" void __tileoff_update_host_bytes(void *hostPtr, int64_t bytesValue) {
-  tileoff_RUNTIME_GUARD();
+  TILEOFF_RUNTIME_GUARD();
   TileOffloadCurrentContextGuard contextGuard;
   TileOffloadEnsureCurrentContext();
 
@@ -3769,7 +3769,7 @@ extern "C" void __tileoff_update_host_bytes(void *hostPtr, int64_t bytesValue) {
     std::abort();
   }
 
-  tileoff_CUDA_CHECK(TileOffloadMemcpyDtoH(hostPtr, it->second.ptr, bytes));
+  TILEOFF_CUDA_CHECK(TileOffloadMemcpyDtoH(hostPtr, it->second.ptr, bytes));
 
   if (TileOffloadDebugEnabled()) {
     std::fprintf(stderr,
@@ -3781,7 +3781,7 @@ extern "C" void __tileoff_update_host_bytes(void *hostPtr, int64_t bytesValue) {
 extern "C" void __tileoff_update_device_desc(void *hostPtr, int64_t elementBytes,
     int32_t rank, int64_t extent0, int64_t extent1, int64_t extent2,
     int64_t stride0, int64_t stride1, int64_t stride2) {
-  tileoff_RUNTIME_GUARD();
+  TILEOFF_RUNTIME_GUARD();
   TileOffloadCurrentContextGuard contextGuard;
   TileOffloadEnsureCurrentContext();
 
@@ -3809,7 +3809,7 @@ extern "C" void __tileoff_update_device_desc(void *hostPtr, int64_t elementBytes
   TileOffloadDeviceAllocation &allocation = TileOffloadGetOrCreateCachedAllocation(hostPtr,
       bytes, /*copyHostToDeviceOnCreateOrResize=*/false, "update_device_desc");
 
-  tileoff_CUDA_CHECK(TileOffloadMemcpyHtoD(allocation.ptr, hostPtr, bytes));
+  TILEOFF_CUDA_CHECK(TileOffloadMemcpyHtoD(allocation.ptr, hostPtr, bytes));
 
   if (TileOffloadDebugEnabled()) {
     std::fprintf(stderr,
@@ -3825,7 +3825,7 @@ extern "C" void __tileoff_update_device_desc(void *hostPtr, int64_t elementBytes
 extern "C" void __tileoff_update_host_desc(void *hostPtr, int64_t elementBytes,
     int32_t rank, int64_t extent0, int64_t extent1, int64_t extent2,
     int64_t stride0, int64_t stride1, int64_t stride2) {
-  tileoff_RUNTIME_GUARD();
+  TILEOFF_RUNTIME_GUARD();
   TileOffloadCurrentContextGuard contextGuard;
   TileOffloadEnsureCurrentContext();
 
@@ -3868,7 +3868,7 @@ extern "C" void __tileoff_update_host_desc(void *hostPtr, int64_t elementBytes,
     std::abort();
   }
 
-  tileoff_CUDA_CHECK(TileOffloadMemcpyDtoH(hostPtr, it->second.ptr, bytes));
+  TILEOFF_CUDA_CHECK(TileOffloadMemcpyDtoH(hostPtr, it->second.ptr, bytes));
 
   if (TileOffloadDebugEnabled()) {
     std::fprintf(stderr,
@@ -3882,7 +3882,7 @@ extern "C" void __tileoff_update_host_desc(void *hostPtr, int64_t elementBytes,
 }
 
 extern "C" void __tileoff_release_desc(void *hostPtr) {
-  tileoff_RUNTIME_GUARD();
+  TILEOFF_RUNTIME_GUARD();
   TileOffloadCurrentContextGuard contextGuard;
   TileOffloadEnsureCurrentContext();
 
@@ -3916,7 +3916,7 @@ extern "C" void __tileoff_release_desc(void *hostPtr) {
 
   TileOffloadSynchronizeActiveContext();
 
-  tileoff_CUDA_CHECK(cuMemFree(devicePtr));
+  TILEOFF_CUDA_CHECK(cuMemFree(devicePtr));
   cache.erase(it);
 
   if (TileOffloadDebugEnabled()) {
@@ -3929,7 +3929,7 @@ extern "C" void __tileoff_release_desc(void *hostPtr) {
 extern "C" void __tileoff_launch_nd_f32(int32_t kernelId, int32_t rank,
     int32_t blockX, int32_t blockY, int32_t blockZ, float *a, float *b,
     float *c, int32_t extentX, int32_t extentY, int32_t extentZ) {
-  tileoff_RUNTIME_GUARD();
+  TILEOFF_RUNTIME_GUARD();
   TileOffloadCurrentContextGuard contextGuard;
   TileOffloadEnsureCurrentContext();
 
@@ -3968,12 +3968,12 @@ extern "C" void __tileoff_launch_nd_f32(int32_t kernelId, int32_t rank,
   CUdeviceptr dB = 0;
   CUdeviceptr dC = 0;
 
-  tileoff_CUDA_CHECK(cuMemAlloc(&dA, numBytes));
-  tileoff_CUDA_CHECK(cuMemAlloc(&dB, numBytes));
-  tileoff_CUDA_CHECK(cuMemAlloc(&dC, numBytes));
+  TILEOFF_CUDA_CHECK(cuMemAlloc(&dA, numBytes));
+  TILEOFF_CUDA_CHECK(cuMemAlloc(&dB, numBytes));
+  TILEOFF_CUDA_CHECK(cuMemAlloc(&dC, numBytes));
 
-  tileoff_CUDA_CHECK(TileOffloadMemcpyHtoD(dA, a, numBytes));
-  tileoff_CUDA_CHECK(TileOffloadMemcpyHtoD(dB, b, numBytes));
+  TILEOFF_CUDA_CHECK(TileOffloadMemcpyHtoD(dA, a, numBytes));
+  TILEOFF_CUDA_CHECK(TileOffloadMemcpyHtoD(dB, b, numBytes));
 
   if (TileOffloadDebugEnabled()) {
     std::fprintf(stderr,
@@ -4017,7 +4017,7 @@ extern "C" void __tileoff_launch_nd_f32(int32_t kernelId, int32_t rank,
 
     TileOffloadValidateCudaBlockSize(fn, kernelId, cudaBlockX);
 
-    tileoff_CUDA_CHECK(cuLaunchKernel(fn, gridX, 1, 1, cudaBlockX, 1, 1, 0,
+    TILEOFF_CUDA_CHECK(cuLaunchKernel(fn, gridX, 1, 1, cudaBlockX, 1, 1, 0,
         TileOffloadActiveContextState().stream, args, nullptr));
     if (TileOffloadDebugEnabled()) {
       std::fprintf(stderr, "TileOffload: cuLaunchKernel rank1 returned\n");
@@ -4059,7 +4059,7 @@ extern "C" void __tileoff_launch_nd_f32(int32_t kernelId, int32_t rank,
 
     TileOffloadValidateCudaBlockSize(fn, kernelId, cudaBlockX);
 
-    tileoff_CUDA_CHECK(cuLaunchKernel(fn, gridX, gridY, 1, cudaBlockX, 1, 1, 0,
+    TILEOFF_CUDA_CHECK(cuLaunchKernel(fn, gridX, gridY, 1, cudaBlockX, 1, 1, 0,
         TileOffloadActiveContextState().stream, args, nullptr));
     if (TileOffloadDebugEnabled()) {
       std::fprintf(stderr, "TileOffload: cuLaunchKernel rank2 returned\n");
@@ -4086,16 +4086,16 @@ extern "C" void __tileoff_launch_nd_f32(int32_t kernelId, int32_t rank,
     std::fflush(stderr);
   }
 
-  tileoff_CUDA_CHECK(TileOffloadMemcpyDtoH(c, dC, numBytes));
+  TILEOFF_CUDA_CHECK(TileOffloadMemcpyDtoH(c, dC, numBytes));
 
   if (TileOffloadDebugEnabled()) {
     std::fprintf(stderr, "TileOffload: cuMemcpyDtoH returned\n");
     std::fflush(stderr);
   }
 
-  tileoff_CUDA_CHECK(cuMemFree(dA));
-  tileoff_CUDA_CHECK(cuMemFree(dB));
-  tileoff_CUDA_CHECK(cuMemFree(dC));
+  TILEOFF_CUDA_CHECK(cuMemFree(dA));
+  TILEOFF_CUDA_CHECK(cuMemFree(dB));
+  TILEOFF_CUDA_CHECK(cuMemFree(dC));
 }
 
 // -------------------------------------------------------------------------- //
@@ -4170,9 +4170,9 @@ extern "C" void __tileoff_begin_launch_v2(int32_t kernelId, int32_t rank,
     int32_t loopLowerZ, int32_t arrayCount, int32_t scalarCount) {
 
   // For profiling
-  tileoff_PROFILE_SCOPE("TileOffload.begin");
+  TILEOFF_PROFILE_SCOPE("TileOffload.begin");
 
-  tileoff_RUNTIME_GUARD();
+  TILEOFF_RUNTIME_GUARD();
   TileOffloadCurrentContextGuard contextGuard;
   TileOffloadEnsureCurrentContext();
 
@@ -4224,7 +4224,7 @@ extern "C" void __tileoff_bind_array_v2(int32_t slot, void *host, int64_t bytes,
     int64_t strideX, int64_t strideY, int64_t strideZ) {
 
   // For profiling
-  tileoff_PROFILE_SCOPE("TileOffload.bind_array");
+  TILEOFF_PROFILE_SCOPE("TileOffload.bind_array");
 
   // Binding state is thread-local; no registry or CUDA state is accessed.
   if (!TileOffloadPendingLaunchStateV2.active || slot < 0 ||
@@ -4254,7 +4254,7 @@ extern "C" void __tileoff_bind_array_v2(int32_t slot, void *host, int64_t bytes,
 template <typename T> static void TileOffloadBindScalarV2(int32_t slot, T value) {
 
   // For profiling
-  tileoff_PROFILE_SCOPE("TileOffload.bind_scalar");
+  TILEOFF_PROFILE_SCOPE("TileOffload.bind_scalar");
 
   // Binding state is thread-local; no registry or CUDA state is accessed.
   if (!TileOffloadPendingLaunchStateV2.active || slot < 0 ||
@@ -4273,20 +4273,20 @@ template <typename T> static void TileOffloadBindScalarV2(int32_t slot, T value)
   scalar.bound = true;
 }
 
-#define tileoff_DEFINE_SCALAR_BINDER(SUFFIX, TYPE) \
+#define TILEOFF_DEFINE_SCALAR_BINDER(SUFFIX, TYPE) \
   extern "C" void __tileoff_bind_scalar_##SUFFIX##_v2( \
       int32_t slot, TYPE value) { \
     TileOffloadBindScalarV2<TYPE>(slot, value); \
   }
 
-tileoff_DEFINE_SCALAR_BINDER(i8, int8_t)
-tileoff_DEFINE_SCALAR_BINDER(i16, int16_t)
-tileoff_DEFINE_SCALAR_BINDER(i32, int32_t)
-tileoff_DEFINE_SCALAR_BINDER(i64, int64_t)
-tileoff_DEFINE_SCALAR_BINDER(f32, float)
-tileoff_DEFINE_SCALAR_BINDER(f64, double)
+TILEOFF_DEFINE_SCALAR_BINDER(i8, int8_t)
+TILEOFF_DEFINE_SCALAR_BINDER(i16, int16_t)
+TILEOFF_DEFINE_SCALAR_BINDER(i32, int32_t)
+TILEOFF_DEFINE_SCALAR_BINDER(i64, int64_t)
+TILEOFF_DEFINE_SCALAR_BINDER(f32, float)
+TILEOFF_DEFINE_SCALAR_BINDER(f64, double)
 
-#undef tileoff_DEFINE_SCALAR_BINDER
+#undef TILEOFF_DEFINE_SCALAR_BINDER
 
 template <typename T>
 static void TileOffloadBindReductionResultAtV2(
@@ -4308,7 +4308,7 @@ static void TileOffloadBindReductionResultAtV2(
   result.bound = true;
 }
 
-#define tileoff_DEFINE_REDUCTION_RESULT_BINDER(SUFFIX, TYPE) \
+#define TILEOFF_DEFINE_REDUCTION_RESULT_BINDER(SUFFIX, TYPE) \
   extern "C" void __tileoff_bind_reduction_result_##SUFFIX##_v2( \
       TYPE *host, TYPE initialValue) { \
     TileOffloadBindReductionResultAtV2<TYPE>(0, host, initialValue); \
@@ -4318,14 +4318,14 @@ static void TileOffloadBindReductionResultAtV2(
     TileOffloadBindReductionResultAtV2<TYPE>(slot, host, initialValue); \
   }
 
-tileoff_DEFINE_REDUCTION_RESULT_BINDER(i8, int8_t)
-tileoff_DEFINE_REDUCTION_RESULT_BINDER(i16, int16_t)
-tileoff_DEFINE_REDUCTION_RESULT_BINDER(i32, int32_t)
-tileoff_DEFINE_REDUCTION_RESULT_BINDER(i64, int64_t)
-tileoff_DEFINE_REDUCTION_RESULT_BINDER(f32, float)
-tileoff_DEFINE_REDUCTION_RESULT_BINDER(f64, double)
+TILEOFF_DEFINE_REDUCTION_RESULT_BINDER(i8, int8_t)
+TILEOFF_DEFINE_REDUCTION_RESULT_BINDER(i16, int16_t)
+TILEOFF_DEFINE_REDUCTION_RESULT_BINDER(i32, int32_t)
+TILEOFF_DEFINE_REDUCTION_RESULT_BINDER(i64, int64_t)
+TILEOFF_DEFINE_REDUCTION_RESULT_BINDER(f32, float)
+TILEOFF_DEFINE_REDUCTION_RESULT_BINDER(f64, double)
 
-#undef tileoff_DEFINE_REDUCTION_RESULT_BINDER
+#undef TILEOFF_DEFINE_REDUCTION_RESULT_BINDER
 
 extern "C" void __tileoff_launch_reduce_f32_v2(
     int32_t, int32_t, int32_t, float *, float *, float *, float, int32_t);
@@ -4527,7 +4527,7 @@ static void TileOffloadCommitReductionTypedV2(
         pending.kernelId, pending.arrays.size(), pending.scalars.size(), gridX,
         pending.extent[0]);
   }
-  tileoff_CUDA_CHECK(cuLaunchKernel(function, gridX, 1, 1, cudaBlockX, 1, 1,
+  TILEOFF_CUDA_CHECK(cuLaunchKernel(function, gridX, 1, 1, cudaBlockX, 1, 1,
       dynamicSharedBytes, TileOffloadActiveContextState().stream, arguments.data(),
       nullptr));
   ++workspace.primaryLaunches;
@@ -4537,7 +4537,7 @@ static void TileOffloadCommitReductionTypedV2(
           desc, workspace, dPartials, gridX, &reducedValue)) {
     TileOffloadWaitForRuntimeStream();
     std::vector<T> partials(gridX);
-    tileoff_CUDA_CHECK(TileOffloadMemcpyDtoH(partials.data(), dPartials, partialBytes));
+    TILEOFF_CUDA_CHECK(TileOffloadMemcpyDtoH(partials.data(), dPartials, partialBytes));
     for (T value : partials)
       reducedValue =
           TileOffloadApplyReduction(desc->reductionOp, reducedValue, value);
@@ -4727,7 +4727,7 @@ static void TileOffloadCommitMultiReductionTypedV2(
         pending.reductionResults.size(), gridX, gridY, pending.extent[0],
         pending.extent[1]);
   }
-  tileoff_CUDA_CHECK(cuLaunchKernel(function, gridX, gridY, 1, cudaBlockX, 1, 1,
+  TILEOFF_CUDA_CHECK(cuLaunchKernel(function, gridX, gridY, 1, cudaBlockX, 1, 1,
       dynamicSharedBytes, TileOffloadActiveContextState().stream, arguments.data(),
       nullptr));
   ++workspace.primaryLaunches;
@@ -4749,18 +4749,18 @@ static void TileOffloadCommitMultiReductionTypedV2(
               desc, workspace, segment, programCount, &finalValue))
         std::abort(); // A nonnegative stage id must resolve or diagnose.
       // Capture the value before the next output reuses the scratch buffer.
-      tileoff_CUDA_CHECK(cuMemcpyDtoDAsync(packed + index * sizeof(T), finalValue,
+      TILEOFF_CUDA_CHECK(cuMemcpyDtoDAsync(packed + index * sizeof(T), finalValue,
           sizeof(T), TileOffloadActiveContextState().stream));
     }
     TileOffloadWaitForRuntimeStream();
-    tileoff_CUDA_CHECK(TileOffloadMemcpyDtoH(reduced.data(), packed, resultBytes));
+    TILEOFF_CUDA_CHECK(TileOffloadMemcpyDtoH(reduced.data(), packed, resultBytes));
   } else {
     // Keep the original per-output arithmetic order in the host fallback.
     std::size_t count = TileOffloadCheckedMul(
         resultCount, programCountSize, "multi-reduction host partial count");
     std::vector<T> partials(count);
     TileOffloadWaitForRuntimeStream();
-    tileoff_CUDA_CHECK(TileOffloadMemcpyDtoH(partials.data(), dPartials,
+    TILEOFF_CUDA_CHECK(TileOffloadMemcpyDtoH(partials.data(), dPartials,
         TileOffloadCheckedMul(
             count, sizeof(T), "multi-reduction host partial bytes")));
     for (std::size_t index = 0; index < resultCount; ++index)
@@ -4814,7 +4814,7 @@ static bool TileOffloadTryCommitReductionLaunchV2(
       std::abort();
     }
 
-#define tileoff_DISPATCH_REDUCTION(TYPE_NAME, TYPE) \
+#define TILEOFF_DISPATCH_REDUCTION(TYPE_NAME, TYPE) \
   if (pointerType == "ptr<" TYPE_NAME ">" && resultBytes == sizeof(TYPE)) { \
     if (isMultiReduction) \
       TileOffloadCommitMultiReductionTypedV2<TYPE>(desc, pending); \
@@ -4823,14 +4823,14 @@ static bool TileOffloadTryCommitReductionLaunchV2(
     return true; \
   }
 
-  tileoff_DISPATCH_REDUCTION("i8", int8_t)
-  tileoff_DISPATCH_REDUCTION("i16", int16_t)
-  tileoff_DISPATCH_REDUCTION("i32", int32_t)
-  tileoff_DISPATCH_REDUCTION("i64", int64_t)
-  tileoff_DISPATCH_REDUCTION("f32", float)
-  tileoff_DISPATCH_REDUCTION("f64", double)
+  TILEOFF_DISPATCH_REDUCTION("i8", int8_t)
+  TILEOFF_DISPATCH_REDUCTION("i16", int16_t)
+  TILEOFF_DISPATCH_REDUCTION("i32", int32_t)
+  TILEOFF_DISPATCH_REDUCTION("i64", int64_t)
+  TILEOFF_DISPATCH_REDUCTION("f32", float)
+  TILEOFF_DISPATCH_REDUCTION("f64", double)
 
-#undef tileoff_DISPATCH_REDUCTION
+#undef TILEOFF_DISPATCH_REDUCTION
 
   std::fprintf(stderr,
       "TileOffload error: v2 reduction result type mismatch for kernel id %d\n",
@@ -4911,17 +4911,17 @@ static int32_t TileOffloadCheckedI32Layout(int64_t value, const char *what) {
 extern "C" void __tileoff_commit_launch_v2() {
 
   // For profiling
-  tileoff_PROFILE_SCOPE("TileOffload.commit");
+  TILEOFF_PROFILE_SCOPE("TileOffload.commit");
 
-  tileoff_RUNTIME_GUARD();
+  TILEOFF_RUNTIME_GUARD();
   TileOffloadCurrentContextGuard contextGuard;
 
   // For profiling
-  tileoff_PROFILE_PUSH("TileOffload.context");
+  TILEOFF_PROFILE_PUSH("TileOffload.context");
   TileOffloadEnsureCurrentContext();
 
   // For profiling
-  tileoff_PROFILE_POP();
+  TILEOFF_PROFILE_POP();
 
   TileOffloadPendingLaunchV2 &pending = TileOffloadPendingLaunchStateV2;
   if (!pending.active || pending.context != TileOffloadActiveContext) {
@@ -5055,7 +5055,7 @@ extern "C" void __tileoff_commit_launch_v2() {
   TileOffloadValidateSupportedHiddenPtrArgCount(pending.kernelId, desc);
 
   // For profiling
-  tileoff_PROFILE_PUSH("TileOffload.buffers");
+  TILEOFF_PROFILE_PUSH("TileOffload.buffers");
 
   auto &deviceArgs = pending.deviceArgs;
   auto &devicePointers = pending.devicePointers;
@@ -5069,10 +5069,10 @@ extern "C" void __tileoff_commit_launch_v2() {
     deviceArgs.push_back(device);
   }
   // For profiling
-  tileoff_PROFILE_POP();
+  TILEOFF_PROFILE_POP();
 
   // For profiling
-  tileoff_PROFILE_PUSH("TileOffload.arguments");
+  TILEOFF_PROFILE_PUSH("TileOffload.arguments");
   auto &parameterValues = pending.parameterValues;
   parameterValues.assign(desc->parameters.size(), 0);
   auto &arguments = pending.arguments;
@@ -5170,10 +5170,10 @@ extern "C" void __tileoff_commit_launch_v2() {
         pending.extent[1], pending.loopLower[0], pending.loopLower[1]);
   }
   // For profiling
-  tileoff_PROFILE_POP();
+  TILEOFF_PROFILE_POP();
 
   // For profiling
-  tileoff_PROFILE_PUSH("TileOffload.launch");
+  TILEOFF_PROFILE_PUSH("TileOffload.launch");
   unsigned sharedBytes = 0;
   if (desc->isMatmul) {
     bool f64 = desc->parameters.front().type == "ptr<f64>";
@@ -5183,27 +5183,27 @@ extern "C" void __tileoff_commit_launch_v2() {
                             pending.block[1], pending.block[2]);
   }
   TileOffloadConfigureDynamicSharedMemory(function, pending.kernelId, sharedBytes);
-  tileoff_CUDA_CHECK(
+  TILEOFF_CUDA_CHECK(
       cuLaunchKernel(function, gridX, gridY, 1, cudaBlockX, 1, 1, sharedBytes,
           TileOffloadActiveContextState().stream, arguments.data(), nullptr));
   TileOffloadCompleteArrayLaunch(std::all_of(
       deviceArgs.begin(), deviceArgs.end(), [](const TileOffloadDeviceArg &arg) {
-        return arg.cached && arg.target == tileoff_PACK_TARGET_DEVICE;
+        return arg.cached && arg.target == TILEOFF_PACK_TARGET_DEVICE;
       }));
   // For profiling
-  tileoff_PROFILE_POP();
+  TILEOFF_PROFILE_POP();
 
   // For profiling
-  tileoff_PROFILE_PUSH("TileOffload.completion");
+  TILEOFF_PROFILE_PUSH("TileOffload.completion");
   for (std::size_t slot = 0; slot < pending.arrays.size(); ++slot) {
     TileOffloadPendingArrayV2 &array = pending.arrays[slot];
-    if ((array.flags & 2) && deviceArgs[slot].target == tileoff_PACK_TARGET_HOST)
+    if ((array.flags & 2) && deviceArgs[slot].target == TILEOFF_PACK_TARGET_HOST)
       TileOffloadCopyBackWriteBuffer(array.host, deviceArgs[slot], array.bytes);
   }
   for (const TileOffloadDeviceArg &device : deviceArgs)
     TileOffloadReleaseDeviceArg(device);
   // For profiling
-  tileoff_PROFILE_POP();
+  TILEOFF_PROFILE_POP();
   TileOffloadClearPendingLaunchV2();
 }
 
@@ -5249,7 +5249,7 @@ void __tileoff_launch_v3(const TileOffloadLaunchV3 *launch);
 #endif /* TILEOFFLOAD_LAUNCH_V3_H */
 
 extern "C" void __tileoff_launch_v3(const TileOffloadLaunchV3 *launch) {
-  tileoff_PROFILE_SCOPE("TileOffload.launch_v3");
+  TILEOFF_PROFILE_SCOPE("TileOffload.launch_v3");
   if (!launch || launch->version != 3 ||
       launch->structBytes != sizeof(TileOffloadLaunchV3) || launch->arrayCount <= 0 ||
       launch->scalarCount < 0 || launch->resultCount < 0 || !launch->arrays ||
@@ -5259,7 +5259,7 @@ extern "C" void __tileoff_launch_v3(const TileOffloadLaunchV3 *launch) {
         stderr, "TileOffload error: invalid single-call launch v3 descriptor\n");
     std::abort();
   }
-  tileoff_RUNTIME_GUARD();
+  TILEOFF_RUNTIME_GUARD();
   TileOffloadCurrentContextGuard contextGuard;
   TileOffloadEnsureCurrentContext();
   __tileoff_begin_launch_v2(launch->kernelId, launch->rank, launch->block[0],
@@ -5318,7 +5318,7 @@ extern "C" void __tileoff_launch_nd_f32_s1(int32_t kernelId, int32_t rank,
     int32_t blockX, int32_t blockY, int32_t blockZ, float *a, float *b,
     float *c, float scalar0, int32_t extentX, int32_t extentY,
     int32_t extentZ) {
-  tileoff_RUNTIME_GUARD();
+  TILEOFF_RUNTIME_GUARD();
   TileOffloadCurrentContextGuard contextGuard;
   TileOffloadEnsureCurrentContext();
 
@@ -5351,12 +5351,12 @@ extern "C" void __tileoff_launch_nd_f32_s1(int32_t kernelId, int32_t rank,
   CUdeviceptr dB = 0;
   CUdeviceptr dC = 0;
 
-  tileoff_CUDA_CHECK(cuMemAlloc(&dA, numBytes));
-  tileoff_CUDA_CHECK(cuMemAlloc(&dB, numBytes));
-  tileoff_CUDA_CHECK(cuMemAlloc(&dC, numBytes));
+  TILEOFF_CUDA_CHECK(cuMemAlloc(&dA, numBytes));
+  TILEOFF_CUDA_CHECK(cuMemAlloc(&dB, numBytes));
+  TILEOFF_CUDA_CHECK(cuMemAlloc(&dC, numBytes));
 
-  tileoff_CUDA_CHECK(TileOffloadMemcpyHtoD(dA, a, numBytes));
-  tileoff_CUDA_CHECK(TileOffloadMemcpyHtoD(dB, b, numBytes));
+  TILEOFF_CUDA_CHECK(TileOffloadMemcpyHtoD(dA, a, numBytes));
+  TILEOFF_CUDA_CHECK(TileOffloadMemcpyHtoD(dB, b, numBytes));
 
   TileOffloadHiddenTritonArgs hidden;
 
@@ -5400,7 +5400,7 @@ extern "C" void __tileoff_launch_nd_f32_s1(int32_t kernelId, int32_t rank,
 
   TileOffloadValidateCudaBlockSize(fn, kernelId, cudaBlockX);
 
-  tileoff_CUDA_CHECK(cuLaunchKernel(fn, gridX, 1, 1, cudaBlockX, 1, 1, 0,
+  TILEOFF_CUDA_CHECK(cuLaunchKernel(fn, gridX, 1, 1, cudaBlockX, 1, 1, 0,
       TileOffloadActiveContextState().stream, args, nullptr));
 
   if (TileOffloadDebugEnabled()) {
@@ -5410,18 +5410,18 @@ extern "C" void __tileoff_launch_nd_f32_s1(int32_t kernelId, int32_t rank,
 
   TileOffloadWaitForRuntimeStream();
 
-  tileoff_CUDA_CHECK(TileOffloadMemcpyDtoH(c, dC, numBytes));
+  TILEOFF_CUDA_CHECK(TileOffloadMemcpyDtoH(c, dC, numBytes));
 
-  tileoff_CUDA_CHECK(cuMemFree(dA));
-  tileoff_CUDA_CHECK(cuMemFree(dB));
-  tileoff_CUDA_CHECK(cuMemFree(dC));
+  TILEOFF_CUDA_CHECK(cuMemFree(dA));
+  TILEOFF_CUDA_CHECK(cuMemFree(dB));
+  TILEOFF_CUDA_CHECK(cuMemFree(dC));
 }
 
 extern "C" void __tileoff_launch_nd_f32_s2(int32_t kernelId, int32_t rank,
     int32_t blockX, int32_t blockY, int32_t blockZ, float *a, float *b,
     float *c, float scalar0, float scalar1, int32_t extentX, int32_t extentY,
     int32_t extentZ) {
-  tileoff_RUNTIME_GUARD();
+  TILEOFF_RUNTIME_GUARD();
   TileOffloadCurrentContextGuard contextGuard;
   TileOffloadEnsureCurrentContext();
 
@@ -5454,12 +5454,12 @@ extern "C" void __tileoff_launch_nd_f32_s2(int32_t kernelId, int32_t rank,
   CUdeviceptr dB = 0;
   CUdeviceptr dC = 0;
 
-  tileoff_CUDA_CHECK(cuMemAlloc(&dA, numBytes));
-  tileoff_CUDA_CHECK(cuMemAlloc(&dB, numBytes));
-  tileoff_CUDA_CHECK(cuMemAlloc(&dC, numBytes));
+  TILEOFF_CUDA_CHECK(cuMemAlloc(&dA, numBytes));
+  TILEOFF_CUDA_CHECK(cuMemAlloc(&dB, numBytes));
+  TILEOFF_CUDA_CHECK(cuMemAlloc(&dC, numBytes));
 
-  tileoff_CUDA_CHECK(TileOffloadMemcpyHtoD(dA, a, numBytes));
-  tileoff_CUDA_CHECK(TileOffloadMemcpyHtoD(dB, b, numBytes));
+  TILEOFF_CUDA_CHECK(TileOffloadMemcpyHtoD(dA, a, numBytes));
+  TILEOFF_CUDA_CHECK(TileOffloadMemcpyHtoD(dB, b, numBytes));
 
   TileOffloadValidateSupportedHiddenPtrArgCount(kernelId);
 
@@ -5506,7 +5506,7 @@ extern "C" void __tileoff_launch_nd_f32_s2(int32_t kernelId, int32_t rank,
 
   TileOffloadValidateCudaBlockSize(fn, kernelId, cudaBlockX);
 
-  tileoff_CUDA_CHECK(cuLaunchKernel(fn, gridX, 1, 1, cudaBlockX, 1, 1, 0,
+  TILEOFF_CUDA_CHECK(cuLaunchKernel(fn, gridX, 1, 1, cudaBlockX, 1, 1, 0,
       TileOffloadActiveContextState().stream, args, nullptr));
 
   if (TileOffloadDebugEnabled()) {
@@ -5516,11 +5516,11 @@ extern "C" void __tileoff_launch_nd_f32_s2(int32_t kernelId, int32_t rank,
 
   TileOffloadWaitForRuntimeStream();
 
-  tileoff_CUDA_CHECK(TileOffloadMemcpyDtoH(c, dC, numBytes));
+  TILEOFF_CUDA_CHECK(TileOffloadMemcpyDtoH(c, dC, numBytes));
 
-  tileoff_CUDA_CHECK(cuMemFree(dA));
-  tileoff_CUDA_CHECK(cuMemFree(dB));
-  tileoff_CUDA_CHECK(cuMemFree(dC));
+  TILEOFF_CUDA_CHECK(cuMemFree(dA));
+  TILEOFF_CUDA_CHECK(cuMemFree(dB));
+  TILEOFF_CUDA_CHECK(cuMemFree(dC));
 }
 
 // TileOffload generic f32 launch ABI v1.
@@ -5543,7 +5543,7 @@ extern "C" void __tileoff_launch_f32_v1(int32_t kernelId, int32_t rank,
     int32_t numScalars, float *read0, float *read1, float *read2, float *write,
     float scalar0, float scalar1, float scalar2, int32_t extentX,
     int32_t extentY, int32_t extentZ) {
-  tileoff_RUNTIME_GUARD();
+  TILEOFF_RUNTIME_GUARD();
   TileOffloadCurrentContextGuard contextGuard;
   TileOffloadEnsureCurrentContext();
 
@@ -5645,11 +5645,11 @@ extern "C" void __tileoff_launch_f32_v1(int32_t kernelId, int32_t rank,
 
   int32_t read1Target = numReadArrays >= 2
       ? TileOffloadEffectivePackTargetForSlot(desc, read1Slot, read1)
-      : tileoff_PACK_TARGET_HOST;
+      : TILEOFF_PACK_TARGET_HOST;
 
   int32_t read2Target = numReadArrays >= 3
       ? TileOffloadEffectivePackTargetForSlot(desc, read2Slot, read2)
-      : tileoff_PACK_TARGET_HOST;
+      : TILEOFF_PACK_TARGET_HOST;
 
   int32_t writeTarget =
       TileOffloadEffectiveWriteTargetForSlot(desc, writeSlot, write);
@@ -5745,12 +5745,12 @@ extern "C" void __tileoff_launch_f32_v1(int32_t kernelId, int32_t rank,
 
   TileOffloadValidateCudaBlockSize(fn, kernelId, cudaBlockX);
 
-  tileoff_CUDA_CHECK(cuLaunchKernel(fn, gridX, gridY, 1, cudaBlockX, 1, 1, 0,
+  TILEOFF_CUDA_CHECK(cuLaunchKernel(fn, gridX, gridY, 1, cudaBlockX, 1, 1, 0,
       TileOffloadActiveContextState().stream, args, nullptr));
 
   TileOffloadWaitForRuntimeStream();
 
-  if (writeDev.target == tileoff_PACK_TARGET_HOST) {
+  if (writeDev.target == TILEOFF_PACK_TARGET_HOST) {
     TileOffloadCopyBackWriteBuffer(write, writeDev, numBytes);
   } else {
     if (TileOffloadDebugEnabled()) {
@@ -5792,7 +5792,7 @@ extern "C" void __tileoff_launch_f64_v1(int32_t kernelId, int32_t rank,
     int32_t numScalars, double *read0, double *read1, double *read2,
     double *write, double scalar0, double scalar1, double scalar2,
     int32_t extentX, int32_t extentY, int32_t extentZ) {
-  tileoff_RUNTIME_GUARD();
+  TILEOFF_RUNTIME_GUARD();
   TileOffloadCurrentContextGuard contextGuard;
   TileOffloadEnsureCurrentContext();
 
@@ -5886,11 +5886,11 @@ extern "C" void __tileoff_launch_f64_v1(int32_t kernelId, int32_t rank,
 
   int32_t read1Target = numReadArrays >= 2
       ? TileOffloadEffectivePackTargetForSlot(desc, read1Slot, read1)
-      : tileoff_PACK_TARGET_HOST;
+      : TILEOFF_PACK_TARGET_HOST;
 
   int32_t read2Target = numReadArrays >= 3
       ? TileOffloadEffectivePackTargetForSlot(desc, read2Slot, read2)
-      : tileoff_PACK_TARGET_HOST;
+      : TILEOFF_PACK_TARGET_HOST;
 
   int32_t writeTarget =
       TileOffloadEffectiveWriteTargetForSlot(desc, writeSlot, write);
@@ -5969,12 +5969,12 @@ extern "C" void __tileoff_launch_f64_v1(int32_t kernelId, int32_t rank,
 
   TileOffloadValidateCudaBlockSize(fn, kernelId, cudaBlockX);
 
-  tileoff_CUDA_CHECK(cuLaunchKernel(fn, gridX, gridY, 1, cudaBlockX, 1, 1, 0,
+  TILEOFF_CUDA_CHECK(cuLaunchKernel(fn, gridX, gridY, 1, cudaBlockX, 1, 1, 0,
       TileOffloadActiveContextState().stream, args, nullptr));
 
   TileOffloadWaitForRuntimeStream();
 
-  if (writeDev.target == tileoff_PACK_TARGET_HOST) {
+  if (writeDev.target == TILEOFF_PACK_TARGET_HOST) {
     TileOffloadCopyBackWriteBuffer(write, writeDev, numBytes);
   } else {
     if (TileOffloadDebugEnabled()) {
@@ -6003,7 +6003,7 @@ static void TileOffloadLaunchIntegerV1(const char *abiName, const char *typeName
     Integer *read1, Integer *read2, Integer *write, Integer scalar0,
     Integer scalar1, Integer scalar2, int32_t extentX, int32_t extentY,
     int32_t extentZ) {
-  tileoff_RUNTIME_GUARD();
+  TILEOFF_RUNTIME_GUARD();
   TileOffloadCurrentContextGuard contextGuard;
   TileOffloadEnsureCurrentContext();
 
@@ -6090,10 +6090,10 @@ static void TileOffloadLaunchIntegerV1(const char *abiName, const char *typeName
   int32_t read0Target = TileOffloadEffectivePackTargetForSlot(desc, read0Slot, read0);
   int32_t read1Target = numReadArrays >= 2
       ? TileOffloadEffectivePackTargetForSlot(desc, read1Slot, read1)
-      : tileoff_PACK_TARGET_HOST;
+      : TILEOFF_PACK_TARGET_HOST;
   int32_t read2Target = numReadArrays >= 3
       ? TileOffloadEffectivePackTargetForSlot(desc, read2Slot, read2)
-      : tileoff_PACK_TARGET_HOST;
+      : TILEOFF_PACK_TARGET_HOST;
   int32_t writeTarget =
       TileOffloadEffectiveWriteTargetForSlot(desc, writeSlot, write);
 
@@ -6157,11 +6157,11 @@ static void TileOffloadLaunchIntegerV1(const char *abiName, const char *typeName
   }
 
   TileOffloadValidateCudaBlockSize(fn, kernelId, cudaBlockX);
-  tileoff_CUDA_CHECK(cuLaunchKernel(fn, gridX, gridY, 1, cudaBlockX, 1, 1, 0,
+  TILEOFF_CUDA_CHECK(cuLaunchKernel(fn, gridX, gridY, 1, cudaBlockX, 1, 1, 0,
       TileOffloadActiveContextState().stream, args, nullptr));
   TileOffloadWaitForRuntimeStream();
 
-  if (writeDev.target == tileoff_PACK_TARGET_HOST) {
+  if (writeDev.target == TILEOFF_PACK_TARGET_HOST) {
     TileOffloadCopyBackWriteBuffer(write, writeDev, numBytes);
   } else if (TileOffloadDebugEnabled()) {
     std::fprintf(stderr,
@@ -6178,7 +6178,7 @@ static void TileOffloadLaunchIntegerV1(const char *abiName, const char *typeName
   TileOffloadReleaseDeviceArg(writeDev);
 }
 
-#define tileoff_DEFINE_INTEGER_LAUNCH(BITS, TYPE) \
+#define TILEOFF_DEFINE_INTEGER_LAUNCH(BITS, TYPE) \
   extern "C" void __tileoff_launch_i##BITS##_v1(int32_t kernelId, int32_t rank, \
       int32_t blockX, int32_t blockY, int32_t blockZ, int32_t numReadArrays, \
       int32_t numScalars, TYPE *read0, TYPE *read1, TYPE *read2, TYPE *write, \
@@ -6190,17 +6190,17 @@ static void TileOffloadLaunchIntegerV1(const char *abiName, const char *typeName
         extentY, extentZ); \
   }
 
-tileoff_DEFINE_INTEGER_LAUNCH(8, int8_t)
-tileoff_DEFINE_INTEGER_LAUNCH(16, int16_t)
-tileoff_DEFINE_INTEGER_LAUNCH(32, int32_t)
-tileoff_DEFINE_INTEGER_LAUNCH(64, int64_t)
+TILEOFF_DEFINE_INTEGER_LAUNCH(8, int8_t)
+TILEOFF_DEFINE_INTEGER_LAUNCH(16, int16_t)
+TILEOFF_DEFINE_INTEGER_LAUNCH(32, int32_t)
+TILEOFF_DEFINE_INTEGER_LAUNCH(64, int64_t)
 
-#undef tileoff_DEFINE_INTEGER_LAUNCH
+#undef TILEOFF_DEFINE_INTEGER_LAUNCH
 
 extern "C" void __tileoff_launch_matmul_f32_v1(int32_t kernelId, int32_t blockX,
     int32_t blockY, int32_t blockK, float *a, float *b, float *c, int32_t n,
     int32_t m, int32_t k) {
-  tileoff_RUNTIME_GUARD();
+  TILEOFF_RUNTIME_GUARD();
   TileOffloadCurrentContextGuard contextGuard;
   TileOffloadEnsureCurrentContext();
 
@@ -6327,15 +6327,15 @@ extern "C" void __tileoff_launch_matmul_f32_v1(int32_t kernelId, int32_t blockX,
   TileOffloadValidateCudaBlockSize(fn, kernelId, cudaBlockX);
   TileOffloadConfigureDynamicSharedMemory(fn, kernelId, dynamicSharedBytes);
 
-  tileoff_CUDA_CHECK(cuLaunchKernel(fn, gridX, gridY, gridZ, cudaBlockX, 1, 1,
+  TILEOFF_CUDA_CHECK(cuLaunchKernel(fn, gridX, gridY, gridZ, cudaBlockX, 1, 1,
       dynamicSharedBytes, TileOffloadActiveContextState().stream, args, nullptr));
 
   TileOffloadCompleteArrayLaunch(aDev.cached && bDev.cached && cDev.cached &&
-      aDev.target == tileoff_PACK_TARGET_DEVICE &&
-      bDev.target == tileoff_PACK_TARGET_DEVICE &&
-      cDev.target == tileoff_PACK_TARGET_DEVICE);
+      aDev.target == TILEOFF_PACK_TARGET_DEVICE &&
+      bDev.target == TILEOFF_PACK_TARGET_DEVICE &&
+      cDev.target == TILEOFF_PACK_TARGET_DEVICE);
 
-  if (cDev.target == tileoff_PACK_TARGET_HOST) {
+  if (cDev.target == TILEOFF_PACK_TARGET_HOST) {
     TileOffloadCopyBackWriteBuffer(c, cDev, bytesC);
   } else {
     if (TileOffloadDebugEnabled()) {
@@ -6354,7 +6354,7 @@ extern "C" void __tileoff_launch_matmul_f32_v1(int32_t kernelId, int32_t blockX,
 extern "C" void __tileoff_launch_matmul_f64_v1(int32_t kernelId, int32_t blockX,
     int32_t blockY, int32_t blockK, double *a, double *b, double *c, int32_t n,
     int32_t m, int32_t k) {
-  tileoff_RUNTIME_GUARD();
+  TILEOFF_RUNTIME_GUARD();
   TileOffloadCurrentContextGuard contextGuard;
   TileOffloadEnsureCurrentContext();
 
@@ -6476,15 +6476,15 @@ extern "C" void __tileoff_launch_matmul_f64_v1(int32_t kernelId, int32_t blockX,
   TileOffloadValidateCudaBlockSize(fn, kernelId, cudaBlockX);
   TileOffloadConfigureDynamicSharedMemory(fn, kernelId, dynamicSharedBytes);
 
-  tileoff_CUDA_CHECK(cuLaunchKernel(fn, gridX, gridY, gridZ, cudaBlockX, 1, 1,
+  TILEOFF_CUDA_CHECK(cuLaunchKernel(fn, gridX, gridY, gridZ, cudaBlockX, 1, 1,
       dynamicSharedBytes, TileOffloadActiveContextState().stream, args, nullptr));
 
   TileOffloadCompleteArrayLaunch(aDev.cached && bDev.cached && cDev.cached &&
-      aDev.target == tileoff_PACK_TARGET_DEVICE &&
-      bDev.target == tileoff_PACK_TARGET_DEVICE &&
-      cDev.target == tileoff_PACK_TARGET_DEVICE);
+      aDev.target == TILEOFF_PACK_TARGET_DEVICE &&
+      bDev.target == TILEOFF_PACK_TARGET_DEVICE &&
+      cDev.target == TILEOFF_PACK_TARGET_DEVICE);
 
-  if (cDev.target == tileoff_PACK_TARGET_HOST) {
+  if (cDev.target == TILEOFF_PACK_TARGET_HOST) {
     TileOffloadCopyBackWriteBuffer(c, cDev, bytesC);
   } else {
     if (TileOffloadDebugEnabled()) {
@@ -6525,11 +6525,11 @@ static CUdeviceptr TileOffloadReserveReductionBuffer(
   std::size_t oldBytes = allocation.bytes;
   if (allocation.ptr) {
     TileOffloadSynchronizeActiveContext();
-    tileoff_CUDA_CHECK(cuMemFree(allocation.ptr));
+    TILEOFF_CUDA_CHECK(cuMemFree(allocation.ptr));
   }
 
   allocation = {};
-  tileoff_CUDA_CHECK(cuMemAlloc(&allocation.ptr, requiredBytes));
+  TILEOFF_CUDA_CHECK(cuMemAlloc(&allocation.ptr, requiredBytes));
   allocation.bytes = requiredBytes;
   ++stats.allocations;
   if (oldBytes != 0)
@@ -6708,7 +6708,7 @@ static bool TileOffloadEnqueueReductionOnDevice(const TileOffloadKernelDesc *pri
     TileOffloadConfigureDynamicSharedMemory(
         stageFn, stageKernelId, dynamicSharedBytes);
 
-    tileoff_CUDA_CHECK(cuLaunchKernel(stageFn, outputCount, 1, 1, stageCudaBlockX,
+    TILEOFF_CUDA_CHECK(cuLaunchKernel(stageFn, outputCount, 1, 1, stageCudaBlockX,
         1, 1, dynamicSharedBytes, TileOffloadActiveContextState().stream, args,
         nullptr));
     ++workspace.stageLaunches;
@@ -6733,14 +6733,14 @@ static bool TileOffloadFinalizeReductionOnDevice(const TileOffloadKernelDesc *de
           desc, workspace, partials, count, &deviceResult))
     return false;
   TileOffloadWaitForRuntimeStream();
-  tileoff_CUDA_CHECK(TileOffloadMemcpyDtoH(result, deviceResult, sizeof(Real)));
+  TILEOFF_CUDA_CHECK(TileOffloadMemcpyDtoH(result, deviceResult, sizeof(Real)));
   return true;
 }
 
 extern "C" void __tileoff_launch_reduce_f32_v2(int32_t kernelId, int32_t blockX,
     int32_t numReadArrays, float *read0, float *read1, float *result,
     float initialValue, int32_t extentX) {
-  tileoff_RUNTIME_GUARD();
+  TILEOFF_RUNTIME_GUARD();
   TileOffloadCurrentContextGuard contextGuard;
   TileOffloadEnsureCurrentContext();
 
@@ -6781,7 +6781,7 @@ extern "C" void __tileoff_launch_reduce_f32_v2(int32_t kernelId, int32_t blockX,
   int32_t read0Target = TileOffloadEffectivePackTargetForSlot(desc, 0, read0);
   int32_t read1Target = numReadArrays >= 2
       ? TileOffloadEffectivePackTargetForSlot(desc, 1, read1)
-      : tileoff_PACK_TARGET_HOST;
+      : TILEOFF_PACK_TARGET_HOST;
 
   TileOffloadDeviceArg read0Dev =
       TileOffloadPrepareReadBuffer(read0, bytes, read0Target, 0);
@@ -6819,7 +6819,7 @@ extern "C" void __tileoff_launch_reduce_f32_v2(int32_t kernelId, int32_t blockX,
 
   TileOffloadConfigureDynamicSharedMemory(fn, kernelId, dynamicSharedBytes);
 
-  tileoff_CUDA_CHECK(cuLaunchKernel(fn, gridX, 1, 1, cudaBlockX, 1, 1,
+  TILEOFF_CUDA_CHECK(cuLaunchKernel(fn, gridX, 1, 1, cudaBlockX, 1, 1,
       dynamicSharedBytes, TileOffloadActiveContextState().stream, args, nullptr));
   ++workspace.primaryLaunches;
 
@@ -6830,7 +6830,7 @@ extern "C" void __tileoff_launch_reduce_f32_v2(int32_t kernelId, int32_t blockX,
     TileOffloadWaitForRuntimeStream();
 
     std::vector<float> partials(gridX);
-    tileoff_CUDA_CHECK(TileOffloadMemcpyDtoH(partials.data(), dPartials, partialBytes));
+    TILEOFF_CUDA_CHECK(TileOffloadMemcpyDtoH(partials.data(), dPartials, partialBytes));
 
     for (float value : partials)
       reducedValue =
@@ -6847,7 +6847,7 @@ extern "C" void __tileoff_launch_reduce_f32_v2(int32_t kernelId, int32_t blockX,
 extern "C" void __tileoff_launch_reduce_f64_v2(int32_t kernelId, int32_t blockX,
     int32_t numReadArrays, double *read0, double *read1, double *result,
     double initialValue, int32_t extentX) {
-  tileoff_RUNTIME_GUARD();
+  TILEOFF_RUNTIME_GUARD();
   TileOffloadCurrentContextGuard contextGuard;
   TileOffloadEnsureCurrentContext();
 
@@ -6888,7 +6888,7 @@ extern "C" void __tileoff_launch_reduce_f64_v2(int32_t kernelId, int32_t blockX,
   int32_t read0Target = TileOffloadEffectivePackTargetForSlot(desc, 0, read0);
   int32_t read1Target = numReadArrays >= 2
       ? TileOffloadEffectivePackTargetForSlot(desc, 1, read1)
-      : tileoff_PACK_TARGET_HOST;
+      : TILEOFF_PACK_TARGET_HOST;
 
   TileOffloadDeviceArg read0Dev =
       TileOffloadPrepareReadBuffer(read0, bytes, read0Target, 0);
@@ -6927,7 +6927,7 @@ extern "C" void __tileoff_launch_reduce_f64_v2(int32_t kernelId, int32_t blockX,
 
   TileOffloadConfigureDynamicSharedMemory(fn, kernelId, dynamicSharedBytes);
 
-  tileoff_CUDA_CHECK(cuLaunchKernel(fn, gridX, 1, 1, cudaBlockX, 1, 1,
+  TILEOFF_CUDA_CHECK(cuLaunchKernel(fn, gridX, 1, 1, cudaBlockX, 1, 1,
       dynamicSharedBytes, TileOffloadActiveContextState().stream, args, nullptr));
   ++workspace.primaryLaunches;
 
@@ -6938,7 +6938,7 @@ extern "C" void __tileoff_launch_reduce_f64_v2(int32_t kernelId, int32_t blockX,
     TileOffloadWaitForRuntimeStream();
 
     std::vector<double> partials(gridX);
-    tileoff_CUDA_CHECK(TileOffloadMemcpyDtoH(partials.data(), dPartials, partialBytes));
+    TILEOFF_CUDA_CHECK(TileOffloadMemcpyDtoH(partials.data(), dPartials, partialBytes));
 
     for (double value : partials)
       reducedValue =
@@ -6957,7 +6957,7 @@ static void TileOffloadLaunchReduceIntegerV2(const char *abiName,
     const char *typeName, int32_t kernelId, int32_t blockX,
     int32_t numReadArrays, Integer *read0, Integer *read1, Integer *result,
     Integer initialValue, int32_t extentX) {
-  tileoff_RUNTIME_GUARD();
+  TILEOFF_RUNTIME_GUARD();
   TileOffloadCurrentContextGuard contextGuard;
   TileOffloadEnsureCurrentContext();
 
@@ -6995,7 +6995,7 @@ static void TileOffloadLaunchReduceIntegerV2(const char *abiName,
   int32_t read0Target = TileOffloadEffectivePackTargetForSlot(desc, 0, read0);
   int32_t read1Target = numReadArrays >= 2
       ? TileOffloadEffectivePackTargetForSlot(desc, 1, read1)
-      : tileoff_PACK_TARGET_HOST;
+      : TILEOFF_PACK_TARGET_HOST;
 
   TileOffloadDeviceArg read0Dev =
       TileOffloadPrepareReadBuffer(read0, bytes, read0Target, 0);
@@ -7028,7 +7028,7 @@ static void TileOffloadLaunchReduceIntegerV2(const char *abiName,
 
   TileOffloadConfigureDynamicSharedMemory(fn, kernelId, dynamicSharedBytes);
 
-  tileoff_CUDA_CHECK(cuLaunchKernel(fn, gridX, 1, 1, cudaBlockX, 1, 1,
+  TILEOFF_CUDA_CHECK(cuLaunchKernel(fn, gridX, 1, 1, cudaBlockX, 1, 1,
       dynamicSharedBytes, TileOffloadActiveContextState().stream, args, nullptr));
   ++workspace.primaryLaunches;
 
@@ -7038,7 +7038,7 @@ static void TileOffloadLaunchReduceIntegerV2(const char *abiName,
     TileOffloadWaitForRuntimeStream();
 
     std::vector<Integer> partials(gridX);
-    tileoff_CUDA_CHECK(TileOffloadMemcpyDtoH(partials.data(), dPartials, partialBytes));
+    TILEOFF_CUDA_CHECK(TileOffloadMemcpyDtoH(partials.data(), dPartials, partialBytes));
     for (Integer value : partials)
       reducedValue =
           TileOffloadApplyReduction(desc->reductionOp, reducedValue, value);
@@ -7051,7 +7051,7 @@ static void TileOffloadLaunchReduceIntegerV2(const char *abiName,
     TileOffloadReleaseDeviceArg(read1Dev);
 }
 
-#define tileoff_DEFINE_INTEGER_REDUCTION(BITS, TYPE) \
+#define TILEOFF_DEFINE_INTEGER_REDUCTION(BITS, TYPE) \
   extern "C" void __tileoff_launch_reduce_i##BITS##_v2(int32_t kernelId, \
       int32_t blockX, int32_t numReadArrays, TYPE *read0, TYPE *read1, \
       TYPE *result, TYPE initialValue, int32_t extentX) { \
@@ -7060,12 +7060,12 @@ static void TileOffloadLaunchReduceIntegerV2(const char *abiName,
         initialValue, extentX); \
   }
 
-tileoff_DEFINE_INTEGER_REDUCTION(8, int8_t)
-tileoff_DEFINE_INTEGER_REDUCTION(16, int16_t)
-tileoff_DEFINE_INTEGER_REDUCTION(32, int32_t)
-tileoff_DEFINE_INTEGER_REDUCTION(64, int64_t)
+TILEOFF_DEFINE_INTEGER_REDUCTION(8, int8_t)
+TILEOFF_DEFINE_INTEGER_REDUCTION(16, int16_t)
+TILEOFF_DEFINE_INTEGER_REDUCTION(32, int32_t)
+TILEOFF_DEFINE_INTEGER_REDUCTION(64, int64_t)
 
-#undef tileoff_DEFINE_INTEGER_REDUCTION
+#undef TILEOFF_DEFINE_INTEGER_REDUCTION
 
 extern "C" void __tileoff_get_reduction_workspace_stats_v1(
     uint64_t *primaryLaunches, uint64_t *stageLaunches,
@@ -7073,7 +7073,7 @@ extern "C" void __tileoff_get_reduction_workspace_stats_v1(
     uint64_t *partialReuses, uint64_t *partialCapacityBytes,
     uint64_t *scratchAllocations, uint64_t *scratchGrowths,
     uint64_t *scratchReuses, uint64_t *scratchCapacityBytes) {
-  tileoff_REGISTRY_GUARD();
+  TILEOFF_REGISTRY_GUARD();
   TileOffloadReductionWorkspace workspace = TileOffloadAggregateReductionWorkspaceStats();
   if (primaryLaunches)
     *primaryLaunches = workspace.primaryLaunches;
@@ -7099,7 +7099,7 @@ extern "C" void __tileoff_get_reduction_workspace_stats_v1(
 
 // Memory management functions to help with cached data and data lifetimes
 extern "C" void __tileoff_update_host(void *hostPtr) {
-  tileoff_RUNTIME_GUARD();
+  TILEOFF_RUNTIME_GUARD();
   TileOffloadCurrentContextGuard contextGuard;
   TileOffloadEnsureCurrentContext();
 
@@ -7119,7 +7119,7 @@ extern "C" void __tileoff_update_host(void *hostPtr) {
     std::abort();
   }
 
-  tileoff_CUDA_CHECK(TileOffloadMemcpyDtoH(hostPtr, it->second.ptr, it->second.bytes));
+  TILEOFF_CUDA_CHECK(TileOffloadMemcpyDtoH(hostPtr, it->second.ptr, it->second.bytes));
 
   if (TileOffloadDebugEnabled()) {
     std::fprintf(stderr, "TileOffload: update_host host=%p device=0x%llx bytes=%zu\n",
@@ -7129,7 +7129,7 @@ extern "C" void __tileoff_update_host(void *hostPtr) {
 }
 
 extern "C" void __tileoff_update_device(void *hostPtr) {
-  tileoff_RUNTIME_GUARD();
+  TILEOFF_RUNTIME_GUARD();
   TileOffloadCurrentContextGuard contextGuard;
   TileOffloadEnsureCurrentContext();
 
@@ -7149,7 +7149,7 @@ extern "C" void __tileoff_update_device(void *hostPtr) {
     std::abort();
   }
 
-  tileoff_CUDA_CHECK(TileOffloadMemcpyHtoD(it->second.ptr, hostPtr, it->second.bytes));
+  TILEOFF_CUDA_CHECK(TileOffloadMemcpyHtoD(it->second.ptr, hostPtr, it->second.bytes));
 
   if (TileOffloadDebugEnabled()) {
     std::fprintf(stderr,
@@ -7159,7 +7159,7 @@ extern "C" void __tileoff_update_device(void *hostPtr) {
 }
 
 extern "C" void __tileoff_release(void *hostPtr) {
-  tileoff_RUNTIME_GUARD();
+  TILEOFF_RUNTIME_GUARD();
   TileOffloadCurrentContextGuard contextGuard;
   TileOffloadEnsureCurrentContext();
 
@@ -7192,7 +7192,7 @@ extern "C" void __tileoff_release(void *hostPtr) {
 
   TileOffloadSynchronizeActiveContext();
 
-  tileoff_CUDA_CHECK(cuMemFree(devicePtr));
+  TILEOFF_CUDA_CHECK(cuMemFree(devicePtr));
 
   cache.erase(it);
 
@@ -7203,7 +7203,7 @@ extern "C" void __tileoff_release(void *hostPtr) {
 }
 
 extern "C" void __tileoff_release_all() {
-  tileoff_RUNTIME_GUARD();
+  TILEOFF_RUNTIME_GUARD();
   TileOffloadCurrentContextGuard contextGuard;
   TileOffloadEnsureCurrentContext();
 
@@ -7233,7 +7233,7 @@ extern "C" void __tileoff_release_all() {
           static_cast<unsigned long long>(allocation.ptr), allocation.bytes);
     }
     if (allocation.ptr)
-      tileoff_CUDA_CHECK(cuMemFree(allocation.ptr));
+      TILEOFF_CUDA_CHECK(cuMemFree(allocation.ptr));
   }
 
   cache.clear();
@@ -7271,7 +7271,7 @@ extern "C" void __tileoff_register_embedded_device_bundle(
     const void *const *imageData, const std::size_t *imageSizes,
     const int32_t *imageKinds, std::size_t imageCount, const char *jsonData,
     std::size_t jsonSize) {
-  tileoff_REGISTRY_GUARD();
+  TILEOFF_REGISTRY_GUARD();
   TileOffloadRegisterEmbeddedDeviceBundle(
       imageData, imageSizes, imageKinds, imageCount, jsonData, jsonSize);
 }
@@ -7279,7 +7279,7 @@ extern "C" void __tileoff_register_embedded_device_bundle(
 extern "C" void __tileoff_register_embedded_kernel_bundle(
     const char *const *ptxData, std::size_t const *ptxSizes,
     std::size_t ptxCount, const char *jsonData, std::size_t jsonSize) {
-  tileoff_REGISTRY_GUARD();
+  TILEOFF_REGISTRY_GUARD();
   std::vector<const void *> imageData(ptxCount);
   for (std::size_t i = 0; i < ptxCount; ++i)
     imageData[i] = ptxData ? ptxData[i] : nullptr;
@@ -7290,7 +7290,7 @@ extern "C" void __tileoff_register_embedded_kernel_bundle(
 
 extern "C" void __tileoff_register_embedded_kernels(const char *ptxData,
     std::size_t ptxSize, const char *jsonData, std::size_t jsonSize) {
-  tileoff_REGISTRY_GUARD();
+  TILEOFF_REGISTRY_GUARD();
   const void *imageData[] = {ptxData};
   std::size_t imageSizes[] = {ptxSize};
   int32_t imageKinds[] = {TileOffloadEmbeddedKernelBundle::PTX};
@@ -7300,7 +7300,7 @@ extern "C" void __tileoff_register_embedded_kernels(const char *ptxData,
 
 // For profiling
 extern "C" void tileoff_profile_compute_begin() {
-  tileoff_PROFILE_PUSH("TileOffload.compute");
+  TILEOFF_PROFILE_PUSH("TileOffload.compute");
 }
 
-extern "C" void tileoff_profile_compute_end() { tileoff_PROFILE_POP(); }
+extern "C" void tileoff_profile_compute_end() { TILEOFF_PROFILE_POP(); }

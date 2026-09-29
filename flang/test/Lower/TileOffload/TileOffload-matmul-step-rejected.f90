@@ -1,5 +1,5 @@
 ! RUN: %flang_fc1 -emit-fir %s -o %t.fir
-! RUN: not fir-opt --TileOffload-pipeline="launch-abi=2 ttir-output=%t.ttir json-output=%t.json" %t.fir 2>&1 | FileCheck %s
+! RUN: not fir-opt --tileoff-pipeline="launch-abi=2 ttir-output=%t.ttir json-output=%t.json" %t.fir 2>&1 | FileCheck %s
 subroutine matmul_step(a,b,c,step)
   real :: a(32,32),b(32,32),c(32,32),acc
   integer :: i,j,p

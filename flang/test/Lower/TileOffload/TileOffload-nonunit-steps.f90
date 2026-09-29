@@ -1,8 +1,8 @@
 ! RUN: %flang_fc1 -emit-fir %s -o %t.fir
-! RUN: fir-opt --TileOffload-pipeline="launch-abi=2 ttir-output=%t.2.ttir json-output=%t.2.json" %t.fir -o %t.2.host
+! RUN: fir-opt --tileoff-pipeline="launch-abi=2 ttir-output=%t.2.ttir json-output=%t.2.json" %t.fir -o %t.2.host
 ! RUN: FileCheck %s --check-prefix=TTIR < %t.2.ttir
 ! RUN: FileCheck %s --check-prefix=JSON < %t.2.json
-! RUN: fir-opt --TileOffload-pipeline="launch-abi=3 ttir-output=%t.3.ttir json-output=%t.3.json" %t.fir -o %t.3.host
+! RUN: fir-opt --tileoff-pipeline="launch-abi=3 ttir-output=%t.3.ttir json-output=%t.3.json" %t.fir -o %t.3.host
 ! RUN: FileCheck %s --check-prefix=TTIR < %t.3.ttir
 ! RUN: FileCheck %s --check-prefix=JSON < %t.3.json
 

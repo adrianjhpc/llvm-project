@@ -1,5 +1,5 @@
 ! RUN: %flang_fc1 -emit-fir %s -o %t.fir
-! RUN: fir-opt --TileOffload-pipeline="launch-abi=2 ttir-output=%t.ttir json-output=%t.json" %t.fir -o %t.host
+! RUN: fir-opt --tileoff-pipeline="launch-abi=2 ttir-output=%t.ttir json-output=%t.json" %t.fir -o %t.host
 ! RUN: FileCheck %s --check-prefix=HOST < %t.host
 
 subroutine partial_1d(a,b,lo,hi)

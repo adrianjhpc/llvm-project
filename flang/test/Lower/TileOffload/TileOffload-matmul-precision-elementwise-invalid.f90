@@ -1,5 +1,5 @@
 ! RUN: %flang_fc1 -emit-fir %s -o %t.fir
-! RUN: not fir-opt --TileOffload-pipeline="ttir-output=%t.ttir json-output=%t.json" %t.fir -o /dev/null 2>&1 | FileCheck %s
+! RUN: not fir-opt --tileoff-pipeline="ttir-output=%t.ttir json-output=%t.json" %t.fir -o /dev/null 2>&1 | FileCheck %s
 ! CHECK: MATMUL_PRECISION requires a recognized real(4) matmul
 
 subroutine wrong_kind(n,a,b,c)

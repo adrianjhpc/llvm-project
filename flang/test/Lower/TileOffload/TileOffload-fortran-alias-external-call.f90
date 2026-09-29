@@ -1,6 +1,6 @@
 ! RUN: %flang_fc1 -emit-fir %s -o %t.fir
 ! RUN: fir-opt \
-! RUN:   --TileOffload-pipeline="ttir-output=%t.ttir json-output=%t.json emit-fortran-aliases=true" \
+! RUN:   --tileoff-pipeline="ttir-output=%t.ttir json-output=%t.json emit-fortran-aliases=true" \
 ! RUN:   %t.fir -o %t.host.fir
 ! RUN: FileCheck %s --input-file=%t.host.fir
 

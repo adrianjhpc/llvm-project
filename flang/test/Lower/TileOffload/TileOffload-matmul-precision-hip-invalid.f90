@@ -1,5 +1,5 @@
 ! RUN: %flang_fc1 -emit-fir %s -o %t.fir
-! RUN: not fir-opt --TileOffload-pipeline="ttir-output=%t.ttir json-output=%t.json accelerator-target=hip" %t.fir -o /dev/null 2>&1 | FileCheck %s
+! RUN: not fir-opt --tileoff-pipeline="ttir-output=%t.ttir json-output=%t.json accelerator-target=hip" %t.fir -o /dev/null 2>&1 | FileCheck %s
 ! CHECK: TF32 matmul precision is currently supported only by the CUDA Triton backend
 
 subroutine hip_precision(a,b,c)

@@ -1,7 +1,7 @@
 ! RUN: %flang_fc1 -emit-fir %s -o %t.fir
-! RUN: fir-opt --TileOffload-pipeline="ttir-output=%t.default.ttir json-output=%t.default.json" %t.fir -o %t.default.host.fir
+! RUN: fir-opt --tileoff-pipeline="ttir-output=%t.default.ttir json-output=%t.default.json" %t.fir -o %t.default.host.fir
 ! RUN: FileCheck %s --check-prefix=DEFAULT < %t.default.json
-! RUN: fir-opt --TileOffload-pipeline="ttir-output=%t.warp4.ttir json-output=%t.warp4.json num-warps=4" %t.fir -o %t.warp4.host.fir
+! RUN: fir-opt --tileoff-pipeline="ttir-output=%t.warp4.ttir json-output=%t.warp4.json num-warps=4" %t.fir -o %t.warp4.host.fir
 ! RUN: FileCheck %s --check-prefix=MULTI < %t.warp4.json
 ! RUN: FileCheck %s --check-prefix=TTIR < %t.warp4.ttir
 

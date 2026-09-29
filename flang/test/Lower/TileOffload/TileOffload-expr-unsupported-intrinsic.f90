@@ -1,6 +1,6 @@
 ! RUN: %flang_fc1 -emit-fir %s -o %t.fir
 ! RUN: not fir-opt \
-! RUN:   --TileOffload-pipeline="ttir-output=%t.ttir json-output=%t.json" \
+! RUN:   --tileoff-pipeline="ttir-output=%t.ttir json-output=%t.json" \
 ! RUN:   %t.fir -o /dev/null 2>&1 | FileCheck %s
 
 subroutine tileoff_expr_unsupported_intrinsic(n, a, b, c)

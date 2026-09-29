@@ -1,5 +1,5 @@
 ! RUN: %flang_fc1 -emit-fir %s -o %t.fir
-! RUN: not fir-opt --TileOffload-pipeline="launch-abi=2 ttir-output=%t.ttir json-output=%t.json" %t.fir -o /dev/null 2>&1 | FileCheck %s
+! RUN: not fir-opt --tileoff-pipeline="launch-abi=2 ttir-output=%t.ttir json-output=%t.json" %t.fir -o /dev/null 2>&1 | FileCheck %s
 subroutine nonuniform_step(a,b,n)
  integer :: n,i,j
  real :: a(n,n),b(n,n)

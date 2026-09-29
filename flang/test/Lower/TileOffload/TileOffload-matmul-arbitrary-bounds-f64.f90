@@ -1,25 +1,25 @@
 ! RUN: %flang_fc1 -emit-fir %s -o %t.fir
-! RUN: fir-opt --TileOffload-pipeline="launch-abi=2 f64-matmul-strategy=dot ttir-output=%t.2.dot.ttir json-output=%t.2.dot.json" %t.fir -o %t.2.dot.fir
+! RUN: fir-opt --tileoff-pipeline="launch-abi=2 f64-matmul-strategy=dot ttir-output=%t.2.dot.ttir json-output=%t.2.dot.json" %t.fir -o %t.2.dot.fir
 ! RUN: FileCheck %s --check-prefix=DEVICE --input-file=%t.2.dot.ttir
 ! RUN: FileCheck %s --check-prefix=JSON --input-file=%t.2.dot.json
 ! RUN: FileCheck %s --check-prefix=V2 --input-file=%t.2.dot.fir
-! RUN: fir-opt --TileOffload-pipeline="launch-abi=2 f64-matmul-strategy=fma ttir-output=%t.2.fma.ttir json-output=%t.2.fma.json" %t.fir -o %t.2.fma.fir
+! RUN: fir-opt --tileoff-pipeline="launch-abi=2 f64-matmul-strategy=fma ttir-output=%t.2.fma.ttir json-output=%t.2.fma.json" %t.fir -o %t.2.fma.fir
 ! RUN: FileCheck %s --check-prefix=DEVICE --input-file=%t.2.fma.ttir
 ! RUN: FileCheck %s --check-prefix=JSON --input-file=%t.2.fma.json
 ! RUN: FileCheck %s --check-prefix=V2 --input-file=%t.2.fma.fir
-! RUN: fir-opt --TileOffload-pipeline="launch-abi=2 f64-matmul-strategy=reduce ttir-output=%t.2.reduce.ttir json-output=%t.2.reduce.json" %t.fir -o %t.2.reduce.fir
+! RUN: fir-opt --tileoff-pipeline="launch-abi=2 f64-matmul-strategy=reduce ttir-output=%t.2.reduce.ttir json-output=%t.2.reduce.json" %t.fir -o %t.2.reduce.fir
 ! RUN: FileCheck %s --check-prefix=DEVICE --input-file=%t.2.reduce.ttir
 ! RUN: FileCheck %s --check-prefix=JSON --input-file=%t.2.reduce.json
 ! RUN: FileCheck %s --check-prefix=V2 --input-file=%t.2.reduce.fir
-! RUN: fir-opt --TileOffload-pipeline="launch-abi=3 f64-matmul-strategy=dot ttir-output=%t.3.dot.ttir json-output=%t.3.dot.json" %t.fir -o %t.3.dot.fir
+! RUN: fir-opt --tileoff-pipeline="launch-abi=3 f64-matmul-strategy=dot ttir-output=%t.3.dot.ttir json-output=%t.3.dot.json" %t.fir -o %t.3.dot.fir
 ! RUN: FileCheck %s --check-prefix=DEVICE --input-file=%t.3.dot.ttir
 ! RUN: FileCheck %s --check-prefix=JSON --input-file=%t.3.dot.json
 ! RUN: FileCheck %s --check-prefix=V3 --input-file=%t.3.dot.fir
-! RUN: fir-opt --TileOffload-pipeline="launch-abi=3 f64-matmul-strategy=fma ttir-output=%t.3.fma.ttir json-output=%t.3.fma.json" %t.fir -o %t.3.fma.fir
+! RUN: fir-opt --tileoff-pipeline="launch-abi=3 f64-matmul-strategy=fma ttir-output=%t.3.fma.ttir json-output=%t.3.fma.json" %t.fir -o %t.3.fma.fir
 ! RUN: FileCheck %s --check-prefix=DEVICE --input-file=%t.3.fma.ttir
 ! RUN: FileCheck %s --check-prefix=JSON --input-file=%t.3.fma.json
 ! RUN: FileCheck %s --check-prefix=V3 --input-file=%t.3.fma.fir
-! RUN: fir-opt --TileOffload-pipeline="launch-abi=3 f64-matmul-strategy=reduce ttir-output=%t.3.reduce.ttir json-output=%t.3.reduce.json" %t.fir -o %t.3.reduce.fir
+! RUN: fir-opt --tileoff-pipeline="launch-abi=3 f64-matmul-strategy=reduce ttir-output=%t.3.reduce.ttir json-output=%t.3.reduce.json" %t.fir -o %t.3.reduce.fir
 ! RUN: FileCheck %s --check-prefix=DEVICE --input-file=%t.3.reduce.ttir
 ! RUN: FileCheck %s --check-prefix=JSON --input-file=%t.3.reduce.json
 ! RUN: FileCheck %s --check-prefix=V3 --input-file=%t.3.reduce.fir

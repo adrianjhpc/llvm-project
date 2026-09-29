@@ -86,7 +86,7 @@ void buildTileOffloadPipeline(mlir::OpPassManager &pm,
 
 void registerTileOffloadPipelines() {
   mlir::PassPipelineRegistration<TileOffloadPipelineOptions>(
-      "TileOffload-pipeline",
+      "tileoff-pipeline",
       "Run the experimental TileOffload lowering pipeline: assign kernel ids, emit "
       "Triton TTIR/JSON metadata, and lower host TileOffload operations to runtime "
       "calls",
