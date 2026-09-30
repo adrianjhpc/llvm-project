@@ -71,7 +71,8 @@ static std::string tensorType(int64_t n, fir::TileOffload::ElementType type) {
          ttElementType(type).str() + ">";
 }
 
-static std::string ptrTensorType(int64_t n, fir::TileOffload::ElementType type) {
+static std::string ptrTensorType(int64_t n,
+                                 fir::TileOffload::ElementType type) {
   return std::string("tensor<") + std::to_string(n) + "x" + ptrType(type) + ">";
 }
 
@@ -103,7 +104,8 @@ static bool isValidBackendName(StringRef name) {
   });
 }
 
-static StringRef deviceImageExtension(fir::TileOffload::TileOffloadDeviceImageKind kind) {
+static StringRef
+deviceImageExtension(fir::TileOffload::TileOffloadDeviceImageKind kind) {
   switch (kind) {
   case fir::TileOffload::TileOffloadDeviceImageKind::PTX:
     return ".ptx";
@@ -115,7 +117,8 @@ static StringRef deviceImageExtension(fir::TileOffload::TileOffloadDeviceImageKi
   llvm_unreachable("unknown TileOffload device image kind");
 }
 
-static StringRef ttUnaryOpForExprKind(fir::TileOffload::ElementwiseExprKind kind) {
+static StringRef
+ttUnaryOpForExprKind(fir::TileOffload::ElementwiseExprKind kind) {
   switch (kind) {
   case fir::TileOffload::ElementwiseExprKind::NegF:
     return "arith.negf";
@@ -160,7 +163,8 @@ static StringRef ttArith(Operation *op) {
   llvm_unreachable("unsupported binary TileOffload arithmetic operation");
 }
 
-static StringRef ttArithForExprKind(fir::TileOffload::ElementwiseExprKind kind) {
+static StringRef
+ttArithForExprKind(fir::TileOffload::ElementwiseExprKind kind) {
   switch (kind) {
   case fir::TileOffload::ElementwiseExprKind::AddF:
     return "arith.addf";
@@ -195,7 +199,8 @@ static StringRef ttArithForExprKind(fir::TileOffload::ElementwiseExprKind kind) 
   }
 }
 
-static StringRef comparisonPredicate(fir::TileOffload::ElementwiseExprKind kind) {
+static StringRef
+comparisonPredicate(fir::TileOffload::ElementwiseExprKind kind) {
   switch (kind) {
   case fir::TileOffload::ElementwiseExprKind::CmpOLT:
     return "olt";
@@ -234,7 +239,8 @@ static int findValueIndex(ArrayRef<Value> values, Value value) {
 }
 
 static void emitLoad1D(StringRef ptr, StringRef dst, int64_t block,
-                       fir::TileOffload::ElementType type, llvm::raw_ostream &os) {
+                       fir::TileOffload::ElementType type,
+                       llvm::raw_ostream &os) {
   std::string ptrTy = ptrType(type);
   std::string ptrVecTy = ptrTensorType(block, type);
 
@@ -276,7 +282,8 @@ static void emitReductionLoad1D(StringRef ptr, StringRef dst,
 }
 
 static void emitStore1D(StringRef ptr, StringRef value, int64_t block,
-                        fir::TileOffload::ElementType type, llvm::raw_ostream &os) {
+                        fir::TileOffload::ElementType type,
+                        llvm::raw_ostream &os) {
   std::string ptrTy = ptrType(type);
   std::string ptrVecTy = ptrTensorType(block, type);
 
@@ -289,8 +296,9 @@ static void emitStore1D(StringRef ptr, StringRef value, int64_t block,
   os << "  tt.store %co, " << value << ", %mask : " << ptrVecTy << "\n";
 }
 
-static void emitTriton1D(const fir::TileOffload::ElementwiseKernel &k, int64_t block,
-                         StringRef kernelName, llvm::raw_ostream &os) {
+static void emitTriton1D(const fir::TileOffload::ElementwiseKernel &k,
+                         int64_t block, StringRef kernelName,
+                         llvm::raw_ostream &os) {
   std::string ptrTy = ptrType(k.elementType);
   std::string elemTy = ttElementType(k.elementType).str();
 
@@ -376,14 +384,15 @@ static std::string emitExprVector(const fir::TileOffload::ElementwiseKernel &k,
                                   ExprTritonEmitterState &state,
                                   llvm::raw_ostream &os);
 
-static std::string emitExprVectorImpl(const fir::TileOffload::ElementwiseKernel &k,
-                                      const fir::TileOffload::ElementwiseExpr &expr,
-                                      ExprTritonEmitterState &state,
-                                      llvm::raw_ostream &os) {
+static std::string
+emitExprVectorImpl(const fir::TileOffload::ElementwiseKernel &k,
+                   const fir::TileOffload::ElementwiseExpr &expr,
+                   ExprTritonEmitterState &state, llvm::raw_ostream &os) {
   int64_t block = state.block;
   fir::TileOffload::ElementType expressionType =
-      expr.elementType == fir::TileOffload::ElementType::Unknown ? k.elementType
-                                                           : expr.elementType;
+      expr.elementType == fir::TileOffload::ElementType::Unknown
+          ? k.elementType
+          : expr.elementType;
   std::string elemTy = ttElementType(expressionType).str();
 
   switch (expr.kind) {
@@ -529,8 +538,9 @@ static std::string emitExprVectorImpl(const fir::TileOffload::ElementwiseKernel 
     else if (!sourceInteger && destinationInteger)
       operation = "arith.fptosi";
     else if (!sourceInteger && !destinationInteger)
-      operation = sourceType == fir::TileOffload::ElementType::F32 ? "arith.extf"
-                                                             : "arith.truncf";
+      operation = sourceType == fir::TileOffload::ElementType::F32
+                      ? "arith.extf"
+                      : "arith.truncf";
     else {
       auto integerWidth = [](fir::TileOffload::ElementType type) -> unsigned {
         switch (type) {
@@ -694,8 +704,9 @@ static std::string emitExprVectorImpl(const fir::TileOffload::ElementwiseKernel 
     std::string rhs = emitExprVector(k, *expr.operands[1], state, os);
     std::string result = "%pred" + std::to_string(state.nextTmp++);
     os << "  " << result << " = "
-       << (expr.kind == fir::TileOffload::ElementwiseExprKind::And ? "arith.andi"
-                                                             : "arith.ori")
+       << (expr.kind == fir::TileOffload::ElementwiseExprKind::And
+               ? "arith.andi"
+               : "arith.ori")
        << " " << lhs << ", " << rhs << " : tensor<" << block << "xi1>\n";
     return result;
   }
@@ -732,7 +743,8 @@ static std::string emitExprVectorImpl(const fir::TileOffload::ElementwiseKernel 
   }
 
   default:
-    llvm_unreachable("unsupported TileOffload expression reached TTIR emission");
+    llvm_unreachable(
+        "unsupported TileOffload expression reached TTIR emission");
   }
 }
 
@@ -819,8 +831,9 @@ static void emitTritonExpr1D(const fir::TileOffload::ElementwiseKernel &k,
   os << "}\n\n";
 }
 
-static void emitRuntimeStepParameters(const fir::TileOffload::ElementwiseKernel &k,
-                                      llvm::raw_ostream &os) {
+static void
+emitRuntimeStepParameters(const fir::TileOffload::ElementwiseKernel &k,
+                          llvm::raw_ostream &os) {
   const int64_t steps[] = {k.loopStepX, k.loopStepY, k.loopStepZ};
   for (unsigned dim = 0; dim < 3; ++dim)
     if (steps[dim] == 0)
@@ -1199,8 +1212,8 @@ static void emitTritonReductionStage1D(fir::TileOffload::ElementType type,
   os << "}\n\n";
 }
 
-static void emitTriton2D(const fir::TileOffload::ElementwiseKernel &k, int64_t blockX,
-                         int64_t blockY, StringRef kernelName,
+static void emitTriton2D(const fir::TileOffload::ElementwiseKernel &k,
+                         int64_t blockX, int64_t blockY, StringRef kernelName,
                          llvm::raw_ostream &os) {
   int64_t block = blockX * blockY;
   std::string ptrTy = ptrType(k.elementType);
@@ -1251,9 +1264,10 @@ static void emitTriton2D(const fir::TileOffload::ElementwiseKernel &k, int64_t b
   os << "}\n\n";
 }
 
-static void emitTritonReductionDot1D(const fir::TileOffload::ElementwiseKernel &k,
-                                     int64_t block, StringRef kernelName,
-                                     llvm::raw_ostream &os) {
+static void
+emitTritonReductionDot1D(const fir::TileOffload::ElementwiseKernel &k,
+                         int64_t block, StringRef kernelName,
+                         llvm::raw_ostream &os) {
   assert(k.kind == fir::TileOffload::ElementwiseKernelKind::ReductionDot1D &&
          "expected ReductionDot1D kernel");
   assert(k.readArrays.size() == 2 &&
@@ -1512,10 +1526,12 @@ static void emitTritonStencil2D(const fir::TileOffload::ElementwiseKernel &k,
   state.arrayAccessNames.resize(k.arrayAccesses.size());
 
   std::function<std::string(
-      const std::shared_ptr<fir::TileOffload::ElementwiseIndexExpr> &, StringRef)>
+      const std::shared_ptr<fir::TileOffload::ElementwiseIndexExpr> &,
+      StringRef)>
       emitIndexExpression;
   emitIndexExpression =
-      [&](const std::shared_ptr<fir::TileOffload::ElementwiseIndexExpr> &expression,
+      [&](const std::shared_ptr<fir::TileOffload::ElementwiseIndexExpr>
+              &expression,
           StringRef stem) -> std::string {
     assert(expression && "missing stencil index expression");
     using Kind = fir::TileOffload::ElementwiseIndexExprKind;
@@ -1724,10 +1740,10 @@ static void emitTritonStencil2D(const fir::TileOffload::ElementwiseKernel &k,
   os << "}\n\n";
 }
 
-static void emitTritonMultiReduction2D(const fir::TileOffload::ElementwiseKernel &k,
-                                       int64_t blockX, int64_t blockY,
-                                       StringRef kernelName,
-                                       llvm::raw_ostream &os) {
+static void
+emitTritonMultiReduction2D(const fir::TileOffload::ElementwiseKernel &k,
+                           int64_t blockX, int64_t blockY, StringRef kernelName,
+                           llvm::raw_ostream &os) {
   assert(k.kind == fir::TileOffload::ElementwiseKernelKind::MultiReduction2D);
   assert(!k.arrayArguments.empty() && !k.reductionOutputs.empty());
 
@@ -1847,53 +1863,54 @@ static void emitTritonMultiReduction2D(const fir::TileOffload::ElementwiseKernel
     return source;
   };
 
-  auto emitLinearOffset = [&](const fir::TileOffload::ElementwiseArrayAccess &access,
-                              StringRef stem) {
-    unsigned array = access.arrayArgumentIndex;
-    assert(!access.offsets.empty() && access.offsets.size() <= 2 &&
-           access.offsets.size() == access.dimensions.size() &&
-           access.offsets.size() == access.coefficients.size() &&
-           access.offsets.size() == access.baseIndices.size());
-    if (access.offsets.size() == 1) {
-      std::string source = emitAdjustedSource(
-          access.dimensions[0], access.coefficients[0], access.baseIndices[0],
-          access.offsets[0], stem.str() + "_dim0");
-      os << "  %" << stem << "_lower_s = tt.splat %array" << array
-         << "_lower0 : i32 -> tensor<" << block << "xi32>\n";
-      os << "  %" << stem << "_index = arith.subi " << source << ", %" << stem
-         << "_lower_s : tensor<" << block << "xi32>\n";
-      os << "  %" << stem << "_stride_s = tt.splat %array" << array
-         << "_stride0 : i32 -> tensor<" << block << "xi32>\n";
-      os << "  %" << stem << "_offset = arith.muli %" << stem << "_index, %"
-         << stem << "_stride_s : tensor<" << block << "xi32>\n";
-      return;
-    }
+  auto emitLinearOffset =
+      [&](const fir::TileOffload::ElementwiseArrayAccess &access,
+          StringRef stem) {
+        unsigned array = access.arrayArgumentIndex;
+        assert(!access.offsets.empty() && access.offsets.size() <= 2 &&
+               access.offsets.size() == access.dimensions.size() &&
+               access.offsets.size() == access.coefficients.size() &&
+               access.offsets.size() == access.baseIndices.size());
+        if (access.offsets.size() == 1) {
+          std::string source = emitAdjustedSource(
+              access.dimensions[0], access.coefficients[0],
+              access.baseIndices[0], access.offsets[0], stem.str() + "_dim0");
+          os << "  %" << stem << "_lower_s = tt.splat %array" << array
+             << "_lower0 : i32 -> tensor<" << block << "xi32>\n";
+          os << "  %" << stem << "_index = arith.subi " << source << ", %"
+             << stem << "_lower_s : tensor<" << block << "xi32>\n";
+          os << "  %" << stem << "_stride_s = tt.splat %array" << array
+             << "_stride0 : i32 -> tensor<" << block << "xi32>\n";
+          os << "  %" << stem << "_offset = arith.muli %" << stem << "_index, %"
+             << stem << "_stride_s : tensor<" << block << "xi32>\n";
+          return;
+        }
 
-    std::string x = emitAdjustedSource(
-        access.dimensions[0], access.coefficients[0], access.baseIndices[0],
-        access.offsets[0], stem.str() + "_dim0");
-    std::string y = emitAdjustedSource(
-        access.dimensions[1], access.coefficients[1], access.baseIndices[1],
-        access.offsets[1], stem.str() + "_dim1");
-    os << "  %" << stem << "_lower0_s = tt.splat %array" << array
-       << "_lower0 : i32 -> tensor<" << block << "xi32>\n";
-    os << "  %" << stem << "_lower1_s = tt.splat %array" << array
-       << "_lower1 : i32 -> tensor<" << block << "xi32>\n";
-    os << "  %" << stem << "_x = arith.subi " << x << ", %" << stem
-       << "_lower0_s : tensor<" << block << "xi32>\n";
-    os << "  %" << stem << "_y = arith.subi " << y << ", %" << stem
-       << "_lower1_s : tensor<" << block << "xi32>\n";
-    os << "  %" << stem << "_stride0_s = tt.splat %array" << array
-       << "_stride0 : i32 -> tensor<" << block << "xi32>\n";
-    os << "  %" << stem << "_stride1_s = tt.splat %array" << array
-       << "_stride1 : i32 -> tensor<" << block << "xi32>\n";
-    os << "  %" << stem << "_xpart = arith.muli %" << stem << "_x, %" << stem
-       << "_stride0_s : tensor<" << block << "xi32>\n";
-    os << "  %" << stem << "_ypart = arith.muli %" << stem << "_y, %" << stem
-       << "_stride1_s : tensor<" << block << "xi32>\n";
-    os << "  %" << stem << "_offset = arith.addi %" << stem << "_xpart, %"
-       << stem << "_ypart : tensor<" << block << "xi32>\n";
-  };
+        std::string x = emitAdjustedSource(
+            access.dimensions[0], access.coefficients[0], access.baseIndices[0],
+            access.offsets[0], stem.str() + "_dim0");
+        std::string y = emitAdjustedSource(
+            access.dimensions[1], access.coefficients[1], access.baseIndices[1],
+            access.offsets[1], stem.str() + "_dim1");
+        os << "  %" << stem << "_lower0_s = tt.splat %array" << array
+           << "_lower0 : i32 -> tensor<" << block << "xi32>\n";
+        os << "  %" << stem << "_lower1_s = tt.splat %array" << array
+           << "_lower1 : i32 -> tensor<" << block << "xi32>\n";
+        os << "  %" << stem << "_x = arith.subi " << x << ", %" << stem
+           << "_lower0_s : tensor<" << block << "xi32>\n";
+        os << "  %" << stem << "_y = arith.subi " << y << ", %" << stem
+           << "_lower1_s : tensor<" << block << "xi32>\n";
+        os << "  %" << stem << "_stride0_s = tt.splat %array" << array
+           << "_stride0 : i32 -> tensor<" << block << "xi32>\n";
+        os << "  %" << stem << "_stride1_s = tt.splat %array" << array
+           << "_stride1 : i32 -> tensor<" << block << "xi32>\n";
+        os << "  %" << stem << "_xpart = arith.muli %" << stem << "_x, %"
+           << stem << "_stride0_s : tensor<" << block << "xi32>\n";
+        os << "  %" << stem << "_ypart = arith.muli %" << stem << "_y, %"
+           << stem << "_stride1_s : tensor<" << block << "xi32>\n";
+        os << "  %" << stem << "_offset = arith.addi %" << stem << "_xpart, %"
+           << stem << "_ypart : tensor<" << block << "xi32>\n";
+      };
 
   ExprTritonEmitterState state;
   state.block = block;
@@ -1965,8 +1982,9 @@ static void emitTritonMultiReduction2D(const fir::TileOffload::ElementwiseKernel
 }
 
 // Matmul layout parameters follow the public ABI parameter order.
-static void emitMatmulLayoutParameters(const fir::TileOffload::ElementwiseKernel &k,
-                                       llvm::raw_ostream &os) {
+static void
+emitMatmulLayoutParameters(const fir::TileOffload::ElementwiseKernel &k,
+                           llvm::raw_ostream &os) {
   os << ", %lx: i32, %ly: i32, %lz: i32";
   for (StringRef name : {"a", "b", "c"})
     os << ", %" << name << "_l0: i32, %" << name << "_l1: i32, %" << name
@@ -1980,7 +1998,7 @@ static void emitMatmulOffsets(llvm::raw_ostream &os, StringRef array,
                               StringRef suffix, StringRef row, StringRef col,
                               StringRef shape, StringRef lowerRow,
                               StringRef lowerCol, int64_t stepRow,
-                              int64_t stepCol) {
+                              int64_t stepCol, bool unitRowStride = false) {
   std::string stem = array.str() + "_addr" + suffix.str();
   std::string ty = "tensor<" + shape.str() + "xi64>";
   auto splat = [&](StringRef label, StringRef value) {
@@ -1994,7 +2012,13 @@ static void emitMatmulOffsets(llvm::raw_ostream &os, StringRef array,
   splat("lc", lowerCol);
   splat("ar", array.str() + "_l0");
   splat("ac", array.str() + "_l1");
-  splat("sr", array.str() + "_s0");
+  // Only used in a branch guarded by all three first-dimension strides == 1.
+  // Keep leading dimensions and origin offsets dynamic; padded/submatrix
+  // layouts need not be tightly packed or aligned.
+  if (unitRowStride)
+    os << "    %" << stem << "_sr = arith.constant dense<1> : " << ty << "\n";
+  else
+    splat("sr", array.str() + "_s0");
   splat("sc", array.str() + "_s1");
   os << "    %" << stem << "_row64 = arith.extsi %" << row << " : tensor<"
      << shape << "xi32> to " << ty << "\n";
@@ -2040,19 +2064,15 @@ static void emitMatmulOffsets(llvm::raw_ostream &os, StringRef array,
      << "_pr, %" << stem << "_pc : " << ty << "\n";
 }
 
-static void emitTritonMatMul2DDot(const fir::TileOffload::ElementwiseKernel &k,
-                                  int64_t blockM, int64_t blockN,
-                                  int64_t blockK, StringRef kernelName,
-                                  llvm::raw_ostream &os) {
-
+// Emit a complete matmul body inside either the function or an scf.if arm.
+// Each arm owns its SSA names; the public device ABI and kernel identity stay
+// unchanged. The generic arm retains arbitrary array/loop strides.
+static void
+emitTritonMatMul2DDotBody(const fir::TileOffload::ElementwiseKernel &k,
+                          int64_t blockM, int64_t blockN, int64_t blockK,
+                          bool unitRowStride, llvm::raw_ostream &os) {
   std::string ptrTy = ptrType(k.elementType);
   std::string elemTy = ttElementType(k.elementType).str();
-
-  os << "tt.func @" << kernelName << "(%a: " << ptrTy << ", %b: " << ptrTy
-     << ", %c: " << ptrTy
-     << ", "
-        "%n: i32, %m: i32, %k: i32";
-  emitMatmulLayoutParameters(k, os);
 
   os << "  %pid_m = tt.get_program_id x : i32\n";
   os << "  %pid_n = tt.get_program_id y : i32\n";
@@ -2110,13 +2130,9 @@ static void emitTritonMatMul2DDot(const fir::TileOffload::ElementwiseKernel &k,
      << "x1xi32> -> tensor<" << blockM << "x" << blockK << "xi32>\n";
   os << "    %offs_k_b_a = tt.broadcast %offs_k_e_a : tensor<1x" << blockK
      << "xi32> -> tensor<" << blockM << "x" << blockK << "xi32>\n";
-  os << "    %n_s_a = tt.splat %n : i32 -> tensor<" << blockM << "x" << blockK
-     << "xi32>\n";
-  os << "    %a_k_n = arith.muli %offs_k_b_a, %n_s_a : tensor<" << blockM << "x"
-     << blockK << "xi32>\n";
   emitMatmulOffsets(os, "a", "", "offs_m_b", "offs_k_b_a",
                     std::to_string(blockM) + "x" + std::to_string(blockK), "lx",
-                    "lz", k.loopStepX, k.loopStepZ);
+                    "lz", k.loopStepX, k.loopStepZ, unitRowStride);
 
   os << "    %offs_k_e_b = tt.expand_dims %offs_k {axis = 1 : i32} : tensor<"
      << blockK << "xi32> -> tensor<" << blockK << "x1xi32>\n";
@@ -2126,13 +2142,9 @@ static void emitTritonMatMul2DDot(const fir::TileOffload::ElementwiseKernel &k,
      << "x1xi32> -> tensor<" << blockK << "x" << blockN << "xi32>\n";
   os << "    %offs_n_b = tt.broadcast %offs_n_e : tensor<1x" << blockN
      << "xi32> -> tensor<" << blockK << "x" << blockN << "xi32>\n";
-  os << "    %k_s_b = tt.splat %k : i32 -> tensor<" << blockK << "x" << blockN
-     << "xi32>\n";
-  os << "    %b_n_k = arith.muli %offs_n_b, %k_s_b : tensor<" << blockK << "x"
-     << blockN << "xi32>\n";
   emitMatmulOffsets(os, "b", "", "offs_k_b_b", "offs_n_b",
                     std::to_string(blockK) + "x" + std::to_string(blockN), "lz",
-                    "ly", k.loopStepZ, k.loopStepY);
+                    "ly", k.loopStepZ, k.loopStepY, unitRowStride);
 
   os << "    %k_s_k = tt.splat %k : i32 -> tensor<" << blockK << "xi32>\n";
   os << "    %mask_k = arith.cmpi slt, %offs_k, %k_s_k : tensor<" << blockK
@@ -2186,10 +2198,10 @@ static void emitTritonMatMul2DDot(const fir::TileOffload::ElementwiseKernel &k,
   // The input precision is ignored for FP64.
   os << "    %acc_next = tt.dot %a_tile, %b_tile, %acc_body, "
         "inputPrecision = "
-     << fir::TileOffload::matmulInputPrecisionName(k.matmulPrecision) << " : tensor<"
-     << blockM << "x" << blockK << "x" << elemTy << "> * tensor<" << blockK
-     << "x" << blockN << "x" << elemTy << "> -> tensor<" << blockM << "x"
-     << blockN << "x" << elemTy << ">\n";
+     << fir::TileOffload::matmulInputPrecisionName(k.matmulPrecision)
+     << " : tensor<" << blockM << "x" << blockK << "x" << elemTy
+     << "> * tensor<" << blockK << "x" << blockN << "x" << elemTy
+     << "> -> tensor<" << blockM << "x" << blockN << "x" << elemTy << ">\n";
   os << "    scf.yield %acc_next : tensor<" << blockM << "x" << blockN << "x"
      << elemTy << ">\n";
   os << "  }\n";
@@ -2202,13 +2214,9 @@ static void emitTritonMatMul2DDot(const fir::TileOffload::ElementwiseKernel &k,
      << "x1xi32> -> tensor<" << blockM << "x" << blockN << "xi32>\n";
   os << "  %offs_n_b_c = tt.broadcast %offs_n_e_c : tensor<1x" << blockN
      << "xi32> -> tensor<" << blockM << "x" << blockN << "xi32>\n";
-  os << "  %n_s_c = tt.splat %n : i32 -> tensor<" << blockM << "x" << blockN
-     << "xi32>\n";
-  os << "  %c_j_n = arith.muli %offs_n_b_c, %n_s_c : tensor<" << blockM << "x"
-     << blockN << "xi32>\n";
   emitMatmulOffsets(os, "c", "", "offs_m_b_c", "offs_n_b_c",
                     std::to_string(blockM) + "x" + std::to_string(blockN), "lx",
-                    "ly", k.loopStepX, k.loopStepY);
+                    "ly", k.loopStepX, k.loopStepY, unitRowStride);
 
   os << "  %mask_m_e_c = tt.expand_dims %mask_m {axis = 1 : i32} : tensor<"
      << blockM << "xi1> -> tensor<" << blockM << "x1xi1>\n";
@@ -2228,9 +2236,39 @@ static void emitTritonMatMul2DDot(const fir::TileOffload::ElementwiseKernel &k,
      << "xi64>\n";
   os << "  tt.store %c_ptrs, %acc, %mask_c : tensor<" << blockM << "x" << blockN
      << "x" << ptrTy << ">\n";
+}
 
-  os << "  tt.return\n";
-  os << "}\n\n";
+static void emitTritonMatMul2DDot(const fir::TileOffload::ElementwiseKernel &k,
+                                  int64_t blockM, int64_t blockN,
+                                  int64_t blockK, StringRef kernelName,
+                                  llvm::raw_ostream &os) {
+
+  std::string ptrTy = ptrType(k.elementType);
+
+  os << "tt.func @" << kernelName << "(%a: " << ptrTy << ", %b: " << ptrTy
+     << ", %c: " << ptrTy
+     << ", "
+        "%n: i32, %m: i32, %k: i32";
+  emitMatmulLayoutParameters(k, os);
+
+  // Specialize only when the logical first coordinates advance by one.
+  // Runtime/non-unit/negative steps continue through the original body.
+  if (k.loopStepX == 1 && k.loopStepZ == 1) {
+    os << "  %layout_one = arith.constant 1 : i32\n";
+    for (StringRef array : {"a", "b", "c"})
+      os << "  %" << array << "_unit_row = arith.cmpi eq, %" << array
+         << "_s0, %layout_one : i32\n";
+    os << "  %ab_unit_row = arith.andi %a_unit_row, %b_unit_row : i1\n"
+       << "  %abc_unit_row = arith.andi %ab_unit_row, %c_unit_row : i1\n"
+       << "  scf.if %abc_unit_row {\n";
+    emitTritonMatMul2DDotBody(k, blockM, blockN, blockK, true, os);
+    os << "    scf.yield\n  } else {\n";
+    emitTritonMatMul2DDotBody(k, blockM, blockN, blockK, false, os);
+    os << "    scf.yield\n  }\n";
+  } else {
+    emitTritonMatMul2DDotBody(k, blockM, blockN, blockK, false, os);
+  }
+  os << "  tt.return\n}\n\n";
 }
 
 static void emitTritonMatMul2DF32(const fir::TileOffload::ElementwiseKernel &k,
@@ -2241,18 +2279,18 @@ static void emitTritonMatMul2DF32(const fir::TileOffload::ElementwiseKernel &k,
   emitTritonMatMul2DDot(k, blockM, blockN, blockK, kernelName, os);
 }
 
-static void emitTritonMatMul2DF64Dot(const fir::TileOffload::ElementwiseKernel &k,
-                                     int64_t blockM, int64_t blockN,
-                                     int64_t blockK, StringRef kernelName,
-                                     llvm::raw_ostream &os) {
+static void
+emitTritonMatMul2DF64Dot(const fir::TileOffload::ElementwiseKernel &k,
+                         int64_t blockM, int64_t blockN, int64_t blockK,
+                         StringRef kernelName, llvm::raw_ostream &os) {
   assert(k.elementType == fir::TileOffload::ElementType::F64);
   emitTritonMatMul2DDot(k, blockM, blockN, blockK, kernelName, os);
 }
 
-static void emitTritonMatMul2DF64Reduce(const fir::TileOffload::ElementwiseKernel &k,
-                                        int64_t blockM, int64_t blockN,
-                                        int64_t blockK, StringRef kernelName,
-                                        llvm::raw_ostream &os) {
+static void
+emitTritonMatMul2DF64Reduce(const fir::TileOffload::ElementwiseKernel &k,
+                            int64_t blockM, int64_t blockN, int64_t blockK,
+                            StringRef kernelName, llvm::raw_ostream &os) {
   assert(k.elementType == fir::TileOffload::ElementType::F64 &&
          "f64 matmul emitter requires f64 kernel");
 
@@ -2490,10 +2528,10 @@ static void emitTritonMatMul2DF64Reduce(const fir::TileOffload::ElementwiseKerne
   os << "}\n\n";
 }
 
-static void emitTritonMatMul2DF64FMA(const fir::TileOffload::ElementwiseKernel &k,
-                                     int64_t blockM, int64_t blockN,
-                                     int64_t blockK, StringRef kernelName,
-                                     llvm::raw_ostream &os) {
+static void
+emitTritonMatMul2DF64FMA(const fir::TileOffload::ElementwiseKernel &k,
+                         int64_t blockM, int64_t blockN, int64_t blockK,
+                         StringRef kernelName, llvm::raw_ostream &os) {
   assert(k.elementType == fir::TileOffload::ElementType::F64 &&
          "f64 matmul emitter requires f64 kernel");
 
@@ -2710,7 +2748,8 @@ static void emitTritonMatMul2DF64FMA(const fir::TileOffload::ElementwiseKernel &
   os << "}\n\n";
 }
 
-static StringRef jsonParameterRole(fir::TileOffload::TileOffloadKernelParameterRole role) {
+static StringRef
+jsonParameterRole(fir::TileOffload::TileOffloadKernelParameterRole role) {
   using Role = fir::TileOffload::TileOffloadKernelParameterRole;
   switch (role) {
   case Role::Read:
@@ -2743,8 +2782,8 @@ static StringRef jsonParameterRole(fir::TileOffload::TileOffloadKernelParameterR
   llvm_unreachable("unknown TileOffload ABI parameter role");
 }
 
-static std::string
-jsonParameterType(const fir::TileOffload::TileOffloadKernelParameter &parameter) {
+static std::string jsonParameterType(
+    const fir::TileOffload::TileOffloadKernelParameter &parameter) {
   if (parameter.passing ==
       fir::TileOffload::TileOffloadKernelParameterPassing::DevicePointer)
     return jsonPtrType(parameter.elementType);
@@ -2782,10 +2821,11 @@ static void emitJsonABI(const fir::TileOffload::TileOffloadKernelABI &abi,
   os << "]\n";
 }
 
-static void emitJsonDescriptor(const fir::TileOffload::TileOffloadKernelPlan &plan,
-                               int32_t ptxIndex,
-                               const fir::TileOffload::TileOffloadCodegenBackend &backend,
-                               llvm::raw_ostream &os, bool &firstKernel) {
+static void
+emitJsonDescriptor(const fir::TileOffload::TileOffloadKernelPlan &plan,
+                   int32_t ptxIndex,
+                   const fir::TileOffload::TileOffloadCodegenBackend &backend,
+                   llvm::raw_ostream &os, bool &firstKernel) {
   const fir::TileOffload::ElementwiseKernel &k = plan.kernel;
   const fir::TileOffload::TileOffloadKernelSchedule &schedule = plan.schedule;
 
@@ -2800,24 +2840,28 @@ static void emitJsonDescriptor(const fir::TileOffload::TileOffloadKernelPlan &pl
   os << "      \"accelerator_target\": \"" << backend.getAcceleratorTarget()
      << "\",\n";
   os << "      \"device_ir_kind\": \""
-     << fir::TileOffload::TileOffloadDeviceIRKindName(backend.getDeviceIRKind()) << "\",\n";
+     << fir::TileOffload::TileOffloadDeviceIRKindName(backend.getDeviceIRKind())
+     << "\",\n";
   os << "      \"device_image_kind\": \""
-     << fir::TileOffload::TileOffloadDeviceImageKindName(backend.getRuntimeImageKind())
+     << fir::TileOffload::TileOffloadDeviceImageKindName(
+            backend.getRuntimeImageKind())
      << "\",\n";
   os << "      \"image_index\": " << ptxIndex << ",\n";
   os << "      \"image_file\": \"" << plan.name
      << deviceImageExtension(backend.getRuntimeImageKind()) << "\",\n";
   // Legacy aliases consumed by existing CUDA wrappers and runtimes.
-  if (backend.getRuntimeImageKind() == fir::TileOffload::TileOffloadDeviceImageKind::PTX) {
+  if (backend.getRuntimeImageKind() ==
+      fir::TileOffload::TileOffloadDeviceImageKind::PTX) {
     os << "      \"ptx_index\": " << ptxIndex << ",\n";
     os << "      \"ptx_file\": \"" << plan.name << ".ptx\",\n";
   }
-  os << "      \"kind\": \"" << fir::TileOffload::TileOffloadKernelKindName(k.kind)
-     << "\",\n";
+  os << "      \"kind\": \""
+     << fir::TileOffload::TileOffloadKernelKindName(k.kind) << "\",\n";
   if (k.kind == fir::TileOffload::ElementwiseKernelKind::MatMul2D &&
       k.elementType == fir::TileOffload::ElementType::F32)
     os << "      \"matmul_precision\": \""
-       << fir::TileOffload::matmulInputPrecisionName(k.matmulPrecision) << "\",\n";
+       << fir::TileOffload::matmulInputPrecisionName(k.matmulPrecision)
+       << "\",\n";
   os << "      \"rank\": " << k.rank << ",\n";
   os << "      \"loop_steps\": [" << k.loopStepX << ", " << k.loopStepY << ", "
      << k.loopStepZ << "],\n";
@@ -2882,13 +2926,13 @@ static void emitJsonDescriptor(const fir::TileOffload::TileOffloadKernelPlan &pl
   os << "    }";
 }
 
-static void
-emitJsonReductionStageDescriptor(const fir::TileOffload::TileOffloadKernelPlan &plan,
-                                 int32_t ptxIndex,
-                                 const fir::TileOffload::TileOffloadCodegenBackend &backend,
-                                 llvm::raw_ostream &os, bool &firstKernel) {
+static void emitJsonReductionStageDescriptor(
+    const fir::TileOffload::TileOffloadKernelPlan &plan, int32_t ptxIndex,
+    const fir::TileOffload::TileOffloadCodegenBackend &backend,
+    llvm::raw_ostream &os, bool &firstKernel) {
   assert(plan.reductionStage && "reduction stage descriptor without a stage");
-  const fir::TileOffload::TileOffloadReductionStagePlan &stage = *plan.reductionStage;
+  const fir::TileOffload::TileOffloadReductionStagePlan &stage =
+      *plan.reductionStage;
 
   if (!firstKernel)
     os << ",\n";
@@ -2901,15 +2945,18 @@ emitJsonReductionStageDescriptor(const fir::TileOffload::TileOffloadKernelPlan &
   os << "      \"accelerator_target\": \"" << backend.getAcceleratorTarget()
      << "\",\n";
   os << "      \"device_ir_kind\": \""
-     << fir::TileOffload::TileOffloadDeviceIRKindName(backend.getDeviceIRKind()) << "\",\n";
+     << fir::TileOffload::TileOffloadDeviceIRKindName(backend.getDeviceIRKind())
+     << "\",\n";
   os << "      \"device_image_kind\": \""
-     << fir::TileOffload::TileOffloadDeviceImageKindName(backend.getRuntimeImageKind())
+     << fir::TileOffload::TileOffloadDeviceImageKindName(
+            backend.getRuntimeImageKind())
      << "\",\n";
   os << "      \"image_index\": " << ptxIndex << ",\n";
   os << "      \"image_file\": \"" << stage.name
      << deviceImageExtension(backend.getRuntimeImageKind()) << "\",\n";
   // Legacy aliases consumed by existing CUDA wrappers and runtimes.
-  if (backend.getRuntimeImageKind() == fir::TileOffload::TileOffloadDeviceImageKind::PTX) {
+  if (backend.getRuntimeImageKind() ==
+      fir::TileOffload::TileOffloadDeviceImageKind::PTX) {
     os << "      \"ptx_index\": " << ptxIndex << ",\n";
     os << "      \"ptx_file\": \"" << stage.name << ".ptx\",\n";
   }
@@ -2953,17 +3000,19 @@ public:
     return isHIP ? "hip" : "cuda";
   }
 
-  fir::TileOffload::TileOffloadDeviceImageKind getRuntimeImageKind() const override {
+  fir::TileOffload::TileOffloadDeviceImageKind
+  getRuntimeImageKind() const override {
     return isHIP ? fir::TileOffload::TileOffloadDeviceImageKind::HSACO
                  : fir::TileOffload::TileOffloadDeviceImageKind::PTX;
   }
 
-  fir::TileOffload::TileOffloadBackendSupport
-  querySupport(const fir::TileOffload::TileOffloadKernelPlan &plan) const override {
+  fir::TileOffload::TileOffloadBackendSupport querySupport(
+      const fir::TileOffload::TileOffloadKernelPlan &plan) const override {
     const fir::TileOffload::ElementwiseKernel &kernel = plan.kernel;
     const fir::TileOffload::TileOffloadKernelSchedule &schedule = plan.schedule;
 
-    if (kernel.matmulPrecision != fir::TileOffload::MatmulInputPrecision::IEEE) {
+    if (kernel.matmulPrecision !=
+        fir::TileOffload::MatmulInputPrecision::IEEE) {
       if (kernel.kind != fir::TileOffload::ElementwiseKernelKind::MatMul2D ||
           kernel.elementType != fir::TileOffload::ElementType::F32)
         return fir::TileOffload::TileOffloadBackendSupport::failure(
@@ -3010,8 +3059,9 @@ public:
     return fir::TileOffload::TileOffloadBackendSupport::success();
   }
 
-  void beginModule(const fir::TileOffload::TileOffloadKernelPlanOptions &options,
-                   llvm::raw_ostream &os) const override {
+  void
+  beginModule(const fir::TileOffload::TileOffloadKernelPlanOptions &options,
+              llvm::raw_ostream &os) const override {
     os << "module attributes {"
        << "\"ttg.num-warps\" = " << options.requestedParallelSubgroups
        << " : i32, " << "\"ttg.num-ctas\" = 1 : i32, "
@@ -3091,16 +3141,18 @@ private:
 };
 
 struct TileOffloadLowerToTritonPass
-    : public fir::TileOffload::impl::TileOffloadLowerToTritonBase<TileOffloadLowerToTritonPass> {
+    : public fir::TileOffload::impl::TileOffloadLowerToTritonBase<
+          TileOffloadLowerToTritonPass> {
   TileOffloadLowerToTritonPass() = default;
 
-  TileOffloadLowerToTritonPass(llvm::StringRef ttirOutput, llvm::StringRef jsonOutput,
-                         int32_t numWarps, int32_t threadsPerWarp,
-                         int32_t numStages, llvm::StringRef f64MatmulStrategy,
-                         llvm::StringRef acceleratorTarget,
-                         llvm::StringRef backend,
-                         llvm::StringRef fallbackBackend,
-                         bool allowBackendFallback) {
+  TileOffloadLowerToTritonPass(llvm::StringRef ttirOutput,
+                               llvm::StringRef jsonOutput, int32_t numWarps,
+                               int32_t threadsPerWarp, int32_t numStages,
+                               llvm::StringRef f64MatmulStrategy,
+                               llvm::StringRef acceleratorTarget,
+                               llvm::StringRef backend,
+                               llvm::StringRef fallbackBackend,
+                               bool allowBackendFallback) {
     this->ttirOutput = ttirOutput.str();
     this->jsonOutput = jsonOutput.str();
     this->numWarps = numWarps;
@@ -3147,18 +3199,18 @@ struct TileOffloadLowerToTritonPass
 
     if ((!isHIP && tritonThreadsPerWarp != 32) ||
         (isHIP && tritonThreadsPerWarp != 32 && tritonThreadsPerWarp != 64)) {
-      module.emitError(isHIP
-                           ? "TileOffload HIP supports 32 or 64 threads per subgroup"
-                           : "TileOffload CUDA supports exactly 32 threads per warp");
+      module.emitError(
+          isHIP ? "TileOffload HIP supports 32 or 64 threads per subgroup"
+                : "TileOffload CUDA supports exactly 32 threads per warp");
       signalPassFailure();
       return;
     }
 
     if (!isValidBackendName(this->backend.getValue()) ||
         !isValidBackendName(this->fallbackBackend.getValue())) {
-      module.emitError(
-          "TileOffload backend names may contain only letters, digits, '.', '_', "
-          "'+' and '-'");
+      module.emitError("TileOffload backend names may contain only letters, "
+                       "digits, '.', '_', "
+                       "'+' and '-'");
       signalPassFailure();
       return;
     }
@@ -3169,23 +3221,28 @@ struct TileOffloadLowerToTritonPass
     planOptions.pipelineStages = tritonNumStages;
 
     if (this->f64MatmulStrategy == "dot") {
-      planOptions.f64MatmulStrategy = fir::TileOffload::TileOffloadMatmulStrategy::Dot;
+      planOptions.f64MatmulStrategy =
+          fir::TileOffload::TileOffloadMatmulStrategy::Dot;
     } else if (this->f64MatmulStrategy == "reduce") {
-      planOptions.f64MatmulStrategy = fir::TileOffload::TileOffloadMatmulStrategy::Reduce;
+      planOptions.f64MatmulStrategy =
+          fir::TileOffload::TileOffloadMatmulStrategy::Reduce;
     } else if (this->f64MatmulStrategy == "fma") {
-      planOptions.f64MatmulStrategy = fir::TileOffload::TileOffloadMatmulStrategy::FMA;
+      planOptions.f64MatmulStrategy =
+          fir::TileOffload::TileOffloadMatmulStrategy::FMA;
     } else {
-      module.emitError("TileOffload f64-matmul-strategy must be dot, reduce, or fma");
+      module.emitError(
+          "TileOffload f64-matmul-strategy must be dot, reduce, or fma");
       signalPassFailure();
       return;
     }
 
     TritonBackend tritonBackend(isHIP);
     CudaTileBackend cudaTileBackend(isHIP);
-    llvm::SmallVector<const fir::TileOffload::TileOffloadCodegenBackend *> backends{
-        &tritonBackend, &cudaTileBackend};
+    llvm::SmallVector<const fir::TileOffload::TileOffloadCodegenBackend *>
+        backends{&tritonBackend, &cudaTileBackend};
     std::vector<fir::TileOffload::TileOffloadKernelPlan> plans;
-    std::vector<const fir::TileOffload::TileOffloadCodegenBackend *> selectedBackends;
+    std::vector<const fir::TileOffload::TileOffloadCodegenBackend *>
+        selectedBackends;
     bool usedBackendFallback = false;
 
     bool hasSimpleElementwiseLaunch = false;
@@ -3198,7 +3255,8 @@ struct TileOffloadLowerToTritonPass
 
     module.walk([&](fir::TileOffload::LaunchOp launchOp) {
       int32_t kernelId = scanFallbackId++;
-      if (auto attr = launchOp->getAttrOfType<IntegerAttr>("TileOffload.kernel_id"))
+      if (auto attr =
+              launchOp->getAttrOfType<IntegerAttr>("TileOffload.kernel_id"))
         kernelId = static_cast<int32_t>(attr.getInt());
       nextSyntheticKernelId = std::max(nextSyntheticKernelId, kernelId + 1);
     });
@@ -3246,9 +3304,9 @@ struct TileOffloadLowerToTritonPass
       }
 
       fir::TileOffload::TileOffloadBackendSelection selection =
-          fir::TileOffload::selectTileOffloadBackend(plan, backends, this->backend,
-                                         this->fallbackBackend,
-                                         this->allowBackendFallback);
+          fir::TileOffload::selectTileOffloadBackend(
+              plan, backends, this->backend, this->fallbackBackend,
+              this->allowBackendFallback);
       if (!selection.succeeded()) {
         launchOp.emitError("TileOffload backend selection failed: ")
             << selection.diagnostic;
@@ -3272,10 +3330,12 @@ struct TileOffloadLowerToTritonPass
     if ((hasSimpleElementwiseLaunch || hasReductionLaunch) && hasMatmulLaunch &&
         tritonNumWarps != 1) {
       module.emitWarning()
-          << "TileOffload module contains both simple elementwise/reduction kernels "
+          << "TileOffload module contains both simple elementwise/reduction "
+             "kernels "
              "and "
              "matmul kernels. Per-kernel TTIR splitting is required for true "
-             "per-kernel num-warps. The TileOffload wrapper should compile each "
+             "per-kernel num-warps. The TileOffload wrapper should compile "
+             "each "
              "emitted "
              "kernel separately.";
     }
@@ -3286,7 +3346,8 @@ struct TileOffloadLowerToTritonPass
     std::error_code ttirEc;
     llvm::raw_fd_ostream ttirOs(ttirPath, ttirEc);
     if (ttirEc) {
-      module.emitError("cannot open TileOffload TTIR output file: ") << ttirPath;
+      module.emitError("cannot open TileOffload TTIR output file: ")
+          << ttirPath;
       signalPassFailure();
       return;
     }
@@ -3294,7 +3355,8 @@ struct TileOffloadLowerToTritonPass
     std::error_code jsonEc;
     llvm::raw_fd_ostream jsonOs(jsonPath, jsonEc);
     if (jsonEc) {
-      module.emitError("cannot open TileOffload JSON output file: ") << jsonPath;
+      module.emitError("cannot open TileOffload JSON output file: ")
+          << jsonPath;
       signalPassFailure();
       return;
     }
@@ -3395,11 +3457,13 @@ struct TileOffloadLowerToTritonPass
 
 } // namespace
 
-std::unique_ptr<mlir::Pass> fir::TileOffload::createTileOffloadLowerToTritonPass() {
+std::unique_ptr<mlir::Pass>
+fir::TileOffload::createTileOffloadLowerToTritonPass() {
   return std::make_unique<TileOffloadLowerToTritonPass>();
 }
 
-std::unique_ptr<mlir::Pass> fir::TileOffload::createTileOffloadLowerToTritonPass(
+std::unique_ptr<mlir::Pass>
+fir::TileOffload::createTileOffloadLowerToTritonPass(
     llvm::StringRef ttirOutput, llvm::StringRef jsonOutput, int32_t numWarps,
     int32_t threadsPerWarp, int32_t numStages,
     llvm::StringRef f64MatmulStrategy, llvm::StringRef backend,
@@ -3410,7 +3474,8 @@ std::unique_ptr<mlir::Pass> fir::TileOffload::createTileOffloadLowerToTritonPass
       "cuda");
 }
 
-std::unique_ptr<mlir::Pass> fir::TileOffload::createTileOffloadLowerToTritonPass(
+std::unique_ptr<mlir::Pass>
+fir::TileOffload::createTileOffloadLowerToTritonPass(
     llvm::StringRef ttirOutput, llvm::StringRef jsonOutput, int32_t numWarps,
     int32_t threadsPerWarp, int32_t numStages,
     llvm::StringRef f64MatmulStrategy, llvm::StringRef backend,
