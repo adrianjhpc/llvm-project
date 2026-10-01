@@ -20,6 +20,7 @@
 #include <cassert>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <functional>
 #include <iomanip>
 #include <limits>
@@ -2070,7 +2071,16 @@ static void emitMatmulOffsets(llvm::raw_ostream &os, StringRef array,
 static void
 emitTritonMatMul2DDotBody(const fir::TileOffload::ElementwiseKernel &k,
                           int64_t blockM, int64_t blockN, int64_t blockK,
-                          bool unitRowStride, llvm::raw_ostream &os) {
+                          bool unitRowStride, llvm::raw_ostream &os,
+                          bool alignedFour = false) {
+  // Alignment is in bytes for pointers; contiguity/constancy are in elements.
+  // Only the enclosing guarded TF32 arm may request these hints.
+  const char *pointerHints =
+      alignedFour ? " {tt.contiguity = dense<[4, 1]> : tensor<2xi32>, "
+                    "tt.divisibility = dense<[16, 4]> : tensor<2xi32>}"
+                  : "";
+  const char *maskHints =
+      alignedFour ? " {tt.constancy = dense<[4, 1]> : tensor<2xi32>}" : "";
   std::string ptrTy = ptrType(k.elementType);
   std::string elemTy = ttElementType(k.elementType).str();
 
@@ -2158,8 +2168,8 @@ emitTritonMatMul2DDotBody(const fir::TileOffload::ElementwiseKernel &k,
      << "x1xi1> -> tensor<" << blockM << "x" << blockK << "xi1>\n";
   os << "    %mask_k_b_a = tt.broadcast %mask_k_e_a : tensor<1x" << blockK
      << "xi1> -> tensor<" << blockM << "x" << blockK << "xi1>\n";
-  os << "    %mask_a = arith.andi %mask_m_b, %mask_k_b_a : tensor<" << blockM
-     << "x" << blockK << "xi1>\n";
+  os << "    %mask_a = arith.andi %mask_m_b, %mask_k_b_a" << maskHints
+     << " : tensor<" << blockM << "x" << blockK << "xi1>\n";
 
   os << "    %mask_k_e_b = tt.expand_dims %mask_k {axis = 1 : i32} : tensor<"
      << blockK << "xi1> -> tensor<" << blockK << "x1xi1>\n";
@@ -2169,19 +2179,19 @@ emitTritonMatMul2DDotBody(const fir::TileOffload::ElementwiseKernel &k,
      << "x1xi1> -> tensor<" << blockK << "x" << blockN << "xi1>\n";
   os << "    %mask_n_b = tt.broadcast %mask_n_e : tensor<1x" << blockN
      << "xi1> -> tensor<" << blockK << "x" << blockN << "xi1>\n";
-  os << "    %mask_b = arith.andi %mask_k_b_b, %mask_n_b : tensor<" << blockK
-     << "x" << blockN << "xi1>\n";
+  os << "    %mask_b = arith.andi %mask_k_b_b, %mask_n_b" << maskHints
+     << " : tensor<" << blockK << "x" << blockN << "xi1>\n";
 
   os << "    %a_base = tt.splat %a : " << ptrTy << " -> tensor<" << blockM
      << "x" << blockK << "x" << ptrTy << ">\n";
   os << "    %b_base = tt.splat %b : " << ptrTy << " -> tensor<" << blockK
      << "x" << blockN << "x" << ptrTy << ">\n";
-  os << "    %a_ptrs = tt.addptr %a_base, %a_offsets : tensor<" << blockM << "x"
-     << blockK << "x" << ptrTy << ">, tensor<" << blockM << "x" << blockK
-     << "xi64>\n";
-  os << "    %b_ptrs = tt.addptr %b_base, %b_offsets : tensor<" << blockK << "x"
-     << blockN << "x" << ptrTy << ">, tensor<" << blockK << "x" << blockN
-     << "xi64>\n";
+  os << "    %a_ptrs = tt.addptr %a_base, %a_offsets" << pointerHints
+     << " : tensor<" << blockM << "x" << blockK << "x" << ptrTy << ">, tensor<"
+     << blockM << "x" << blockK << "xi64>\n";
+  os << "    %b_ptrs = tt.addptr %b_base, %b_offsets" << pointerHints
+     << " : tensor<" << blockK << "x" << blockN << "x" << ptrTy << ">, tensor<"
+     << blockK << "x" << blockN << "xi64>\n";
   // Masked-off K lanes still participate in the dot product. A masked load
   // without an explicit other value is undefined, not a zero-padding operation.
   os << "    %a_zero = tt.splat %zero : " << elemTy << " -> tensor<" << blockM
@@ -2226,16 +2236,64 @@ emitTritonMatMul2DDotBody(const fir::TileOffload::ElementwiseKernel &k,
      << "x1xi1> -> tensor<" << blockM << "x" << blockN << "xi1>\n";
   os << "  %mask_n_b_c = tt.broadcast %mask_n_e_c : tensor<1x" << blockN
      << "xi1> -> tensor<" << blockM << "x" << blockN << "xi1>\n";
-  os << "  %mask_c = arith.andi %mask_m_b_c, %mask_n_b_c : tensor<" << blockM
-     << "x" << blockN << "xi1>\n";
+  os << "  %mask_c = arith.andi %mask_m_b_c, %mask_n_b_c" << maskHints
+     << " : tensor<" << blockM << "x" << blockN << "xi1>\n";
 
   os << "  %c_base = tt.splat %c : " << ptrTy << " -> tensor<" << blockM << "x"
      << blockN << "x" << ptrTy << ">\n";
-  os << "  %c_ptrs = tt.addptr %c_base, %c_offsets : tensor<" << blockM << "x"
-     << blockN << "x" << ptrTy << ">, tensor<" << blockM << "x" << blockN
-     << "xi64>\n";
+  os << "  %c_ptrs = tt.addptr %c_base, %c_offsets" << pointerHints
+     << " : tensor<" << blockM << "x" << blockN << "x" << ptrTy << ">, tensor<"
+     << blockM << "x" << blockN << "xi64>\n";
   os << "  tt.store %c_ptrs, %acc, %mask_c : tensor<" << blockM << "x" << blockN
      << "x" << ptrTy << ">\n";
+}
+
+// Conservative opt-in experiment: establish 16-byte alignment and groups of
+// four uniformly masked FP32 elements before attaching any vectorization hints.
+static void emitMatmulAlignedFourGuard(llvm::raw_ostream &os) {
+  os << "    %al_zero = arith.constant 0 : i64\n"
+     << "    %al_three = arith.constant 3 : i64\n"
+     << "    %al_fifteen = arith.constant 15 : i64\n";
+  for (StringRef extent : {"n", "k"})
+    os << "    %al_" << extent << "64 = arith.extsi %" << extent
+       << " : i32 to i64\n"
+       << "    %al_" << extent << "_rem = arith.andi %al_" << extent
+       << "64, %al_three : i64\n"
+       << "    %al_" << extent << "_ok = arith.cmpi eq, %al_" << extent
+       << "_rem, %al_zero : i64\n";
+  os << "    %al_extents = arith.andi %al_n_ok, %al_k_ok : i1\n";
+  for (StringRef array : {"a", "b", "c"}) {
+    StringRef row = array == "b" ? "lz" : "lx";
+    os << "    %al_" << array << "_ptr = tt.ptr_to_int %" << array
+       << " : !tt.ptr<f32> -> i64\n"
+       << "    %al_" << array << "_ptr_rem = arith.andi %al_" << array
+       << "_ptr, %al_fifteen : i64\n"
+       << "    %al_" << array << "_ptr_ok = arith.cmpi eq, %al_" << array
+       << "_ptr_rem, %al_zero : i64\n"
+       << "    %al_" << array << "_row = arith.extsi %" << row
+       << " : i32 to i64\n"
+       << "    %al_" << array << "_lb = arith.extsi %" << array
+       << "_l0 : i32 to i64\n"
+       << "    %al_" << array << "_delta = arith.subi %al_" << array
+       << "_row, %al_" << array << "_lb : i64\n"
+       << "    %al_" << array << "_delta_rem = arith.andi %al_" << array
+       << "_delta, %al_three : i64\n"
+       << "    %al_" << array << "_delta_ok = arith.cmpi eq, %al_" << array
+       << "_delta_rem, %al_zero : i64\n"
+       << "    %al_" << array << "_ld = arith.extsi %" << array
+       << "_s1 : i32 to i64\n"
+       << "    %al_" << array << "_ld_rem = arith.andi %al_" << array
+       << "_ld, %al_three : i64\n"
+       << "    %al_" << array << "_ld_ok = arith.cmpi eq, %al_" << array
+       << "_ld_rem, %al_zero : i64\n"
+       << "    %al_" << array << "_origin_ok = arith.andi %al_" << array
+       << "_ptr_ok, %al_" << array << "_delta_ok : i1\n"
+       << "    %al_" << array << "_ok = arith.andi %al_" << array
+       << "_origin_ok, %al_" << array << "_ld_ok : i1\n";
+  }
+  os << "    %al_ab = arith.andi %al_a_ok, %al_b_ok : i1\n"
+     << "    %al_abc = arith.andi %al_ab, %al_c_ok : i1\n"
+     << "    %al_all = arith.andi %al_abc, %al_extents : i1\n";
 }
 
 static void emitTritonMatMul2DDot(const fir::TileOffload::ElementwiseKernel &k,
@@ -2261,7 +2319,24 @@ static void emitTritonMatMul2DDot(const fir::TileOffload::ElementwiseKernel &k,
     os << "  %ab_unit_row = arith.andi %a_unit_row, %b_unit_row : i1\n"
        << "  %abc_unit_row = arith.andi %ab_unit_row, %c_unit_row : i1\n"
        << "  scf.if %abc_unit_row {\n";
-    emitTritonMatMul2DDotBody(k, blockM, blockN, blockK, true, os);
+    const char *alignedEnv = std::getenv("TILEOFF_MATMUL_ALIGNED_LOADS");
+    const bool tryAligned =
+        alignedEnv && std::string(alignedEnv) == "1" &&
+        k.elementType == fir::TileOffload::ElementType::F32 &&
+        StringRef(fir::TileOffload::matmulInputPrecisionName(
+            k.matmulPrecision)) == "tf32" &&
+        k.loopStepY == 1 && blockM % 4 == 0 && blockN % 4 == 0 &&
+        blockK % 4 == 0;
+    if (tryAligned) {
+      emitMatmulAlignedFourGuard(os);
+      os << "    scf.if %al_all {\n";
+      emitTritonMatMul2DDotBody(k, blockM, blockN, blockK, true, os, true);
+      os << "      scf.yield\n    } else {\n";
+      emitTritonMatMul2DDotBody(k, blockM, blockN, blockK, true, os);
+      os << "      scf.yield\n    }\n";
+    } else {
+      emitTritonMatMul2DDotBody(k, blockM, blockN, blockK, true, os);
+    }
     os << "    scf.yield\n  } else {\n";
     emitTritonMatMul2DDotBody(k, blockM, blockN, blockK, false, os);
     os << "    scf.yield\n  }\n";
