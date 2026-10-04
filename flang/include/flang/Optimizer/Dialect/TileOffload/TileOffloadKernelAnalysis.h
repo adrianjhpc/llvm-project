@@ -258,8 +258,8 @@ struct ElementwiseReductionOutput {
 
 /// Classification of scalar storage referenced by a parallel loop.
 ///
-/// ReadOnlyCapture is materialized outside TileOffload.launch and passed by value.
-/// IterationPrivate is assigned and consumed within one logical loop
+/// ReadOnlyCapture is materialized outside TileOffload.launch and passed by
+/// value. IterationPrivate is assigned and consumed within one logical loop
 /// iteration; its defining expression is promoted to device SSA. A remaining
 /// mutable reference is unsafe because it would otherwise become one uniform
 /// kernel argument shared by all logical iterations.
@@ -270,6 +270,8 @@ enum class ScalarReferenceKind {
 };
 
 struct ElementwiseKernel {
+  // Synthetic matmul variant consuming compiler-packed AP(k,i).
+  bool autoPackedA = false;
   MatmulInputPrecision matmulPrecision = MatmulInputPrecision::IEEE;
   int32_t rank = 1;
 

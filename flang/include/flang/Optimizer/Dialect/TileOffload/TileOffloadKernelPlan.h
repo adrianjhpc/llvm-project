@@ -16,6 +16,10 @@
 
 namespace fir::TileOffload {
 
+/// True for the recognised AP(k,i)*B(k,j) matmul storage orientation.
+/// Lower bounds and strides in the launch ABI remain in physical array order.
+bool matmulHasTransposedA(const ElementwiseKernel &kernel);
+
 /// Compiler-side device IR produced by an TileOffload code-generation backend.
 /// These values describe intermediate artifacts, not necessarily something a
 /// runtime loader can consume directly.
@@ -24,7 +28,8 @@ enum class TileOffloadDeviceIRKind { TTIR, LLVMIR, CUDATileIR, PTX };
 /// Runtime-consumable device image formats.
 enum class TileOffloadDeviceImageKind { PTX, Cubin, HSACO };
 
-inline llvm::StringRef TileOffloadDeviceIRKindName(TileOffloadDeviceIRKind kind) {
+inline llvm::StringRef
+TileOffloadDeviceIRKindName(TileOffloadDeviceIRKind kind) {
   switch (kind) {
   case TileOffloadDeviceIRKind::TTIR:
     return "ttir";
@@ -38,7 +43,8 @@ inline llvm::StringRef TileOffloadDeviceIRKindName(TileOffloadDeviceIRKind kind)
   return "unknown";
 }
 
-inline llvm::StringRef TileOffloadDeviceImageKindName(TileOffloadDeviceImageKind kind) {
+inline llvm::StringRef
+TileOffloadDeviceImageKindName(TileOffloadDeviceImageKind kind) {
   switch (kind) {
   case TileOffloadDeviceImageKind::PTX:
     return "ptx";
@@ -68,13 +74,14 @@ enum class TileOffloadKernelParameterRole {
 
 enum class TileOffloadKernelParameterPassing { DevicePointer, Value };
 
-/// One source-level parameter in the stable TileOffload kernel ABI. Backend-private
-/// parameters, such as parameters appended by Triton/NVVM, are deliberately
-/// not represented here.
+/// One source-level parameter in the stable TileOffload kernel ABI.
+/// Backend-private parameters, such as parameters appended by Triton/NVVM, are
+/// deliberately not represented here.
 struct TileOffloadKernelParameter {
   unsigned slot = 0;
   TileOffloadKernelParameterRole role = TileOffloadKernelParameterRole::Read;
-  TileOffloadKernelParameterPassing passing = TileOffloadKernelParameterPassing::Value;
+  TileOffloadKernelParameterPassing passing =
+      TileOffloadKernelParameterPassing::Value;
   ElementType elementType = ElementType::Unknown;
   std::string name;
   int32_t arrayIndex = -1;
@@ -107,7 +114,8 @@ struct TileOffloadKernelSchedule {
   int32_t parallelSubgroups = 1;
   int32_t subgroupWidth = 32;
   int32_t pipelineStages = 3;
-  TileOffloadMatmulStrategy f64MatmulStrategy = TileOffloadMatmulStrategy::Reduce;
+  TileOffloadMatmulStrategy f64MatmulStrategy =
+      TileOffloadMatmulStrategy::Reduce;
 };
 
 struct TileOffloadReductionStagePlan {
@@ -133,20 +141,23 @@ struct TileOffloadKernelPlan {
   TileOffloadKernelSchedule schedule;
   TileOffloadKernelABI abi;
   std::optional<TileOffloadReductionStagePlan> reductionStage;
+  int32_t autoPackAId = -1;
+  int32_t autoPackedMatmulId = -1;
 };
 
 struct TileOffloadKernelPlanOptions {
   int32_t requestedParallelSubgroups = 1;
   int32_t subgroupWidth = 32;
   int32_t pipelineStages = 3;
-  TileOffloadMatmulStrategy f64MatmulStrategy = TileOffloadMatmulStrategy::Reduce;
+  TileOffloadMatmulStrategy f64MatmulStrategy =
+      TileOffloadMatmulStrategy::Reduce;
 };
 
 class TileOffloadKernelPlanResult {
 public:
   static TileOffloadKernelPlanResult success(TileOffloadKernelPlan plan);
   static TileOffloadKernelPlanResult failure(mlir::Operation *where,
-                                       std::string reason);
+                                             std::string reason);
 
   bool succeeded() const { return plan.has_value(); }
   bool failed() const { return !succeeded(); }
@@ -161,9 +172,9 @@ private:
 };
 
 TileOffloadKernelPlanResult
-buildTileOffloadKernelPlan(fir::TileOffload::LaunchOp launchOp, int32_t fallbackId,
-                     int32_t nextSyntheticKernelId,
-                     const TileOffloadKernelPlanOptions &options);
+buildTileOffloadKernelPlan(fir::TileOffload::LaunchOp launchOp,
+                           int32_t fallbackId, int32_t nextSyntheticKernelId,
+                           const TileOffloadKernelPlanOptions &options);
 
 bool isReductionKernelKind(ElementwiseKernelKind kind);
 llvm::StringRef TileOffloadKernelKindName(ElementwiseKernelKind kind);
@@ -178,9 +189,9 @@ struct TileOffloadBackendSupport {
   }
 };
 
-/// Interface shared by TileOffload device-code backends. Module framing and kernel
-/// emission use raw_ostream so textual and bytecode backends can share the
-/// orchestration layer.
+/// Interface shared by TileOffload device-code backends. Module framing and
+/// kernel emission use raw_ostream so textual and bytecode backends can share
+/// the orchestration layer.
 class TileOffloadCodegenBackend {
 public:
   virtual ~TileOffloadCodegenBackend() = default;
@@ -201,8 +212,8 @@ public:
   virtual void endModule(llvm::raw_ostream &os) const = 0;
 
   /// Number of backend-private pointer arguments appended after the stable
-  /// TileOffload ABI. This preserves compatibility with the current runtime while
-  /// keeping those arguments out of TileOffloadKernelABI.
+  /// TileOffload ABI. This preserves compatibility with the current runtime
+  /// while keeping those arguments out of TileOffloadKernelABI.
   virtual int32_t
   getPrivatePointerArgumentCount(const TileOffloadKernelPlan &plan) const = 0;
 };

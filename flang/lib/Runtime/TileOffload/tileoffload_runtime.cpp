@@ -35,6 +35,7 @@ using CUdeviceptr = std::uintptr_t;
 using CUfunction_attribute = hipFunction_attribute;
 
 static constexpr CUresult CUDA_SUCCESS = hipSuccess;
+static constexpr CUresult CUDA_ERROR_OUT_OF_MEMORY = hipErrorOutOfMemory;
 static constexpr CUresult CUDA_ERROR_NO_DEVICE = hipErrorNoDevice;
 static constexpr CUresult CUDA_ERROR_NOT_INITIALIZED = hipErrorNotInitialized;
 static constexpr CUresult CUDA_ERROR_ILLEGAL_ADDRESS = hipErrorIllegalAddress;
@@ -932,6 +933,9 @@ struct TileOffloadKernelDesc {
   // Synthetic kernel used to recursively reduce a partials buffer. A negative
   // value denotes older metadata that requires the host-side fallback.
   int32_t reductionStageId = -1;
+  int32_t autoPackAId = -1, autoPackedMatmulId = -1;
+  bool matmulTransposedA = false;
+  int32_t compiledSharedBytes = -1;
 
   int32_t launchAbiVersion = 1;
   int32_t arrayCount = 0;
@@ -1234,6 +1238,7 @@ struct TileOffloadContextState {
   std::unordered_map<void *, TileOffloadDeviceAllocation> deviceCache;
   std::vector<TileOffloadDataRegionFrame> dataRegions;
   TileOffloadReductionWorkspace reductionWorkspace;
+  TileOffloadDeviceAllocation matmulPackWorkspace;
 };
 
 struct TileOffloadKernelRegistry {
@@ -1734,6 +1739,10 @@ TileOffloadParseKernelDescsFromJson(const std::string &json) {
     desc.pack = jsonParsePackEntries(objectText);
     desc.parameters = jsonParseParameterEntries(objectText);
     jsonFindInt(objectText, "reduction_stage_id", desc.reductionStageId);
+    jsonFindInt(objectText, "auto_pack_a_id", desc.autoPackAId);
+    jsonFindInt(objectText, "auto_packed_matmul_id", desc.autoPackedMatmulId);
+    jsonFindBool(objectText, "matmul_transposed_a", desc.matmulTransposedA);
+    jsonFindInt(objectText, "compiled_shared_bytes", desc.compiledSharedBytes);
 
     std::string reductionOp;
     if (jsonFindString(objectText, "reduction_op", reductionOp)) {
@@ -1851,6 +1860,8 @@ static void TileOffloadCleanup() {
       cuCtxSetCurrent(state.context);
     if (state.stream)
       cuStreamSynchronize(state.stream);
+    if (state.matmulPackWorkspace.ptr)
+      cuMemFree(state.matmulPackWorkspace.ptr);
     if (workspace.partials.ptr)
       cuMemFree(workspace.partials.ptr);
     if (workspace.scratch.ptr)
@@ -4908,6 +4919,8 @@ static int32_t TileOffloadCheckedI32Layout(int64_t value, const char *what) {
   return static_cast<int32_t>(value);
 }
 
+#include "tileoffload_matmul_pack.inc"
+
 extern "C" void __tileoff_commit_launch_v2() {
 
   // For profiling
@@ -4995,8 +5008,8 @@ extern "C" void __tileoff_commit_launch_v2() {
   if (desc->isMatmul) {
     // Each operand's selected rectangle must fit its full bound allocation.
     // K=0 still writes the zero accumulator to C, but does not read A or B.
-    const int rows[] = {0, 2, 0};
-    const int cols[] = {2, 1, 1};
+    const int rows[] = {desc->matmulTransposedA ? 2 : 0, 2, 0};
+    const int cols[] = {desc->matmulTransposedA ? 0 : 2, 1, 1};
     for (int operand = 0; operand < 3; ++operand) {
       const auto &parameter = desc->parameters.at(operand);
       const auto &array = pending.arrays.at(parameter.arrayIndex);
@@ -5156,6 +5169,13 @@ extern "C" void __tileoff_commit_launch_v2() {
     arguments.push_back(&hidden.hidden1);
   }
 
+  // Pack and consume on the same context stream; only scratch capacity is
+  // cached. Pending host descriptors and original device allocations stay intact.
+  const TileOffloadKernelDesc *packedDesc = TileOffloadTryPackMatmulA(
+      desc, pending, devicePointers, parameterValues, arguments);
+  if (packedDesc)
+    function = getKernelFunction(packedDesc->id);
+
   unsigned gridX =
       TileOffloadCdiv(pending.extent[0], pending.block[0], "v2 grid dimension X");
   unsigned gridY = pending.rank >= 2
@@ -5182,7 +5202,10 @@ extern "C" void __tileoff_commit_launch_v2() {
                       : TileOffloadMatmulDynamicSharedBytes(desc, pending.block[0],
                             pending.block[1], pending.block[2]);
   }
-  TileOffloadConfigureDynamicSharedMemory(function, pending.kernelId, sharedBytes);
+  if (packedDesc)
+    sharedBytes = static_cast<unsigned>(packedDesc->compiledSharedBytes);
+  TileOffloadConfigureDynamicSharedMemory(function,
+      packedDesc ? packedDesc->id : pending.kernelId, sharedBytes);
   TILEOFF_CUDA_CHECK(
       cuLaunchKernel(function, gridX, gridY, 1, cudaBlockX, 1, 1, sharedBytes,
           TileOffloadActiveContextState().stream, arguments.data(), nullptr));

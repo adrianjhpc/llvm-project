@@ -2065,6 +2065,21 @@ static void emitMatmulOffsets(llvm::raw_ostream &os, StringRef array,
      << "_pr, %" << stem << "_pc : " << ty << "\n";
 }
 
+// Map logical (i,k) into physical AP(k,i) when A is explicitly packed.
+static void emitMatmulAOffsets(const fir::TileOffload::ElementwiseKernel &k,
+                               llvm::raw_ostream &os, StringRef suffix,
+                               StringRef row, StringRef col, StringRef shape,
+                               StringRef lowerRow, StringRef lowerCol,
+                               int64_t stepRow, int64_t stepCol,
+                               bool unitRowStride = false) {
+  if (fir::TileOffload::matmulHasTransposedA(k))
+    emitMatmulOffsets(os, "a", suffix, col, row, shape, lowerCol, lowerRow,
+                      stepCol, stepRow, unitRowStride);
+  else
+    emitMatmulOffsets(os, "a", suffix, row, col, shape, lowerRow, lowerCol,
+                      stepRow, stepCol, unitRowStride);
+}
+
 // Emit a complete matmul body inside either the function or an scf.if arm.
 // Each arm owns its SSA names; the public device ABI and kernel identity stay
 // unchanged. The generic arm retains arbitrary array/loop strides.
@@ -2081,6 +2096,16 @@ emitTritonMatMul2DDotBody(const fir::TileOffload::ElementwiseKernel &k,
                   : "";
   const char *maskHints =
       alignedFour ? " {tt.constancy = dense<[4, 1]> : tensor<2xi32>}" : "";
+  const bool transposedA = fir::TileOffload::matmulHasTransposedA(k);
+  const char *aPointerHints =
+      alignedFour && transposedA
+          ? " {tt.contiguity = dense<[1, 4]> : tensor<2xi32>, "
+            "tt.divisibility = dense<[4, 16]> : tensor<2xi32>}"
+          : pointerHints;
+  const char *aMaskHints =
+      alignedFour && transposedA
+          ? " {tt.constancy = dense<[1, 4]> : tensor<2xi32>}"
+          : maskHints;
   std::string ptrTy = ptrType(k.elementType);
   std::string elemTy = ttElementType(k.elementType).str();
 
@@ -2140,9 +2165,9 @@ emitTritonMatMul2DDotBody(const fir::TileOffload::ElementwiseKernel &k,
      << "x1xi32> -> tensor<" << blockM << "x" << blockK << "xi32>\n";
   os << "    %offs_k_b_a = tt.broadcast %offs_k_e_a : tensor<1x" << blockK
      << "xi32> -> tensor<" << blockM << "x" << blockK << "xi32>\n";
-  emitMatmulOffsets(os, "a", "", "offs_m_b", "offs_k_b_a",
-                    std::to_string(blockM) + "x" + std::to_string(blockK), "lx",
-                    "lz", k.loopStepX, k.loopStepZ, unitRowStride);
+  emitMatmulAOffsets(k, os, "", "offs_m_b", "offs_k_b_a",
+                     std::to_string(blockM) + "x" + std::to_string(blockK),
+                     "lx", "lz", k.loopStepX, k.loopStepZ, unitRowStride);
 
   os << "    %offs_k_e_b = tt.expand_dims %offs_k {axis = 1 : i32} : tensor<"
      << blockK << "xi32> -> tensor<" << blockK << "x1xi32>\n";
@@ -2168,7 +2193,7 @@ emitTritonMatMul2DDotBody(const fir::TileOffload::ElementwiseKernel &k,
      << "x1xi1> -> tensor<" << blockM << "x" << blockK << "xi1>\n";
   os << "    %mask_k_b_a = tt.broadcast %mask_k_e_a : tensor<1x" << blockK
      << "xi1> -> tensor<" << blockM << "x" << blockK << "xi1>\n";
-  os << "    %mask_a = arith.andi %mask_m_b, %mask_k_b_a" << maskHints
+  os << "    %mask_a = arith.andi %mask_m_b, %mask_k_b_a" << aMaskHints
      << " : tensor<" << blockM << "x" << blockK << "xi1>\n";
 
   os << "    %mask_k_e_b = tt.expand_dims %mask_k {axis = 1 : i32} : tensor<"
@@ -2186,7 +2211,7 @@ emitTritonMatMul2DDotBody(const fir::TileOffload::ElementwiseKernel &k,
      << "x" << blockK << "x" << ptrTy << ">\n";
   os << "    %b_base = tt.splat %b : " << ptrTy << " -> tensor<" << blockK
      << "x" << blockN << "x" << ptrTy << ">\n";
-  os << "    %a_ptrs = tt.addptr %a_base, %a_offsets" << pointerHints
+  os << "    %a_ptrs = tt.addptr %a_base, %a_offsets" << aPointerHints
      << " : tensor<" << blockM << "x" << blockK << "x" << ptrTy << ">, tensor<"
      << blockM << "x" << blockK << "xi64>\n";
   os << "    %b_ptrs = tt.addptr %b_base, %b_offsets" << pointerHints
@@ -2250,7 +2275,8 @@ emitTritonMatMul2DDotBody(const fir::TileOffload::ElementwiseKernel &k,
 
 // Conservative opt-in experiment: establish 16-byte alignment and groups of
 // four uniformly masked FP32 elements before attaching any vectorization hints.
-static void emitMatmulAlignedFourGuard(llvm::raw_ostream &os) {
+static void emitMatmulAlignedFourGuard(llvm::raw_ostream &os,
+                                       bool transposedA) {
   os << "    %al_zero = arith.constant 0 : i64\n"
      << "    %al_three = arith.constant 3 : i64\n"
      << "    %al_fifteen = arith.constant 15 : i64\n";
@@ -2263,7 +2289,8 @@ static void emitMatmulAlignedFourGuard(llvm::raw_ostream &os) {
        << "_rem, %al_zero : i64\n";
   os << "    %al_extents = arith.andi %al_n_ok, %al_k_ok : i1\n";
   for (StringRef array : {"a", "b", "c"}) {
-    StringRef row = array == "b" ? "lz" : "lx";
+    StringRef row =
+        (array == "b" || (array == "a" && transposedA)) ? "lz" : "lx";
     os << "    %al_" << array << "_ptr = tt.ptr_to_int %" << array
        << " : !tt.ptr<f32> -> i64\n"
        << "    %al_" << array << "_ptr_rem = arith.andi %al_" << array
@@ -2321,14 +2348,14 @@ static void emitTritonMatMul2DDot(const fir::TileOffload::ElementwiseKernel &k,
        << "  scf.if %abc_unit_row {\n";
     const char *alignedEnv = std::getenv("TILEOFF_MATMUL_ALIGNED_LOADS");
     const bool tryAligned =
-        alignedEnv && std::string(alignedEnv) == "1" &&
+        (k.autoPackedA || (alignedEnv && std::string(alignedEnv) == "1")) &&
         k.elementType == fir::TileOffload::ElementType::F32 &&
         StringRef(fir::TileOffload::matmulInputPrecisionName(
             k.matmulPrecision)) == "tf32" &&
         k.loopStepY == 1 && blockM % 4 == 0 && blockN % 4 == 0 &&
         blockK % 4 == 0;
     if (tryAligned) {
-      emitMatmulAlignedFourGuard(os);
+      emitMatmulAlignedFourGuard(os, fir::TileOffload::matmulHasTransposedA(k));
       os << "    scf.if %al_all {\n";
       emitTritonMatMul2DDotBody(k, blockM, blockN, blockK, true, os, true);
       os << "      scf.yield\n    } else {\n";
@@ -2447,9 +2474,9 @@ emitTritonMatMul2DF64Reduce(const fir::TileOffload::ElementwiseKernel &k,
      << "xi32>\n";
   os << "    %a_col = arith.muli %offs_k_b_a, %n_s_a : tensor<" << blockM << "x"
      << blockK << "xi32>\n";
-  emitMatmulOffsets(os, "a", "", "offs_m_b_a", "offs_k_b_a",
-                    std::to_string(blockM) + "x" + std::to_string(blockK), "lx",
-                    "lz", k.loopStepX, k.loopStepZ);
+  emitMatmulAOffsets(k, os, "", "offs_m_b_a", "offs_k_b_a",
+                     std::to_string(blockM) + "x" + std::to_string(blockK),
+                     "lx", "lz", k.loopStepX, k.loopStepZ);
 
   // B offsets emitted as B(j, p) logical tensor N x K:
   // B(p,j), column-major offset = p + j * k.
@@ -2699,9 +2726,9 @@ emitTritonMatMul2DF64FMA(const fir::TileOffload::ElementwiseKernel &k,
        << blockM << "xi32>\n";
     os << "    %a_col" << suffix << " = arith.muli %kk_m" << suffix
        << ", %n_s_m_body" << suffix << " : tensor<" << blockM << "xi32>\n";
-    emitMatmulOffsets(os, "a", suffix, "offs_m", "kk_m" + suffix,
-                      std::to_string(blockM), "lx", "lz", k.loopStepX,
-                      k.loopStepZ);
+    emitMatmulAOffsets(k, os, suffix, "offs_m", "kk_m" + suffix,
+                       std::to_string(blockM), "lx", "lz", k.loopStepX,
+                       k.loopStepZ);
 
     // B(kk+q, j), column-major offset:
     //
@@ -2896,6 +2923,8 @@ static void emitJsonABI(const fir::TileOffload::TileOffloadKernelABI &abi,
   os << "]\n";
 }
 
+#include "TileOffloadMatmulPackEmitter.inc"
+
 static void
 emitJsonDescriptor(const fir::TileOffload::TileOffloadKernelPlan &plan,
                    int32_t ptxIndex,
@@ -2937,6 +2966,14 @@ emitJsonDescriptor(const fir::TileOffload::TileOffloadKernelPlan &plan,
     os << "      \"matmul_precision\": \""
        << fir::TileOffload::matmulInputPrecisionName(k.matmulPrecision)
        << "\",\n";
+  if (plan.autoPackAId >= 0)
+    os << "      \"auto_pack_a_id\": " << plan.autoPackAId << ",\n"
+       << "      \"auto_packed_matmul_id\": " << plan.autoPackedMatmulId
+       << ",\n";
+  if (k.kind == fir::TileOffload::ElementwiseKernelKind::MatMul2D)
+    os << "      \"matmul_transposed_a\": "
+       << (fir::TileOffload::matmulHasTransposedA(k) ? "true" : "false")
+       << ",\n";
   os << "      \"rank\": " << k.rank << ",\n";
   os << "      \"loop_steps\": [" << k.loopStepX << ", " << k.loopStepY << ", "
      << k.loopStepZ << "],\n";
@@ -3389,6 +3426,16 @@ struct TileOffloadLowerToTritonPass
         return;
       }
 
+      // CUDA Tile currently assumes physical A(i,k). Do not silently feed
+      // AP(k,i) to that emitter. The explicit packed path is Triton-only.
+      if (fir::TileOffload::matmulHasTransposedA(k) &&
+          selection.backend != &tritonBackend) {
+        launchOp.emitError(
+            "packed A matmul currently requires --tileoff-backend triton");
+        planningFailed = true;
+        return;
+      }
+
       if (selection.usedFallback)
         launchOp.emitWarning() << selection.diagnostic;
       usedBackendFallback |= selection.usedFallback;
@@ -3496,6 +3543,33 @@ struct TileOffloadLowerToTritonPass
       if (emissionFailed)
         break;
 
+      // Opt-in code generation; runtime chooses per invocation and retains the
+      // original kernel for small/unsupported layouts. No source rewrite
+      // needed.
+      const char *packEnv = std::getenv("TILEOFF_MATMUL_PACK_A");
+      const auto &k = plan.kernel;
+      const bool emitAutoPack =
+          packEnv &&
+          (std::string(packEnv) == "1" || std::string(packEnv) == "auto") &&
+          backend == &tritonBackend &&
+          backend->getAcceleratorTarget() == "cuda" && plan.usesVariadicABI &&
+          k.kind == fir::TileOffload::ElementwiseKernelKind::MatMul2D &&
+          k.elementType == fir::TileOffload::ElementType::F32 &&
+          StringRef(fir::TileOffload::matmulInputPrecisionName(
+              k.matmulPrecision)) == "tf32" &&
+          !fir::TileOffload::matmulHasTransposedA(k) && k.loopStepX == 1 &&
+          k.loopStepY == 1 && k.loopStepZ == 1 && k.arrayArguments.size() == 3;
+      if (emitAutoPack) {
+        if (nextSyntheticKernelId > std::numeric_limits<int32_t>::max() - 2) {
+          plan.launchOp.emitError(
+              "kernel ID space exhausted for automatic packing");
+          emissionFailed = true;
+          break;
+        }
+        plan.autoPackAId = nextSyntheticKernelId++;
+        plan.autoPackedMatmulId = nextSyntheticKernelId++;
+      }
+
       if (mlir::failed(backend->emitKernel(
               plan, backend == &cudaTileBackend ? *tileOs : ttirOs))) {
         plan.launchOp.emitError("TileOffload backend '")
@@ -3507,6 +3581,31 @@ struct TileOffloadLowerToTritonPass
 
       emitJsonDescriptor(plan, emittedPtxIndex, *backend, jsonOs, firstKernel);
       ++emittedPtxIndex;
+
+      if (emitAutoPack) {
+        const int32_t originalId = plan.id;
+        const std::string originalName = plan.name;
+        const int32_t packId = plan.autoPackAId;
+        const int32_t packedId = plan.autoPackedMatmulId;
+        const std::string packName = originalName + "_pack_a";
+        emitMatmulPackA(packName, ttirOs);
+        emitMatmulPackADescriptor(packId, packName, emittedPtxIndex++, jsonOs,
+                                  firstKernel);
+        // Temporarily select a synthetic layout; the FIR recognition is intact.
+        plan.id = packedId;
+        plan.name = originalName + "_packed_a";
+        plan.kernel.autoPackedA = true;
+        plan.autoPackAId = plan.autoPackedMatmulId = -1;
+        if (mlir::failed(backend->emitKernel(plan, ttirOs)))
+          emissionFailed = true;
+        emitJsonDescriptor(plan, emittedPtxIndex++, *backend, jsonOs,
+                           firstKernel);
+        plan.id = originalId;
+        plan.name = originalName;
+        plan.kernel.autoPackedA = false;
+        plan.autoPackAId = packId;
+        plan.autoPackedMatmulId = packedId;
+      }
 
       if (plan.reductionStage) {
         emitJsonReductionStageDescriptor(plan, emittedPtxIndex, *backend,

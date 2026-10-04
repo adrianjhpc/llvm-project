@@ -140,7 +140,8 @@ static void markPostLoopInductionUpdate(ElementwiseKernel &kernel,
 
 /// Return a runtime-visible array base for a reduction.
 ///
-/// Flang commonly lowers an allocatable array access inside TileOffload.launch as:
+/// Flang commonly lowers an allocatable array access inside TileOffload.launch
+/// as:
 ///
 ///   %box = fir.load %descriptor
 ///   %addr = fir.box_addr %box
@@ -300,8 +301,9 @@ static bool sameValueAfterFirConvert(Value lhs, Value rhs) {
   return lhs && rhs && stripFirConvert(lhs) == stripFirConvert(rhs);
 }
 
-static bool scalarReferenceIsUsedAfterLaunch(Value reference,
-                                             fir::TileOffload::LaunchOp launchOp);
+static bool
+scalarReferenceIsUsedAfterLaunch(Value reference,
+                                 fir::TileOffload::LaunchOp launchOp);
 
 static Value getScalarStorageRoot(Value value) {
   while (true) {
@@ -962,8 +964,9 @@ struct ScalarReferenceInfo {
   fir::StoreOp definingStore;
 };
 
-static bool scalarReferenceIsUsedAfterLaunch(Value reference,
-                                             fir::TileOffload::LaunchOp launchOp) {
+static bool
+scalarReferenceIsUsedAfterLaunch(Value reference,
+                                 fir::TileOffload::LaunchOp launchOp) {
   Block *launchBlock = launchOp->getBlock();
 
   for (Operation *user : reference.getUsers()) {
@@ -3577,7 +3580,8 @@ static bool valueIsLoadOfMemref(Value v, Value memref) {
 }
 
 static void markLoopBounds(ElementwiseKernel &kernel,
-                           fir::TileOffload::LaunchOp launchOp, fir::DoLoopOp loop) {
+                           fir::TileOffload::LaunchOp launchOp,
+                           fir::DoLoopOp loop) {
   markConsumed(kernel, loop.getOperation());
 
   markLaunchLocalBackwardSlice(kernel, launchOp, loop.getLowerBound());
@@ -4356,7 +4360,23 @@ static bool findMatmulReductionBody(fir::DoLoopOp pLoop, Value accMemref,
       return true;
     }
 
-    reason = "matmul multiply operands are not A(i,p) and B(p,j)";
+    // Explicit packed storage: AP(p,i) has the same logical values as A(i,p).
+    // Prefer the original form above; accept either multiplication order.
+    Value packedArray;
+    if (loadIsArrayAccess(mulLhs, pMemref, iMemref, packedArray) && rhsIsB) {
+      aArray = packedArray;
+      bArray = rhsArray;
+      computeOp = mulOp;
+      return true;
+    }
+    if (loadIsArrayAccess(mulRhs, pMemref, iMemref, packedArray) && lhsIsB) {
+      aArray = packedArray;
+      bArray = lhsArray;
+      computeOp = mulOp;
+      return true;
+    }
+
+    reason = "matmul expected A(i,p)*B(p,j) or AP(p,i)*B(p,j)";
     return false;
   }
 
@@ -4562,7 +4582,8 @@ recognizeMatMul2D(fir::TileOffload::LaunchOp launchOp) {
   return ElementwiseRecognitionResult::success(std::move(k));
 }
 
-static ElementwiseRecognitionResult recognize1D(fir::TileOffload::LaunchOp launchOp) {
+static ElementwiseRecognitionResult
+recognize1D(fir::TileOffload::LaunchOp launchOp) {
   Region &region = launchOp.getRegion();
   if (region.empty())
     return fail(launchOp, "launch region is empty");
@@ -4614,7 +4635,8 @@ static ElementwiseRecognitionResult recognize1D(fir::TileOffload::LaunchOp launc
   return ElementwiseRecognitionResult::success(std::move(k));
 }
 
-static ElementwiseRecognitionResult recognize2D(fir::TileOffload::LaunchOp launchOp) {
+static ElementwiseRecognitionResult
+recognize2D(fir::TileOffload::LaunchOp launchOp) {
   Region &region = launchOp.getRegion();
   if (region.empty())
     return fail(launchOp, "launch region is empty");
@@ -4706,6 +4728,23 @@ static ElementwiseRecognitionResult recognize2D(fir::TileOffload::LaunchOp launc
 
 } // namespace
 
+// Derive the storage orientation from the recognised multiply. Keep physical
+// descriptor dimensions in the ABI: backends must map logical coordinates.
+bool matmulHasTransposedA(const ElementwiseKernel &kernel) {
+  if (kernel.autoPackedA)
+    return true;
+  if (kernel.kind != ElementwiseKernelKind::MatMul2D || !kernel.computeOp)
+    return false;
+  for (Value operand : kernel.computeOp->getOperands()) {
+    Value array;
+    if (loadIsArrayAccess(operand, kernel.reductionIndMemref,
+                          kernel.innerIndMemref, array) &&
+        array == kernel.readArrays.front())
+      return true;
+  }
+  return false;
+}
+
 bool isSupportedElementwiseCompute(Operation *op) {
   return op &&
          isa<arith::AddFOp, arith::SubFOp, arith::MulFOp, arith::DivFOp,
@@ -4730,12 +4769,13 @@ static bool hasDirectNestedLoop(fir::TileOffload::LaunchOp launchOp) {
 
 ElementwiseRecognitionResult
 recognizeElementwiseKernel(fir::TileOffload::LaunchOp launchOp) {
-  // Reductions are explicitly marked by lowering with TileOffload.reduction_slots.
-  // Do not try reduction recognition on ordinary elementwise/matmul launches,
-  // otherwise diagnostics become noisy and misleading.
+  // Reductions are explicitly marked by lowering with
+  // TileOffload.reduction_slots. Do not try reduction recognition on ordinary
+  // elementwise/matmul launches, otherwise diagnostics become noisy and
+  // misleading.
   if (launchOp->hasAttr("TileOffload.reduction_slots")) {
-    auto slots =
-        launchOp->getAttrOfType<DenseI32ArrayAttr>("TileOffload.reduction_slots");
+    auto slots = launchOp->getAttrOfType<DenseI32ArrayAttr>(
+        "TileOffload.reduction_slots");
     bool hasMultipleResults = slots && slots.asArrayRef().size() > 1;
     if (hasMultipleResults || hasDirectNestedLoop(launchOp)) {
       auto multi = recognizeMultiReduction2D(launchOp);
@@ -4743,13 +4783,13 @@ recognizeElementwiseKernel(fir::TileOffload::LaunchOp launchOp) {
         return validateRecognizedKernel(launchOp, std::move(multi));
       if (multi.getFailure().reason ==
           "multi-reduction found no logical inner loop")
-        return fail(
-            launchOp,
-            "not a supported TileOffload reduction kernel; reduction recognition "
-            "requires exactly one reduction scalar");
+        return fail(launchOp, "not a supported TileOffload reduction kernel; "
+                              "reduction recognition "
+                              "requires exactly one reduction scalar");
       std::string reason =
-          hasMultipleResults ? "not a supported TileOffload multi-reduction kernel; "
-                             : "not a supported TileOffload 2-D reduction kernel; ";
+          hasMultipleResults
+              ? "not a supported TileOffload multi-reduction kernel; "
+              : "not a supported TileOffload 2-D reduction kernel; ";
       reason += multi.getFailure().reason;
       return fail(launchOp, reason);
     }
@@ -4792,8 +4832,10 @@ recognizeElementwiseKernel(fir::TileOffload::LaunchOp launchOp) {
 
 namespace {
 
-static constexpr llvm::StringLiteral kKernelIdAttrName = "TileOffload.kernel_id";
-static constexpr llvm::StringLiteral kKernelNameAttrName = "TileOffload.kernel_name";
+static constexpr llvm::StringLiteral kKernelIdAttrName =
+    "TileOffload.kernel_id";
+static constexpr llvm::StringLiteral kKernelNameAttrName =
+    "TileOffload.kernel_name";
 
 static int32_t getPlannedKernelId(fir::TileOffload::LaunchOp launchOp,
                                   int32_t fallbackId) {
@@ -4887,7 +4929,7 @@ static void appendABIParameter(TileOffloadKernelABI &abi,
 }
 
 static TileOffloadKernelABI buildKernelABI(fir::TileOffload::LaunchOp launchOp,
-                                     const ElementwiseKernel &kernel) {
+                                           const ElementwiseKernel &kernel) {
   TileOffloadKernelABI abi;
   bool isReduction = isReductionKernelKind(kernel.kind);
 
@@ -4901,7 +4943,8 @@ static TileOffloadKernelABI buildKernelABI(fir::TileOffload::LaunchOp launchOp,
 
     if (!kernel.outputs.empty() || !kernel.reductionOutputs.empty()) {
       for (auto [index, array] : llvm::enumerate(kernel.arrayArguments)) {
-        TileOffloadKernelParameterRole role = TileOffloadKernelParameterRole::Read;
+        TileOffloadKernelParameterRole role =
+            TileOffloadKernelParameterRole::Read;
         if (array.read && array.write)
           role = TileOffloadKernelParameterRole::ReadWrite;
         else if (array.write)
@@ -4934,57 +4977,59 @@ static TileOffloadKernelABI buildKernelABI(fir::TileOffload::LaunchOp launchOp,
 
     for (unsigned i = 0; i < kernel.scalarRefs.size(); ++i)
       appendABIParameter(abi, TileOffloadKernelParameterRole::Scalar,
-                         TileOffloadKernelParameterPassing::Value, kernel.elementType,
-                         "scalar" + std::to_string(i), -1, -1, i);
+                         TileOffloadKernelParameterPassing::Value,
+                         kernel.elementType, "scalar" + std::to_string(i), -1,
+                         -1, i);
 
     for (unsigned i = 0; i < kernel.indexRefs.size(); ++i) {
       unsigned scalarIndex = kernel.scalarRefs.size() + i;
       appendABIParameter(abi, TileOffloadKernelParameterRole::Scalar,
-                         TileOffloadKernelParameterPassing::Value, ElementType::I32,
-                         "index" + std::to_string(i), -1, -1, scalarIndex);
+                         TileOffloadKernelParameterPassing::Value,
+                         ElementType::I32, "index" + std::to_string(i), -1, -1,
+                         scalarIndex);
     }
 
     appendABIParameter(abi, TileOffloadKernelParameterRole::ExtentX,
-                       TileOffloadKernelParameterPassing::Value, ElementType::I32,
-                       "extent_x");
+                       TileOffloadKernelParameterPassing::Value,
+                       ElementType::I32, "extent_x");
     if (kernel.rank >= 2)
       appendABIParameter(abi, TileOffloadKernelParameterRole::ExtentY,
-                         TileOffloadKernelParameterPassing::Value, ElementType::I32,
-                         "extent_y");
+                         TileOffloadKernelParameterPassing::Value,
+                         ElementType::I32, "extent_y");
     if (kernel.kind == ElementwiseKernelKind::MatMul2D)
       appendABIParameter(abi, TileOffloadKernelParameterRole::ExtentZ,
-                         TileOffloadKernelParameterPassing::Value, ElementType::I32,
-                         "extent_k");
+                         TileOffloadKernelParameterPassing::Value,
+                         ElementType::I32, "extent_k");
 
     if (kernel.kind == ElementwiseKernelKind::MultiExpr1D ||
         (isReduction && kernel.rank == 1)) {
       appendABIParameter(abi, TileOffloadKernelParameterRole::LoopLowerX,
-                         TileOffloadKernelParameterPassing::Value, ElementType::I32,
-                         "loop_lower_x");
+                         TileOffloadKernelParameterPassing::Value,
+                         ElementType::I32, "loop_lower_x");
 
       for (unsigned array = 0; array < kernel.arrayArguments.size(); ++array) {
-        appendABIParameter(abi, TileOffloadKernelParameterRole::ArrayLowerBound,
-                           TileOffloadKernelParameterPassing::Value, ElementType::I32,
-                           "array" + std::to_string(array) + "_lower0", array,
-                           0);
-        appendABIParameter(abi, TileOffloadKernelParameterRole::ArrayStride,
-                           TileOffloadKernelParameterPassing::Value, ElementType::I32,
-                           "array" + std::to_string(array) + "_stride0", array,
-                           0);
+        appendABIParameter(
+            abi, TileOffloadKernelParameterRole::ArrayLowerBound,
+            TileOffloadKernelParameterPassing::Value, ElementType::I32,
+            "array" + std::to_string(array) + "_lower0", array, 0);
+        appendABIParameter(
+            abi, TileOffloadKernelParameterRole::ArrayStride,
+            TileOffloadKernelParameterPassing::Value, ElementType::I32,
+            "array" + std::to_string(array) + "_stride0", array, 0);
       }
     } else if (kernel.kind == ElementwiseKernelKind::Stencil2D ||
                kernel.kind == ElementwiseKernelKind::MultiReduction2D ||
                kernel.kind == ElementwiseKernelKind::MatMul2D) {
       appendABIParameter(abi, TileOffloadKernelParameterRole::LoopLowerX,
-                         TileOffloadKernelParameterPassing::Value, ElementType::I32,
-                         "loop_lower_x");
+                         TileOffloadKernelParameterPassing::Value,
+                         ElementType::I32, "loop_lower_x");
       appendABIParameter(abi, TileOffloadKernelParameterRole::LoopLowerY,
-                         TileOffloadKernelParameterPassing::Value, ElementType::I32,
-                         "loop_lower_y");
+                         TileOffloadKernelParameterPassing::Value,
+                         ElementType::I32, "loop_lower_y");
       if (kernel.kind == ElementwiseKernelKind::MatMul2D)
         appendABIParameter(abi, TileOffloadKernelParameterRole::LoopLowerZ,
-                           TileOffloadKernelParameterPassing::Value, ElementType::I32,
-                           "loop_lower_z");
+                           TileOffloadKernelParameterPassing::Value,
+                           ElementType::I32, "loop_lower_z");
 
       llvm::SmallVector<unsigned> layoutArrays;
       if (kernel.kind == ElementwiseKernelKind::MatMul2D) {
@@ -5014,8 +5059,9 @@ static TileOffloadKernelABI buildKernelABI(fir::TileOffload::LaunchOp launchOp,
       int index = kernel.runtimeStepScalarIndex(dim);
       if (index >= 0)
         appendABIParameter(abi, TileOffloadKernelParameterRole::Scalar,
-                           TileOffloadKernelParameterPassing::Value, ElementType::I32,
-                           "loop_step_" + std::to_string(dim), -1, -1, index);
+                           TileOffloadKernelParameterPassing::Value,
+                           ElementType::I32, "loop_step_" + std::to_string(dim),
+                           -1, -1, index);
     }
 
   } else {
@@ -5029,8 +5075,8 @@ static TileOffloadKernelABI buildKernelABI(fir::TileOffload::LaunchOp launchOp,
                          TileOffloadKernelParameterPassing::DevicePointer,
                          kernel.elementType, "partials");
       appendABIParameter(abi, TileOffloadKernelParameterRole::ExtentX,
-                         TileOffloadKernelParameterPassing::Value, ElementType::I32,
-                         "extent_x");
+                         TileOffloadKernelParameterPassing::Value,
+                         ElementType::I32, "extent_x");
     } else {
       appendABIParameter(abi, TileOffloadKernelParameterRole::Write,
                          TileOffloadKernelParameterPassing::DevicePointer,
@@ -5042,13 +5088,13 @@ static TileOffloadKernelABI buildKernelABI(fir::TileOffload::LaunchOp launchOp,
                            kernel.elementType, "scalar" + std::to_string(i));
 
       appendABIParameter(abi, TileOffloadKernelParameterRole::ExtentX,
-                         TileOffloadKernelParameterPassing::Value, ElementType::I32,
-                         "extent_x");
+                         TileOffloadKernelParameterPassing::Value,
+                         ElementType::I32, "extent_x");
 
       if (kernel.rank == 2) {
         appendABIParameter(abi, TileOffloadKernelParameterRole::ExtentY,
-                           TileOffloadKernelParameterPassing::Value, ElementType::I32,
-                           "extent_y");
+                           TileOffloadKernelParameterPassing::Value,
+                           ElementType::I32, "extent_y");
 
         if (kernel.kind == ElementwiseKernelKind::MatMul2D)
           appendABIParameter(abi, TileOffloadKernelParameterRole::ExtentZ,
@@ -5068,8 +5114,9 @@ static TileOffloadKernelABI buildKernelABI(fir::TileOffload::LaunchOp launchOp,
     llvm::SmallVector<unsigned> slots =
         getKernelParameterSlotsForValue(kernel, packValue);
     if (slots.empty()) {
-      launchOp.emitWarning() << "PACK variable #" << packIndex
-                             << " was not used by recognized TileOffload kernel body";
+      launchOp.emitWarning()
+          << "PACK variable #" << packIndex
+          << " was not used by recognized TileOffload kernel body";
       continue;
     }
 
@@ -5088,19 +5135,20 @@ static TileOffloadKernelABI buildKernelABI(fir::TileOffload::LaunchOp launchOp,
 static TileOffloadKernelABI buildReductionStageABI(ElementType elementType) {
   TileOffloadKernelABI abi;
   appendABIParameter(abi, TileOffloadKernelParameterRole::Read,
-                     TileOffloadKernelParameterPassing::DevicePointer, elementType,
-                     "input");
+                     TileOffloadKernelParameterPassing::DevicePointer,
+                     elementType, "input");
   appendABIParameter(abi, TileOffloadKernelParameterRole::Partials,
-                     TileOffloadKernelParameterPassing::DevicePointer, elementType,
-                     "output");
+                     TileOffloadKernelParameterPassing::DevicePointer,
+                     elementType, "output");
   appendABIParameter(abi, TileOffloadKernelParameterRole::ExtentX,
                      TileOffloadKernelParameterPassing::Value, ElementType::I32,
                      "extent_x");
   return abi;
 }
 
-static TileOffloadTileShape getPlannedTileShape(fir::TileOffload::LaunchOp launchOp,
-                                          const ElementwiseKernel &kernel) {
+static TileOffloadTileShape
+getPlannedTileShape(fir::TileOffload::LaunchOp launchOp,
+                    const ElementwiseKernel &kernel) {
   llvm::ArrayRef<int64_t> tiles = launchOp.getTileSizes();
   TileOffloadTileShape tile;
 
@@ -5120,14 +5168,15 @@ static TileOffloadTileShape getPlannedTileShape(fir::TileOffload::LaunchOp launc
 
 } // namespace
 
-TileOffloadKernelPlanResult TileOffloadKernelPlanResult::success(TileOffloadKernelPlan plan) {
+TileOffloadKernelPlanResult
+TileOffloadKernelPlanResult::success(TileOffloadKernelPlan plan) {
   TileOffloadKernelPlanResult result;
   result.plan.emplace(std::move(plan));
   return result;
 }
 
-TileOffloadKernelPlanResult TileOffloadKernelPlanResult::failure(Operation *where,
-                                                     std::string reason) {
+TileOffloadKernelPlanResult
+TileOffloadKernelPlanResult::failure(Operation *where, std::string reason) {
   TileOffloadKernelPlanResult result;
   result.failureInfo.where = where;
   result.failureInfo.reason = std::move(reason);
@@ -5203,14 +5252,14 @@ llvm::StringRef TileOffloadKernelKindName(ElementwiseKernelKind kind) {
 }
 
 TileOffloadKernelPlanResult
-buildTileOffloadKernelPlan(fir::TileOffload::LaunchOp launchOp, int32_t fallbackId,
-                     int32_t nextSyntheticKernelId,
-                     const TileOffloadKernelPlanOptions &options) {
+buildTileOffloadKernelPlan(fir::TileOffload::LaunchOp launchOp,
+                           int32_t fallbackId, int32_t nextSyntheticKernelId,
+                           const TileOffloadKernelPlanOptions &options) {
   ElementwiseRecognitionResult recognition =
       recognizeElementwiseKernel(launchOp);
   if (recognition.failed())
-    return TileOffloadKernelPlanResult::failure(recognition.getFailure().where,
-                                          recognition.getFailure().reason);
+    return TileOffloadKernelPlanResult::failure(
+        recognition.getFailure().where, recognition.getFailure().reason);
 
   ElementwiseKernel kernel = std::move(recognition.getKernel());
 
@@ -5250,7 +5299,8 @@ TileOffloadBackendSelection selectTileOffloadBackend(
     llvm::ArrayRef<const TileOffloadCodegenBackend *> availableBackends,
     llvm::StringRef preferredBackend, llvm::StringRef fallbackBackend,
     bool allowFallback) {
-  auto findBackend = [&](llvm::StringRef name) -> const TileOffloadCodegenBackend * {
+  auto findBackend =
+      [&](llvm::StringRef name) -> const TileOffloadCodegenBackend * {
     for (const TileOffloadCodegenBackend *backend : availableBackends)
       if (backend && backend->getName() == name)
         return backend;
